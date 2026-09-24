@@ -406,6 +406,10 @@ enum Function {
     Rept,
     Row,
     Column,
+    Hyperlink,
+    Rank,
+    Text,
+    Rri,
 }
 
 /// A parsed formula whose cell references can be enumerated and rebound
@@ -1660,6 +1664,18 @@ impl Workbook {
         ) {
             return self.evaluate_simple_aggregate(function, arguments);
         }
+        if function == Function::Hyperlink {
+            return self.evaluate_hyperlink(arguments);
+        }
+        if function == Function::Rank {
+            return self.evaluate_rank(arguments);
+        }
+        if function == Function::Text {
+            return self.evaluate_text(arguments);
+        }
+        if function == Function::Rri {
+            return self.evaluate_rri(arguments);
+        }
 
         let mut values = Vec::new();
         for argument in arguments {
@@ -1834,7 +1850,113 @@ impl Workbook {
             | Function::DMax
             | Function::DMin
             | Function::DStDev
-            | Function::ReferenceSpan => Value::Error(CalcError::InvalidArguments),
+            | Function::ReferenceSpan
+            | Function::Hyperlink
+            | Function::Rank
+            | Function::Text
+            | Function::Rri => Value::Error(CalcError::InvalidArguments),
+        }
+    }
+
+    /// `HYPERLINK(link, [friendly_name])` returns the friendly name when
+    /// present and the link otherwise. The value is never fetched.
+    fn evaluate_hyperlink(&self, arguments: &[Expr<usize>]) -> Value {
+        if !matches!(arguments.len(), 1 | 2) {
+            return Value::Error(CalcError::InvalidArguments);
+        }
+        let link = self.evaluate(&arguments[0]);
+        if matches!(link, Value::Error(_)) {
+            return link;
+        }
+        if arguments.len() == 1 {
+            link
+        } else {
+            self.evaluate(&arguments[1])
+        }
+    }
+
+    /// `RANK(number, ref, [order])`: competition rank. Zero or omitted order
+    /// ranks the largest number first. Ties share a rank and the next rank
+    /// skips. Non-numbers in `ref` are ignored; an error there propagates.
+    fn evaluate_rank(&self, arguments: &[Expr<usize>]) -> Value {
+        if !matches!(arguments.len(), 2 | 3) {
+            return Value::Error(CalcError::InvalidArguments);
+        }
+        let target = match number(self.evaluate(&arguments[0])) {
+            Ok(value) => value,
+            Err(error) => return Value::Error(error),
+        };
+        let mut values = Vec::new();
+        self.flatten_values(&arguments[1], &mut values);
+        if let Some(error) = first_error(&values) {
+            return Value::Error(error);
+        }
+        let ascending = if arguments.len() == 3 {
+            match number(self.evaluate(&arguments[2])) {
+                Ok(value) => value != 0.0,
+                Err(error) => return Value::Error(error),
+            }
+        } else {
+            false
+        };
+        let mut rank = 1_usize;
+        let mut saw_number = false;
+        for value in &values {
+            let Value::Number(candidate) = value else {
+                continue;
+            };
+            saw_number = true;
+            let ahead = match compare_numbers(*candidate, target) {
+                std::cmp::Ordering::Greater => !ascending,
+                std::cmp::Ordering::Less => ascending,
+                std::cmp::Ordering::Equal => false,
+            };
+            if ahead {
+                rank += 1;
+            }
+        }
+        if saw_number {
+            Value::Number(rank as f64)
+        } else {
+            Value::Error(CalcError::NotAvailable)
+        }
+    }
+
+    /// `TEXT(value, format)` for the locale-free codes listed in
+    /// `docs/FUNCTIONS.md`. Any other code is `#VALUE!`.
+    fn evaluate_text(&self, arguments: &[Expr<usize>]) -> Value {
+        if arguments.len() != 2 {
+            return Value::Error(CalcError::InvalidArguments);
+        }
+        let value = self.evaluate(&arguments[0]);
+        if matches!(value, Value::Error(_)) {
+            return value;
+        }
+        let format = match text_value(&self.evaluate(&arguments[1])) {
+            Ok(format) => format,
+            Err(error) => return Value::Error(error),
+        };
+        match format_text_value(&value, &format) {
+            Ok(text) => Value::Text(text),
+            Err(error) => Value::Error(error),
+        }
+    }
+
+    /// `RRI(nper, pv, fv) = (fv/pv)^(1/nper) - 1`.
+    fn evaluate_rri(&self, arguments: &[Expr<usize>]) -> Value {
+        if arguments.len() != 3 {
+            return Value::Error(CalcError::InvalidArguments);
+        }
+        let mut numbers = [0.0; 3];
+        for (index, argument) in arguments.iter().enumerate() {
+            match number(self.evaluate(argument)) {
+                Ok(value) => numbers[index] = value,
+                Err(error) => return Value::Error(error),
+            }
+        }
+        match equivalent_interest_rate(numbers[0], numbers[1], numbers[2]) {
+            Ok(value) => number_value(value),
+            Err(error) => Value::Error(error),
         }
     }
 
@@ -3055,6 +3177,9 @@ fn is_elementwise(function: Function) -> bool {
             | Function::T
             | Function::Find
             | Function::Rept
+            | Function::Text
+            | Function::Hyperlink
+            | Function::Rri
     )
 }
 
@@ -3872,6 +3997,235 @@ fn exact_text(values: &[Value]) -> Value {
     match (text_value(&values[0]), text_value(&values[1])) {
         (Ok(left), Ok(right)) => Value::Boolean(left == right),
         (Err(error), _) | (_, Err(error)) => Value::Error(error),
+    }
+}
+
+enum TextFormat {
+    General,
+    Integer { group: bool, optional: bool },
+    Fixed { decimals: u8, group: bool },
+    Percent { decimals: u8 },
+    DateIso,
+    DateUs,
+}
+
+/// Locale-free `TEXT` codes. `#` is the optional integer digit the sample
+/// uses; a rounded zero is an empty string. Anything else, including
+/// literals such as `0.0x`, is refused.
+fn text_format(code: &str) -> Option<TextFormat> {
+    match code.trim().to_ascii_lowercase().as_str() {
+        "general" => Some(TextFormat::General),
+        "0" => Some(TextFormat::Integer {
+            group: false,
+            optional: false,
+        }),
+        "#" => Some(TextFormat::Integer {
+            group: false,
+            optional: true,
+        }),
+        "#,##0" => Some(TextFormat::Integer {
+            group: true,
+            optional: false,
+        }),
+        "0.00" => Some(TextFormat::Fixed {
+            decimals: 2,
+            group: false,
+        }),
+        "#,##0.00" => Some(TextFormat::Fixed {
+            decimals: 2,
+            group: true,
+        }),
+        "0%" => Some(TextFormat::Percent { decimals: 0 }),
+        "0.00%" => Some(TextFormat::Percent { decimals: 2 }),
+        "yyyy-mm-dd" => Some(TextFormat::DateIso),
+        "mm/dd/yyyy" => Some(TextFormat::DateUs),
+        _ => None,
+    }
+}
+
+fn format_text_value(value: &Value, format: &str) -> Result<String, CalcError> {
+    let format = text_format(format).ok_or(CalcError::InvalidValue)?;
+    let number = match value {
+        Value::Number(number) => *number,
+        Value::Blank => 0.0,
+        Value::Boolean(true) => 1.0,
+        Value::Boolean(false) => 0.0,
+        Value::Text(text) => text
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| CalcError::InvalidValue)?,
+        Value::Error(error) => return Err(error.clone()),
+    };
+    match format {
+        TextFormat::General => format_general(number),
+        TextFormat::Integer { group, optional } => {
+            format_scaled(number, 0, group, optional, "")
+        }
+        TextFormat::Fixed { decimals, group } => {
+            format_scaled(number, i32::from(decimals), group, false, "")
+        }
+        TextFormat::Percent { decimals } => {
+            format_scaled(number * 100.0, i32::from(decimals), false, false, "%")
+        }
+        TextFormat::DateIso | TextFormat::DateUs => format_text_date(number, format),
+    }
+}
+
+fn format_text_date(number: f64, format: TextFormat) -> Result<String, CalcError> {
+    let serial = serial_date::serial_from_number(number)?;
+    let date = serial_date::civil_from_serial(serial)?;
+    Ok(match format {
+        TextFormat::DateIso => format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
+        _ => format!("{:02}/{:02}/{:04}", date.month, date.day, date.year),
+    })
+}
+
+fn format_general(value: f64) -> Result<String, CalcError> {
+    if !value.is_finite() {
+        return Err(CalcError::InvalidNumber);
+    }
+    if value == 0.0 {
+        return Ok("0".into());
+    }
+    let negative = value.is_sign_negative();
+    let magnitude = value.abs();
+    let exponent = magnitude.log10().floor() as i32;
+    let body = if exponent >= 11 || exponent <= -10 {
+        let mut mantissa = magnitude / 10_f64.powi(exponent);
+        let mut exponent = exponent;
+        if mantissa >= 10.0 {
+            mantissa /= 10.0;
+            exponent += 1;
+        } else if mantissa < 1.0 {
+            mantissa *= 10.0;
+            exponent -= 1;
+        }
+        mantissa = (mantissa * 1.0e5).round() / 1.0e5;
+        if mantissa >= 10.0 {
+            mantissa /= 10.0;
+            exponent += 1;
+        }
+        let mut digits = format!("{mantissa:.5}");
+        trim_trailing_zeros(&mut digits);
+        let sign = if exponent >= 0 { '+' } else { '-' };
+        format!("{digits}E{sign}{:02}", exponent.unsigned_abs())
+    } else {
+        let rounded = round_significant(magnitude, 15)?;
+        let exponent = if rounded == 0.0 {
+            0
+        } else {
+            rounded.log10().floor() as i32
+        };
+        let decimals = (14 - exponent).clamp(0, 15) as usize;
+        let mut text = format!("{rounded:.decimals$}");
+        if text.contains('.') {
+            trim_trailing_zeros(&mut text);
+        }
+        text
+    };
+    Ok(if negative { format!("-{body}") } else { body })
+}
+
+fn round_significant(magnitude: f64, digits: i32) -> Result<f64, CalcError> {
+    if magnitude == 0.0 {
+        return Ok(0.0);
+    }
+    let exponent = magnitude.log10().floor() as i32;
+    let scale = 10_f64.powi(digits - 1 - exponent);
+    if !scale.is_finite() {
+        return Err(CalcError::InvalidNumber);
+    }
+    let rounded = (magnitude * scale).round() / scale;
+    if rounded.is_finite() {
+        Ok(rounded)
+    } else {
+        Err(CalcError::InvalidNumber)
+    }
+}
+
+fn trim_trailing_zeros(text: &mut String) {
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+}
+
+/// Half away from zero, then a fixed number of decimal places. `optional`
+/// is Excel's `#`: a result of zero has no characters.
+fn format_scaled(
+    value: f64,
+    decimals: i32,
+    group: bool,
+    optional: bool,
+    suffix: &str,
+) -> Result<String, CalcError> {
+    if !value.is_finite() {
+        return Err(CalcError::InvalidNumber);
+    }
+    let factor = 10_f64.powi(decimals);
+    if !factor.is_finite() {
+        return Err(CalcError::InvalidNumber);
+    }
+    let scaled = (value * factor).round();
+    if !scaled.is_finite() || scaled.abs() > u128::MAX as f64 {
+        return Err(CalcError::InvalidNumber);
+    }
+    let negative = scaled.is_sign_negative() && scaled != 0.0;
+    let digits = format!("{}", scaled.abs() as u128);
+    let width = decimals.max(0) as usize;
+    let padded = if digits.len() > width {
+        digits
+    } else {
+        format!("{digits:0>width$}", width = width + 1)
+    };
+    let (integer, fraction) = padded.split_at(padded.len() - width);
+    if optional && integer == "0" && fraction.bytes().all(|byte| byte == b'0') {
+        return Ok(String::new());
+    }
+    let integer = if group {
+        group_digits(integer)
+    } else {
+        integer.to_string()
+    };
+    let mut text = String::new();
+    if negative {
+        text.push('-');
+    }
+    text.push_str(&integer);
+    if width > 0 {
+        text.push('.');
+        text.push_str(fraction);
+    }
+    text.push_str(suffix);
+    Ok(text)
+}
+
+fn group_digits(digits: &str) -> String {
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().rev().enumerate() {
+        if index > 0 && index.is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped.chars().rev().collect()
+}
+
+fn equivalent_interest_rate(periods: f64, present: f64, future: f64) -> Result<f64, CalcError> {
+    if periods <= 0.0 || present == 0.0 || !periods.is_finite() {
+        return Err(CalcError::InvalidNumber);
+    }
+    let ratio = future / present;
+    if ratio <= 0.0 || !ratio.is_finite() {
+        return Err(CalcError::InvalidNumber);
+    }
+    let rate = ratio.powf(1.0 / periods) - 1.0;
+    if rate.is_finite() {
+        Ok(rate)
+    } else {
+        Err(CalcError::InvalidNumber)
     }
 }
 
@@ -4807,6 +5161,8 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("CONCATENATE", Function::Concat),
     ("TEXTJOIN", Function::TextJoin),
     ("VALUE", Function::Value),
+    ("TEXT", Function::Text),
+    ("HYPERLINK", Function::Hyperlink),
     ("EXACT", Function::Exact),
     ("COUNTIF", Function::CountIf),
     ("SUMIF", Function::SumIf),
@@ -4836,6 +5192,7 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("NPV", Function::Npv),
     ("XNPV", Function::Xnpv),
     ("XIRR", Function::Xirr),
+    ("RRI", Function::Rri),
     ("NORMDIST", Function::NormDist),
     ("NORM.DIST", Function::NormDist),
     ("NORMSDIST", Function::NormSDistLegacy),
@@ -4854,6 +5211,7 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("T", Function::T),
     ("SUMPRODUCT", Function::SumProduct),
     ("MEDIAN", Function::Median),
+    ("RANK", Function::Rank),
     ("CHOOSE", Function::Choose),
     ("SUBTOTAL", Function::SubTotal),
     ("STDEV", Function::StDev),
@@ -6759,6 +7117,133 @@ mod tests {
             workbook.value(cell(0, 2)),
             Value::Text("north-south-TRUE".into())
         );
+    }
+
+    #[test]
+    fn text_rank_hyperlink_and_rri_follow_excel_scalar_rules() {
+        let mut workbook = Workbook::default();
+        workbook.set_number(cell(0, 0), 10.0);
+        workbook.set_number(cell(1, 0), 30.0);
+        workbook.set_number(cell(2, 0), 20.0);
+        workbook.set_number(cell(3, 0), 30.0);
+        workbook.set_text(cell(5, 0), "9");
+        workbook.set_boolean(cell(6, 0), true);
+        workbook.set_formula(cell(7, 0), "=1/0").unwrap();
+        workbook.set_formula(cell(8, 0), "=0.1+0.2").unwrap();
+        workbook.set_number(cell(9, 0), 0.3);
+        workbook.set_text(cell(0, 1), "C2");
+
+        for (column, formula, expected) in [
+            (2, "=TEXT(12.5,\"#\")", Value::Text("13".into())),
+            (3, "=TEXT(0,\"#\")", Value::Text(String::new())),
+            (4, "=TEXT(-0.4,\"#\")&\"P\"", Value::Text("P".into())),
+            (5, "=TEXT(2.5,\"0\")", Value::Text("3".into())),
+            (6, "=TEXT(-1.5,\"0\")", Value::Text("-2".into())),
+            (7, "=TEXT(2,\"0.00\")", Value::Text("2.00".into())),
+            (8, "=TEXT(1234.5,\"#,##0\")", Value::Text("1,235".into())),
+            (
+                9,
+                "=TEXT(-1234.25,\"#,##0.00\")",
+                Value::Text("-1,234.25".into()),
+            ),
+            (10, "=TEXT(0.5,\"0%\")", Value::Text("50%".into())),
+            (11, "=TEXT(0.125,\"0.00%\")", Value::Text("12.50%".into())),
+            (12, "=TEXT(12.5,\"General\")", Value::Text("12.5".into())),
+            (13, "=TEXT(0.1+0.2,\"General\")", Value::Text("0.3".into())),
+            (14, "=TEXT(1E11,\"General\")", Value::Text("1E+11".into())),
+            (
+                15,
+                "=TEXT(DATE(2024,1,15),\"yyyy-mm-dd\")",
+                Value::Text("2024-01-15".into()),
+            ),
+            (
+                16,
+                "=TEXT(DATE(2024,1,15),\"MM/DD/YYYY\")",
+                Value::Text("01/15/2024".into()),
+            ),
+            (
+                17,
+                "=TEXT(DATE(1900,2,29),\"yyyy-mm-dd\")",
+                Value::Text("1900-02-29".into()),
+            ),
+            (
+                18,
+                "=TEXT(12,\"0.0x\")",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (
+                19,
+                "=TEXT(\"abc\",\"0\")",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (20, "=TEXT(\"12\",\"0\")", Value::Text("12".into())),
+            (
+                21,
+                "=TEXT(-1,\"yyyy-mm-dd\")",
+                Value::Error(CalcError::InvalidNumber),
+            ),
+            (22, "=TEXT(1)", Value::Error(CalcError::InvalidArguments)),
+            (23, "=RANK(30,A1:A7)", Value::Number(1.0)),
+            (24, "=RANK(20,A1:A7)", Value::Number(3.0)),
+            (25, "=RANK(10,A1:A7,0)", Value::Number(4.0)),
+            (26, "=RANK(10,A1:A7,1)", Value::Number(1.0)),
+            (27, "=RANK(0,A1:A7)", Value::Number(5.0)),
+            (28, "=RANK(2,{10,20,30})", Value::Number(4.0)),
+            (29, "=RANK(0.3,A9:A10)", Value::Number(1.0)),
+            (
+                30,
+                "=RANK(1,A8:A8)",
+                Value::Error(CalcError::DivisionByZero),
+            ),
+            (
+                31,
+                "=RANK(1,A5:A6)",
+                Value::Error(CalcError::NotAvailable),
+            ),
+            (
+                32,
+                "=RANK(\"x\",A1:A3)",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (
+                33,
+                "=HYPERLINK(\"https://example.test/\"&B1&\".pdf\",B1)",
+                Value::Text("C2".into()),
+            ),
+            (
+                34,
+                "=HYPERLINK(\"https://example.test/a\")",
+                Value::Text("https://example.test/a".into()),
+            ),
+            (35, "=HYPERLINK(\"url\",42)", Value::Number(42.0)),
+            (
+                36,
+                "=HYPERLINK(\"url\",NA())",
+                Value::Error(CalcError::NotAvailable),
+            ),
+            (37, "=HYPERLINK()", Value::Error(CalcError::InvalidArguments)),
+        ] {
+            workbook.set_formula(cell(0, column), formula).unwrap();
+            assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
+        }
+        for (column, formula, expected) in [
+            (38, "=_xlfn.RRI(10,100,121)", 0.019_244_876_491_456_564),
+            (39, "=RRI(8,10000,12000)", 0.023_051_875_220_462_925),
+            (40, "=RRI(10,-100,-121)", 0.019_244_876_491_456_564),
+        ] {
+            workbook.set_formula(cell(0, column), formula).unwrap();
+            assert_close(workbook.value(cell(0, column)), expected, 1e-9, formula);
+        }
+        for (column, formula, expected) in [
+            (41, "=RRI(0,100,121)", Value::Error(CalcError::InvalidNumber)),
+            (42, "=RRI(10,0,121)", Value::Error(CalcError::InvalidNumber)),
+            (43, "=RRI(10,-100,121)", Value::Error(CalcError::InvalidNumber)),
+            (44, "=RRI(10,\"x\",121)", Value::Error(CalcError::InvalidValue)),
+            (45, "=RRI(1,2)", Value::Error(CalcError::InvalidArguments)),
+        ] {
+            workbook.set_formula(cell(0, column), formula).unwrap();
+            assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
+        }
     }
 
     #[test]
