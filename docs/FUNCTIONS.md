@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-110 function names listed below, grouped for reading.
+114 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -36,8 +36,9 @@ refusal instead of exporting different references.
 Deliberately unsupported: `TODAY`, `NOW`, `RAND` and every other volatile
 function (until the calculation context consumes stored tick events), external workbook references,
 3D references, spilling array formulas, `INDIRECT`, `OFFSET`,
-`CELL`, add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`
-and `TEXT`, and the 1904 date system.
+`CELL`, add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`,
+and the 1904 date system. `TEXT` accepts only the locale-free codes listed
+with the text functions below.
 
 Approximate lookups (`VLOOKUP`/`HLOOKUP` without `FALSE`, `MATCH` types 1 and
 -1) binary-search sorted keys per Excel's documented contract; results over
@@ -77,6 +78,7 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `PRODUCT`
 - `SUMPRODUCT`
 - `MEDIAN`
+- `RANK`
 - `SUBTOTAL`
 - `STDEV`
 - `STDEV.S`
@@ -156,6 +158,8 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `CONCATENATE`
 - `TEXTJOIN`
 - `VALUE`
+- `TEXT`
+- `HYPERLINK`
 - `EXACT`
 - `FIND`
 - `REPT`
@@ -193,7 +197,18 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `NPV`
 - `XNPV`
 - `XIRR`
+- `RRI`
 
 
 `TEXTJOIN` joins scalar and bounded range arguments in row order, can skip blanks
 and empty strings, propagates errors, and refuses output beyond 32,767 UTF-16 units.
+
+`TEXT` formats a number with one code, compared without regard to case:
+`General`, `0`, `0.00`, `#`, `#,##0`, `#,##0.00`, `0%`, `0.00%`, `yyyy-mm-dd`,
+or `mm/dd/yyyy`. Any other code, including a literal suffix such as `0.0x`,
+is `#VALUE!`. `#` rounds half away from zero to an integer and shows nothing
+for zero. Date codes use the 1900 serial, including the fictitious 1900-02-29.
+`HYPERLINK` returns its friendly name, or the link when the name is omitted,
+and does not fetch the target. `RANK` is a competition rank over numbers in
+the reference (ties share a rank and the next rank is skipped); a zero or
+omitted order ranks the largest first. `RRI` is `(fv/pv)^(1/nper)-1`.
