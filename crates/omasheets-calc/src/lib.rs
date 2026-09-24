@@ -322,6 +322,7 @@ enum Function {
     Today,
     Now,
     Rand,
+    RandBetween,
     Offset,
     Indirect,
     Transpose,
@@ -431,12 +432,6 @@ enum Function {
     Rank,
     Text,
     Rri,
-    Today,
-    Now,
-    Rand,
-    RandBetween,
-    Offset,
-    Indirect,
 }
 
 /// A parsed formula whose cell references can be enumerated and rebound
@@ -864,6 +859,13 @@ impl Workbook {
     ) {
         self.external
             .insert(link_index, book_file, sheet, row, column, value);
+    }
+
+    /// Records that an external sheet exists even when it has no cached cells.
+    /// A later formula that names this sheet and misses a cell is blank, not
+    /// `#REF!`. An unknown sheet stays `#REF!`.
+    pub fn note_external_sheet(&mut self, link_index: u32, book_file: Option<&str>, sheet: &str) {
+        self.external.note_sheet(link_index, book_file, sheet);
     }
 
     pub fn set_error(&mut self, cell: CellId, error: CalcError) -> RecalcReport {
@@ -2083,12 +2085,7 @@ impl Workbook {
             | Function::Rank
             | Function::Text
             | Function::Rri
-            | Function::Today
-            | Function::Now
-            | Function::Rand
-            | Function::RandBetween
-            | Function::Offset
-            | Function::Indirect => Value::Error(CalcError::InvalidArguments),
+            | Function::RandBetween => Value::Error(CalcError::InvalidArguments),
         }
     }
 
@@ -4789,6 +4786,10 @@ struct ExternalRangeKey {
 struct ExternalCache {
     by_index: HashMap<(u32, String, u32, u32), Value>,
     by_file: HashMap<(String, String, u32, u32), Value>,
+    /// Sheets the cache or a loaded target workbook knows, even with no cells.
+    /// A missing cell on one of these sheets is blank; an unknown sheet is `#REF!`.
+    sheets_by_index: HashSet<(u32, String)>,
+    sheets_by_file: HashSet<(String, String)>,
     /// Distinct external rectangles, each stored once for every formula and
     /// defined name that names the same cells.
     interned: RefCell<HashMap<ExternalRangeKey, ArrayValue>>,
@@ -4806,6 +4807,7 @@ impl ExternalCache {
         value: Value,
     ) {
         let sheet = sheet.trim().to_lowercase();
+        self.note_sheet(link_index, book_file, &sheet);
         self.by_index
             .insert((link_index, sheet.clone(), row, column), value.clone());
         if let Some(file) = book_file {
@@ -4813,6 +4815,28 @@ impl ExternalCache {
             if !file.is_empty() {
                 self.by_file.insert((file, sheet, row, column), value);
             }
+        }
+    }
+
+    fn note_sheet(&mut self, link_index: u32, book_file: Option<&str>, sheet: &str) {
+        let sheet = sheet.trim().to_lowercase();
+        if sheet.is_empty() {
+            return;
+        }
+        self.sheets_by_index.insert((link_index, sheet.clone()));
+        if let Some(file) = book_file {
+            let file = external_file_key(file);
+            if !file.is_empty() {
+                self.sheets_by_file.insert((file, sheet));
+            }
+        }
+    }
+
+    fn knows_sheet(&self, book: &ExternalBook, sheet: &str) -> bool {
+        let sheet = sheet.trim().to_lowercase();
+        match book {
+            ExternalBook::Index(index) => self.sheets_by_index.contains(&(*index, sheet)),
+            ExternalBook::File(file) => self.sheets_by_file.contains(&(file.clone(), sheet)),
         }
     }
 
@@ -4941,6 +4965,9 @@ fn external_rectangle(
 fn lower_external_scalar(cache: &ExternalCache, address: &ExternalAddress) -> Expr {
     match cache.get(&address.book, &address.sheet, address.row, address.column) {
         Some(value) => value_to_expr(value.clone()),
+        // The sheet is real and this cell was simply empty. A formula that
+        // returns that blank shows 0, matching Excel. An unknown sheet is `#REF!`.
+        None if cache.knows_sheet(&address.book, &address.sheet) => Expr::Empty,
         None => Expr::Error(CalcError::InvalidReference),
     }
 }
@@ -5949,54 +5976,12 @@ fn volatile_function<T>(e: &Expr<T>) -> Option<&'static str> {
         _ => None,
     }
 }
-fn literal_integer(e: &Expr) -> Option<i64> {
-    match e {
-        Expr::Number(n) if n.is_finite() && n.abs() < 1.0e9 => Some(n.trunc() as i64),
-        Expr::UnaryMinus(e) => literal_integer(e).map(|n| -n),
-        Expr::Empty => Some(0),
-        _ => None,
-    }
-}
-fn literal_offset(args: &[Expr]) -> Result<Expr, FormulaError> {
-    if !(3..=5).contains(&args.len()) {
-        return Ok(Expr::Error(CalcError::InvalidArguments));
-    }
-    let Some((first, last)) = reference_bounds(&args[0]) else {
-        return Ok(Expr::Error(CalcError::InvalidReference));
-    };
-    let literal = |e: &Expr| {
-        literal_integer(e).ok_or_else(|| {
-            FormulaError::UnsupportedFunction(
-                "OFFSET requires literal offsets and dimensions".into(),
-            )
-        })
-    };
-    let row = i64::from(first.row) + literal(&args[1])?;
-    let col = i64::from(first.column) + literal(&args[2])?;
-    let h = match args.get(3) {
-        None | Some(Expr::Empty) => i64::from(last.row - first.row) + 1,
-        Some(e) => literal(e)?,
-    };
-    let w = match args.get(4) {
-        None | Some(Expr::Empty) => i64::from(last.column - first.column) + 1,
-        Some(e) => literal(e)?,
-    };
-    if row < 0 || col < 0 || h <= 0 || w <= 0 || row + h > 1_048_576 || col + w > 16_384 {
-        return Ok(Expr::Error(CalcError::InvalidReference));
-    }
-    let a = CellId::new(first.sheet, row as u32, col as u32);
-    let b = CellId::new(first.sheet, (row + h - 1) as u32, (col + w - 1) as u32);
-    if a == b {
-        Ok(Expr::Reference(a))
-    } else {
-        expand_range(a, b)
-    }
-}
 
 const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("TODAY", Function::Today),
     ("NOW", Function::Now),
     ("RAND", Function::Rand),
+    ("RANDBETWEEN", Function::RandBetween),
     ("OFFSET", Function::Offset),
     ("INDIRECT", Function::Indirect),
     ("TRANSPOSE", Function::Transpose),
@@ -6113,12 +6098,6 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("REPT", Function::Rept),
     ("ROW", Function::Row),
     ("COLUMN", Function::Column),
-    ("TODAY", Function::Today),
-    ("NOW", Function::Now),
-    ("RAND", Function::Rand),
-    ("RANDBETWEEN", Function::RandBetween),
-    ("OFFSET", Function::Offset),
-    ("INDIRECT", Function::Indirect),
 ];
 
 /// The supported function names in registry order.
@@ -7679,6 +7658,14 @@ mod tests {
         assert_eq!(cached.value(cell(0, 5)), Value::Number(12.0));
         cached.set_formula(cell(0, 6), "=SUM(Block)").unwrap();
         assert_eq!(cached.value(cell(0, 6)), Value::Number(15.0));
+        // Inputs is known, so an uncached cell is blank and the formula shows 0.
+        cached.set_formula(cell(2, 0), "=[1]Inputs!B1").unwrap();
+        assert_eq!(cached.value(cell(2, 0)), Value::Number(0.0));
+        cached.set_formula(cell(2, 1), "=[1]Missing!A1").unwrap();
+        assert_eq!(
+            cached.value(cell(2, 1)),
+            Value::Error(CalcError::InvalidReference)
+        );
         cached
             .set_formula(cell(1, 0), "=SUM([1]Inputs!A1:[1]Inputs!A3)")
             .unwrap();

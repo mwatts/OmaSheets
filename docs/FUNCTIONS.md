@@ -41,13 +41,20 @@ relative path under the source workbook's directory, or when an absolute or
 `file://` target names a file sitting next to the source. Network targets,
 `..`, and a symlink that escapes that directory are not opened. A workbook
 already being imported keeps the stored link cache, and that cache is also
-used when the file is not opened. Cached external strings keep their decoded
-whitespace, including empty values. Occupied cells, cached link records and
-opened targets share the importer's cell budget. A single cell with no value
-in the opened file or the cache is `#REF!`. A missing cell inside an external
-range is blank.
+used when the file is not opened. A same-named file reached only as the base
+name of an absolute or `file://` target does not replace a populated cache.
+Cached external strings keep their decoded whitespace, including empty values.
+Occupied cells, cached link records and opened targets share the importer's
+cell budget. A cell on a sheet that cache or target workbook knows, with no
+stored value, is blank, and a formula that returns that blank shows 0. An
+unknown sheet or link is `#REF!`. A missing cell inside an external range is
+blank.
 `TODAY`, `NOW`, `RAND` and `RANDBETWEEN` read the stored tick and never the
-system clock. With no tick they are `#N/A`. `OFFSET` with constant arguments
+system clock. With no tick they are `#N/A`. Import sets that tick from the
+cached numeric value of a `TODAY()` or `NOW()` cell, as a 1900 serial read
+in UTC, before formulas are installed. `NOW()` keeps the time fraction when
+the cache has one. A workbook with no such cached cell stays at no tick.
+`OFFSET` with constant arguments
 is an ordinary range; a dynamic shift keeps that shift's rectangle as its
 dependency envelope. `INDIRECT` accepts one A1 reference or range, optionally
 sheet-qualified. Deliberately unsupported: 3D references, `CELL`, `FILTER`,
@@ -63,12 +70,6 @@ unsorted keys are undefined in Excel and are not promised here.
 ## Registry
 
 ### Explicit tick and bounded references
-
-- `TODAY`
-- `NOW`
-- `RAND`
-- `OFFSET`
-- `INDIRECT`
 
 `TODAY`, `NOW` and `RAND` require a persisted `Tick` event before a formula
 can be installed. Use Commands → Data → Refresh date and random formulas
@@ -244,7 +245,9 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 
 
 `TODAY` is the 1900 serial of the tick instant's UTC date. `NOW` adds the
-time-of-day fraction. `RAND` and `RANDBETWEEN` are deterministic in the tick
+time-of-day fraction. Import replays a cached `TODAY()` or `NOW()` serial
+as that instant and does not read a clock; `RAND` still will not match
+Excel's generator. `RAND` and `RANDBETWEEN` are deterministic in the tick
 number and the calling cell: the same tick replays the same value, and a new
 tick changes it. `OFFSET` refuses a result outside the grid with `#REF!` and
 a height or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of anything

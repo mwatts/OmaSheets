@@ -632,7 +632,12 @@ impl Workbook {
                         SpillPreview::Array(array)
                     }
                     Ok(array) => SpillPreview::Scalar(
-                        array.values.into_iter().next().unwrap_or(Value::Blank),
+                        array
+                            .values
+                            .iter()
+                            .cloned()
+                            .next()
+                            .unwrap_or(Value::Blank),
                     ),
                     Err(error) => SpillPreview::Scalar(Value::Error(error)),
                 }
@@ -723,7 +728,7 @@ impl Workbook {
             SpillRecord {
                 rows: array.rows,
                 columns: array.columns,
-                values: array.values,
+                values: array.values.to_vec(),
                 members: members.clone(),
             },
         );
