@@ -36,15 +36,22 @@ whose current A1 spelling cannot preserve those identities reports a projection
 refusal instead of exporting different references.
 
 `TODAY`, `NOW`, `RAND` and `RANDBETWEEN` read the stored tick and never the
-system clock. With no tick they are `#N/A`. `OFFSET` with constant arguments
+system clock. With no tick they are `#N/A`. Import sets that tick from the
+cached numeric value of a `TODAY()` or `NOW()` cell, as a 1900 serial read
+in UTC, before formulas are installed. `NOW()` keeps the time fraction when
+the cache has one. A workbook with no such cached cell stays at no tick.
+`OFFSET` with constant arguments
 is an ordinary range; a dynamic shift keeps that shift's rectangle as its
 dependency envelope. `INDIRECT` accepts one A1 reference or range, optionally
 sheet-qualified. An external workbook reference (`[1]Sheet!A1`,
 `[Book.xlsx]Sheet!A1`, or `'[Book.xlsx]Sheet 1'!A1`) compiles and reads the
-target workbook when that file is next to the source. The stored
-external-link cache is used only when the file is absent. A single cell
-with no value in that file or cache is `#REF!`, and a missing cell inside
-a cached external range is blank.
+target workbook when that file is a relative path next to the source. The
+stored external-link cache is used when the file is absent. A same-named
+file reached only as the base name of an absolute or `file://` target does
+not replace a populated cache. A cell on a sheet that cache or target
+workbook knows, with no stored value, is blank, and a formula that returns
+that blank shows 0. An unknown sheet or link is `#REF!`. A missing cell
+inside a cached external range is blank.
 Deliberately unsupported: 3D references, `CELL`, `FILTER`, `UNIQUE`, `SORT`,
 add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`,
 and the 1904 date system. `TEXT` accepts only the locale-free codes listed
@@ -217,7 +224,9 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 
 
 `TODAY` is the 1900 serial of the tick instant's UTC date. `NOW` adds the
-time-of-day fraction. `RAND` and `RANDBETWEEN` are deterministic in the tick
+time-of-day fraction. Import replays a cached `TODAY()` or `NOW()` serial
+as that instant and does not read a clock; `RAND` still will not match
+Excel's generator. `RAND` and `RANDBETWEEN` are deterministic in the tick
 number and the calling cell: the same tick replays the same value, and a new
 tick changes it. `OFFSET` refuses a result outside the grid with `#REF!` and
 a height or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of anything
