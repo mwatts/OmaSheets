@@ -31,40 +31,45 @@ unsupported-function distribution and the failure kinds), and
 baseline engine named in that delta. Both are aggregate only; the JSON records
 the exact engine revisions and runners.
 
-The latest comparison was scored on 2026-09-08, sequentially on one GitHub
-`ubuntu-latest` runner with separate build directories. Both revisions used
-the same frozen 1,000-workbook manifest and exposed 924,235 formula cells.
-[Workflow evidence](https://github.com/tcballard/OmaSheets/actions/runs/34254502652).
+The latest score was taken on 2026-09-24 at engine `371fc30` in one Linux
+aarch64 container. The frozen 1,000-workbook manifest is unchanged and still
+exposes 924,235 formula cells. `enron-figshare.score-delta.json` remains the
+2026-09-08 paired comparison and was not recomputed.
+[Workflow evidence](https://github.com/tcballard/OmaSheets/actions/runs/34254502652)
+for that earlier run.
 
-| Owned engine lane | Baseline (`ecf0036`) | Formula coverage (`12d1c8c`) |
+| Owned engine lane | 2026-09-08 (`12d1c8c`) | 2026-09-24 (`371fc30`) |
 |---|---:|---:|
 | Workbooks opened | 996 / 1,000 | 996 / 1,000 |
 | Formula cells observed | 924,235 | 924,235 |
-| Loaded and compared | 825,016 (89.26%) | 829,529 (89.75%) |
-| Stored values matched | 823,932 | 828,437 |
-| Match rate of compared | 99.87% | 99.87% |
-| Stored values mismatched | 1,084 | 1,092 |
-| Not compiled | 99,219 | 94,706 |
+| Loaded and compared | 829,529 (89.75%) | 881,148 (95.34%) |
+| Stored values matched | 828,437 | 852,505 |
+| Match rate of compared | 99.87% | 96.75% |
+| Stored values mismatched | 1,092 | 28,643 |
+| Not compiled | 94,706 | 43,087 |
 
-This adds 4,513 compiled formulas and 4,505 stored-value matches without
-changing the sample, comparison tolerance or denominator. The eight additional
-mismatches remain visible. The aggregate cannot attribute them to individual
-formulas or establish that every previously matched cell is unchanged.
+This compiles 51,619 more formulas than the 2026-09-08 aggregate and matches
+24,068 more stored values, without changing the sample or denominator.
+Mismatches rise from 1,092 to 28,643, so the match rate of compared cells
+falls from 99.87% to 96.75%. The aggregate cannot attribute those mismatches
+to individual formulas or establish that every previously matched cell is
+unchanged.
 
-Parser work also reveals later failures: the 10,791 syntax classifications
-are gone, while invalid references rise from 4,260 to 10,551 and unsupported
-function classifications rise from 26,617 to 28,967. `OFFSET` now accounts for
-3,619 first failures; previously some of these stopped at a syntax or name
-error. A lower count in an early failure class does not mean every affected
-formula now compiles.
+First-failure classes also move. Invalid references fall from 10,551 to none,
+while cycles rise from 2,292 to 7,494 and structured references account for
+5. Unsupported functions fall from 28,967 to 23,367 and unsupported names
+from 5,767 to 3,550. A lower count in an early failure class does not mean
+every affected formula now compiles.
 
-The remaining first-failure groups are 47,007 external workbook references,
-28,967 unsupported functions, 10,551 invalid references, 5,767 unsupported
-name definitions, 2,292 cycles and 122 unknown names. Within unsupported
-functions, 21,737 cells call proprietary add-ins. Ordinary gaps include
-`OFFSET`, locale-sensitive `DATEVALUE`, volatile functions and `INDIRECT`.
-External/add-in execution and hidden clock or random state remain refused.
-These are compatibility measurements, not target-desktop performance claims.
+The remaining first-failure groups are 8,549 external workbook references,
+23,367 unsupported functions, 7,494 cycles, 3,550 unsupported name
+definitions, 122 unknown names and 5 structured references. Within
+unsupported functions, 21,737 cells still call proprietary add-ins. Ordinary
+gaps that remain include locale-sensitive `DATEVALUE`, `LINEST`, `CELL` and
+`ROWS`. `OFFSET`, `INDIRECT`, `TEXT`, `TODAY`, `NOW`, `RAND` and the database
+aggregates are no longer in the first-failure table. External references that
+still do not resolve, and add-in execution, remain refused. These are
+compatibility measurements, not target-desktop performance claims.
 
 
 Generate both files from a measured schema-2 scorer report with
