@@ -19,8 +19,9 @@
 //! - only the 1900 date system is supported; 1904-epoch workbooks are
 //!   rejected explicitly by the importer rather than silently offset.
 //!
-//! Nothing here reads a clock. `TODAY` and `NOW` use an explicitly persisted
-//! UTC tick, so reopening a workbook never changes its values.
+//! Nothing here reads a clock. `TODAY` and `NOW` convert a stored tick
+//! instant ([`serial_from_unix_millis`]) so reopening a workbook cannot
+//! change a value unless a new tick was recorded.
 
 use crate::CalcError;
 
@@ -46,7 +47,6 @@ pub fn serial_from_unix_millis(millis: i64) -> Result<f64, CalcError> {
     let serial = serial_from_civil(date.year, i64::from(date.month), i64::from(date.day))?;
     Ok(serial as f64 + (within as f64) / (MILLIS_PER_DAY as f64))
 }
-
 /// Unix milliseconds for an Excel 1900 serial, UTC, without reading a clock.
 /// The fraction is the time of day, rounded to the nearest millisecond.
 /// The fictitious serial `60` (1900-02-29) has no UTC instant and is `#NUM!`.

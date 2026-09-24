@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-119 function names listed below, grouped for reading.
+120 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -19,8 +19,10 @@ aggregate arguments (`SUM(IF(A1:A5=0,0,B1:B5))`, `SUMPRODUCT((A1:A5>2)*B1:B5)`).
 Rectangular array constants support numbers, text, booleans and error literals,
 comma-separated columns and semicolon-separated rows, up to 1,000,000 values.
 They work in aggregates, elementwise expressions and INDEX/MATCH/LOOKUP,
-VLOOKUP/HLOOKUP/XLOOKUP. A scalar use takes the first value; spilling into
-neighbouring cells is not implemented. `_xlfn.` and `_xlfn._xlws.` prefixes
+VLOOKUP/HLOOKUP/XLOOKUP. A scalar use takes the first value. A root
+`TRANSPOSE`, `MMULT` or array constant spills into the rectangle whose
+top-left is the formula, up to 1,000,000 values; a blocked or out-of-grid
+rectangle is `#SPILL!`. `_xlfn.` and `_xlfn._xlws.` prefixes
 resolve only to functions already in the registry.
 
 `INDEX` also returns references: `SUM(A1:INDEX(A1:A100,D1))` follows the
@@ -50,14 +52,17 @@ is compiled without that requirement, a cell on a sheet the cache or target
 workbook knows, with no stored value, is blank and shows 0. An unknown sheet
 or link is `#REF!`. A missing cell inside an external range on a resolved
 sheet is blank.
-`TODAY`, `NOW`, and `RAND` read the stored tick and never the system clock.
-Import sets that tick from the cached numeric value of a `TODAY()` or `NOW()`
-cell, as a 1900 serial read in UTC, before formulas are installed. `NOW()`
-keeps the time fraction when the cache has one. A workbook with no such
-cached cell stays at no tick, so those formulas are not installed.
-Deliberately unsupported: clock/random evaluation without an explicit tick,
-3D references, spilling array formulas, dynamic `INDIRECT`/`OFFSET` arguments,
-`CELL`, add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`,
+`TODAY`, `NOW`, `RAND`, and `RANDBETWEEN` read the stored tick and never the
+system clock. Import sets that tick from the cached numeric value of a `TODAY()`
+or `NOW()` cell, as a 1900 serial read in UTC, before formulas are installed.
+`NOW()` keeps the time fraction when the cache has one. A workbook with no such
+cached cell stays at no tick, so those formulas are not installed. `OFFSET`
+with constant arguments is an ordinary range; a dynamic shift keeps that
+shift's rectangle as its dependency envelope. `INDIRECT` accepts one A1
+reference or range, optionally sheet-qualified. A root `TRANSPOSE`, `MMULT`,
+or array constant spills into a bounded rectangle. Deliberately unsupported:
+3D references, `CELL`, `FILTER`, `UNIQUE`, `SORT`, add-in (`_xll.`) calls,
+locale-sensitive parsing such as `DATEVALUE`,
 and the 1904 date system. `TEXT` accepts only the locale-free codes listed
 with the text functions below.
 
@@ -69,24 +74,17 @@ unsorted keys are undefined in Excel and are not promised here.
 
 ### Explicit tick and bounded references
 
-- `TODAY`
-- `NOW`
-- `RAND`
-- `OFFSET`
-- `INDIRECT`
-
-`TODAY`, `NOW` and `RAND` require a persisted `Tick` event before a formula
+`TODAY`, `NOW`, `RAND`, and `RANDBETWEEN` require a persisted `Tick` event before a formula
 can be installed. Use Commands → Data → Refresh date and random formulas
 to create or update that tick. Tick timestamps are UTC Unix milliseconds. Recalculation and
 reopen reuse that tick; a new explicit tick updates the values and dependents.
 RAND uses a fixed deterministic mixing algorithm with the tick, stable native
 cell identity and call order. It is not cryptographic randomness.
 
-`OFFSET` accepts bounded reference arguments with literal numeric offsets and
-sizes. `INDIRECT` accepts literal A1 text within this workbook. They compile to
-normal tracked references and retain native stable-ID behavior after edits.
-Dynamic text/offset expressions and R1C1 mode are explicitly refused pending a
-bounded dynamic-dependency design.
+`OFFSET` accepts a reference plus row and column shifts. Constant shifts compile
+to an ordinary range. A dynamic shift keeps that shift's rectangle as its
+dependency envelope. `INDIRECT` accepts one A1 reference or range, optionally
+sheet-qualified. R1C1 text, 3D references, and external targets are `#REF!`.
 
 ### Matrices and databases
 
@@ -186,6 +184,8 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `LOG`
 - `LOG10`
 - `PI`
+- `RAND`
+- `RANDBETWEEN`
 
 ### Text
 
@@ -216,6 +216,8 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `ROW`
 - `COLUMN`
 - `LOOKUP`
+- `OFFSET`
+- `INDIRECT`
 
 ### Dates (1900 serial system)
 
@@ -230,6 +232,8 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `DAYS360`
 - `NETWORKDAYS`
 - `WORKDAY`
+- `TODAY`
+- `NOW`
 
 ### Financial
 
@@ -244,7 +248,12 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 
 `TODAY` is the 1900 serial of the tick instant's UTC date. `NOW` adds the
 time-of-day fraction. Import replays a cached `TODAY()` or `NOW()` serial
-as that instant and does not read a clock.
+as that instant and does not read a clock. `RAND` and `RANDBETWEEN` are
+deterministic in the tick number and the calling cell: the same tick replays
+the same value, and a new tick changes it. `OFFSET` refuses a result outside
+the grid with `#REF!` and a height or width over 1,000,000 cells with `#NUM!`.
+`INDIRECT` of anything other than A1 text (`#REF!`, R1C1, 3D or an external
+workbook) is `#REF!`.
 
 `TEXTJOIN` joins scalar and bounded range arguments in row order, can skip blanks
 and empty strings, propagates errors, and refuses output beyond 32,767 UTF-16 units.
