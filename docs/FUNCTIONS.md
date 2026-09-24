@@ -39,9 +39,14 @@ refusal instead of exporting different references.
 system clock. With no tick they are `#N/A`. `OFFSET` with constant arguments
 is an ordinary range; a dynamic shift keeps that shift's rectangle as its
 dependency envelope. `INDIRECT` accepts one A1 reference or range, optionally
-sheet-qualified. Deliberately unsupported: external workbook references,
-3D references, `CELL`, `FILTER`, `UNIQUE`, `SORT`, add-in (`_xll.`) calls,
-locale-sensitive parsing such as `DATEVALUE`,
+sheet-qualified. An external workbook reference (`[1]Sheet!A1`,
+`[Book.xlsx]Sheet!A1`, or `'[Book.xlsx]Sheet 1'!A1`) compiles and reads the
+target workbook when that file is next to the source. The stored
+external-link cache is used only when the file is absent. A single cell
+with no value in that file or cache is `#REF!`, and a missing cell inside
+a cached external range is blank.
+Deliberately unsupported: 3D references, `CELL`, `FILTER`, `UNIQUE`, `SORT`,
+add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`,
 and the 1904 date system. `TEXT` accepts only the locale-free codes listed
 with the text functions below.
 
