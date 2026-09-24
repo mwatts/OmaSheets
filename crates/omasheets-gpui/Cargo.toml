@@ -12,3 +12,7 @@ omasheets-calc = { path = "../omasheets-calc" }
 omasheets-core = { path = "../omasheets-core" }
 omasheets-xlsx = { path = "../omasheets-xlsx" }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+gpui-kit = { version = "0.6", features = ["test-support"] }
+omasheets-core = { path = "../omasheets-core" }
