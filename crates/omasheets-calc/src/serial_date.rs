@@ -19,9 +19,9 @@
 //! - only the 1900 date system is supported; 1904-epoch workbooks are
 //!   rejected explicitly by the importer rather than silently offset.
 //!
-//! Nothing here reads a clock. `TODAY` and `NOW` stay out of the engine until
-//! explicit tick-event semantics exist, because reopening a workbook must not
-//! silently change its values.
+//! Nothing here reads a clock. `TODAY` and `NOW` convert a stored tick
+//! instant ([`serial_from_unix_millis`]) so reopening a workbook cannot
+//! change a value unless a new tick was recorded.
 
 use crate::CalcError;
 
@@ -33,6 +33,20 @@ pub const MIN_SERIAL: i64 = 0;
 pub const MAX_SERIAL: i64 = 2_958_465;
 /// The fictitious 1900-02-29.
 pub const LEAP_BUG_SERIAL: i64 = 60;
+/// Milliseconds in a UTC day. Time-of-day is this fraction of a serial.
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
+/// Excel 1900 serial for a UTC instant in Unix milliseconds, including the
+/// time-of-day fraction. Does not read a clock. The civil date is converted
+/// through [`serial_from_civil`], so the 1900 leap-day quirk applies. Instants
+/// outside serial `0..=2_958_465` are `#NUM!`.
+pub fn serial_from_unix_millis(millis: i64) -> Result<f64, CalcError> {
+    let days = millis.div_euclid(MILLIS_PER_DAY);
+    let within = millis.rem_euclid(MILLIS_PER_DAY);
+    let date = civil_from_days(days);
+    let serial = serial_from_civil(date.year, i64::from(date.month), i64::from(date.day))?;
+    Ok(serial as f64 + (within as f64) / (MILLIS_PER_DAY as f64))
+}
 /// 1970-01-01 in the 1900 date system.
 const UNIX_EPOCH_SERIAL: i64 = 25_569;
 /// Largest magnitude accepted for a `DATE`/`EDATE`/`EOMONTH` component before

@@ -8,6 +8,7 @@
 //! boundary rules and the deliberately unsupported cases.
 
 mod database;
+mod hard;
 mod matrix;
 mod reference;
 pub mod serial_date;
@@ -95,6 +96,8 @@ pub enum CalcError {
     InvalidName,
     /// Excel `#NULL!`, only ever imported or written as a literal.
     NullIntersection,
+    /// Excel `#SPILL!`: a dynamic array could not write its rectangle.
+    Spill,
     /// Wrong argument count or shape for the function.
     InvalidArguments,
 }
@@ -110,6 +113,7 @@ impl CalcError {
             Self::InvalidNumber => "#NUM!",
             Self::InvalidName => "#NAME?",
             Self::NullIntersection => "#NULL!",
+            Self::Spill => "#SPILL!",
             Self::InvalidArguments => "#ARGS!",
         }
     }
@@ -123,6 +127,7 @@ impl CalcError {
             "#NUM!" => Self::InvalidNumber,
             "#NAME?" => Self::InvalidName,
             "#NULL!" => Self::NullIntersection,
+            "#SPILL!" => Self::Spill,
             _ => return None,
         })
     }
@@ -410,6 +415,12 @@ enum Function {
     Rank,
     Text,
     Rri,
+    Today,
+    Now,
+    Rand,
+    RandBetween,
+    Offset,
+    Indirect,
 }
 
 /// A parsed formula whose cell references can be enumerated and rebound
@@ -638,6 +649,12 @@ enum Input {
     Range {
         shape: RangeShape,
     },
+    /// The workbook tick. Volatile formulas depend on this node.
+    Tick,
+    /// A cell displaying one element of another formula's spilled array.
+    Spill {
+        anchor: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -713,6 +730,17 @@ pub struct Workbook {
     /// and `ROW()`/`COLUMN()`. Evaluation is sequential, so a plain cell is
     /// enough.
     evaluating: std::cell::Cell<CellId>,
+    /// `(tick number, unix milliseconds)`. None until the first tick.
+    tick: Option<(u64, i64)>,
+    tick_node: Option<usize>,
+    spills: HashMap<usize, hard::SpillRecord>,
+    spill_followups: Vec<usize>,
+    /// Dynamic reference targets currently spliced into `dependencies`.
+    dynamic_edges: HashMap<usize, Vec<usize>>,
+    dynamic_errors: HashMap<usize, CalcError>,
+    /// Set by `set_parsed_formula` for the `commit` that installs it.
+    pending_dynamic: Option<Vec<usize>>,
+    eval_marks: Vec<u64>,
 }
 
 impl Default for Workbook {
@@ -731,6 +759,14 @@ impl Default for Workbook {
             generation: 1,
             bulk: None,
             evaluating: std::cell::Cell::new(CellId::new(0, 0, 0)),
+            tick: None,
+            tick_node: None,
+            spills: HashMap::new(),
+            spill_followups: Vec::new(),
+            dynamic_edges: HashMap::new(),
+            dynamic_errors: HashMap::new(),
+            pending_dynamic: None,
+            eval_marks: Vec::new(),
         }
     }
 }
@@ -820,9 +856,14 @@ impl Workbook {
         formula: ParsedFormula,
     ) -> Result<RecalcReport, FormulaError> {
         let parsed = reference::narrow_reference_dependencies(formula.expression);
-        let mut cells = BTreeSet::new();
-        let mut range_keys = Vec::new();
-        collect_dependencies(&parsed, &mut cells, &mut range_keys);
+        let mut structural_cells = BTreeSet::new();
+        let mut structural_ranges = Vec::new();
+        collect_dependencies(&parsed, &mut structural_cells, &mut structural_ranges);
+        let (dynamic_cells, dynamic_ranges) = self.preview_dynamic_binding(cell.sheet, &parsed);
+        let mut cells = structural_cells.clone();
+        cells.extend(dynamic_cells.iter().copied());
+        let mut range_keys = structural_ranges.clone();
+        range_keys.extend(dynamic_ranges.iter().cloned());
         let mut range_nodes: HashMap<RangeKey, usize> = HashMap::new();
         for key in range_keys {
             let node = self.ensure_range(&key);
@@ -834,14 +875,31 @@ impl Workbook {
             }
             return Err(FormulaError::Cycle(path));
         }
+        let structural_indices: HashSet<usize> = structural_cells
+            .iter()
+            .map(|dependency| self.ensure_cell(*dependency))
+            .chain(structural_ranges.iter().map(|key| range_nodes[key]))
+            .collect();
+        let mut dynamic_indices: Vec<usize> = dynamic_cells
+            .iter()
+            .map(|dependency| self.ensure_cell(*dependency))
+            .chain(dynamic_ranges.iter().map(|key| range_nodes[key]))
+            .filter(|index| !structural_indices.contains(index))
+            .collect();
+        dynamic_indices.sort_unstable();
+        dynamic_indices.dedup();
         let mut dependencies: Vec<usize> = cells
             .into_iter()
             .map(|dependency| self.ensure_cell(dependency))
             .collect();
         dependencies.extend(range_nodes.values().copied());
+        if hard::expression_is_volatile(&parsed) {
+            dependencies.push(self.ensure_tick_node());
+        }
         dependencies.sort_unstable();
         dependencies.dedup();
         let expression = compile_expression(parsed, &self.indices, &range_nodes);
+        self.pending_dynamic = Some(dynamic_indices);
         Ok(self.commit(cell, Input::Formula(expression), dependencies))
     }
 
@@ -914,10 +972,12 @@ impl Workbook {
             self.cells.push(cell);
             self.dirty_marks.push(0);
             self.pending.push(0);
+            self.eval_marks.push(0);
         } else {
             self.cells[node] = cell;
             self.dirty_marks[node] = 0;
             self.pending[node] = 0;
+            self.eval_marks[node] = 0;
         }
         self.ranges.insert(key.clone(), node);
         node
@@ -1014,7 +1074,7 @@ impl Workbook {
         for dependent in &self.cells[index].dependents {
             visit(*dependent);
         }
-        if !matches!(self.cells[index].input, Input::Range { .. }) {
+        if !matches!(self.cells[index].input, Input::Range { .. } | Input::Tick) {
             for node in self.covering_nodes(self.cells[index].id) {
                 visit(node);
             }
@@ -1031,8 +1091,8 @@ impl Workbook {
                     statistics.formula_cells += 1;
                     statistics.expression_nodes += count_nodes(expression);
                 }
-                Input::Literal(_) => statistics.cells += 1,
-                Input::Vacant => continue,
+                Input::Literal(_) | Input::Spill { .. } => statistics.cells += 1,
+                Input::Tick | Input::Vacant => continue,
             }
             statistics.dependency_edges += cell.dependencies.len();
             statistics.dependent_edges += cell.dependents.len();
@@ -1166,11 +1226,20 @@ impl Workbook {
         });
         self.dirty_marks.push(0);
         self.pending.push(0);
+        self.eval_marks.push(0);
         index
     }
 
     fn commit(&mut self, cell: CellId, input: Input, dependencies: Vec<usize>) -> RecalcReport {
         let changed = self.ensure_cell(cell);
+        let mut extra = self.retract_spill(changed);
+        if let Input::Spill { anchor } = self.cells[changed].input {
+            extra.push(anchor);
+        }
+        extra.extend(self.anchors_covering(cell));
+        extra.retain(|index| *index != changed);
+        extra.sort_unstable();
+        extra.dedup();
         let previous = std::mem::take(&mut self.cells[changed].dependencies);
         for dependency in &previous {
             self.cells[*dependency]
@@ -1187,11 +1256,27 @@ impl Workbook {
         for dependency in previous {
             self.retire_range(dependency);
         }
+        match self.pending_dynamic.take() {
+            Some(dynamic) if !dynamic.is_empty() => {
+                self.dynamic_edges.insert(changed, dynamic);
+            }
+            Some(_) => {
+                self.dynamic_edges.remove(&changed);
+                self.dynamic_errors.remove(&changed);
+            }
+            None => {
+                self.dynamic_edges.remove(&changed);
+                self.dynamic_errors.remove(&changed);
+            }
+        }
+        let mut seeds = Vec::with_capacity(1 + extra.len());
+        seeds.push(changed);
+        seeds.extend(extra);
         if let Some(pending) = &mut self.bulk {
-            pending.push(changed);
+            pending.extend(seeds);
             return RecalcReport::default();
         }
-        self.recalculate(&[changed])
+        self.recalculate(&seeds)
     }
 
     /// Starts a bulk load: every edit until [`Workbook::end_bulk`] updates
@@ -1269,7 +1354,9 @@ impl Workbook {
                 // through which the cycle enters the range.
                 let mut cells: Vec<CellId> = path
                     .into_iter()
-                    .filter(|index| !matches!(self.cells[*index].input, Input::Range { .. }))
+                    .filter(|index| {
+                        !matches!(self.cells[*index].input, Input::Range { .. } | Input::Tick)
+                    })
                     .map(|index| self.cells[index].id)
                     .collect();
                 if cells.first() != Some(&changed) {
@@ -1289,9 +1376,27 @@ impl Workbook {
     }
 
     fn recalculate(&mut self, seeds: &[usize]) -> RecalcReport {
+        let mut report = self.recalculate_once(seeds);
+        for _ in 0..4 {
+            let follow = std::mem::take(&mut self.spill_followups);
+            if follow.is_empty() {
+                break;
+            }
+            let more = self.recalculate_once(&follow);
+            report.evaluated.extend(more.evaluated);
+        }
+        self.spill_followups.clear();
+        report
+    }
+
+    fn recalculate_once(&mut self, seeds: &[usize]) -> RecalcReport {
+        if self.eval_marks.len() < self.cells.len() {
+            self.eval_marks.resize(self.cells.len(), 0);
+        }
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
             self.dirty_marks.fill(0);
+            self.eval_marks.fill(0);
             self.generation = 1;
         }
         let generation = self.generation;
@@ -1314,7 +1419,7 @@ impl Workbook {
                     dirty.push(dependent);
                 }
             }
-            if !matches!(self.cells[index].input, Input::Range { .. }) {
+            if !matches!(self.cells[index].input, Input::Range { .. } | Input::Tick) {
                 let covering: Vec<usize> = self.covering_nodes(self.cells[index].id).collect();
                 for node in covering {
                     if self.dirty_marks[node] != generation {
@@ -1346,20 +1451,22 @@ impl Workbook {
         let mut released = Vec::new();
 
         while let Some(cell_index) = ready.pop_front() {
-            let value = match &self.cells[cell_index].input {
-                Input::Literal(value) => Some(value.clone()),
-                Input::Formula(expression) => {
-                    self.evaluating.set(self.cells[cell_index].id);
-                    Some(match self.evaluate(expression) {
+            let value = match self.step_cell(cell_index, generation) {
+                hard::StepResult::Deferred => continue,
+                hard::StepResult::Barrier => None,
+                hard::StepResult::Value(value) => {
+                    let value = if matches!(self.cells[cell_index].input, Input::Formula(_))
+                        && matches!(value, Value::Blank)
+                    {
                         // A formula whose result is an empty reference shows 0.
-                        Value::Blank => Value::Number(0.0),
-                        value => value,
-                    })
+                        Value::Number(0.0)
+                    } else {
+                        value
+                    };
+                    Some(value)
                 }
-                // A range node only orders its members before its readers.
-                Input::Range { .. } => None,
-                Input::Vacant => unreachable!("retired ranges have no edges"),
             };
+            self.eval_marks[cell_index] = generation;
             match value {
                 Some(value) => {
                     self.cells[cell_index].value = value;
@@ -1676,6 +1783,18 @@ impl Workbook {
         if function == Function::Rri {
             return self.evaluate_rri(arguments);
         }
+        if matches!(
+            function,
+            Function::Today | Function::Now | Function::Rand | Function::RandBetween
+        ) {
+            return self.evaluate_volatile(function, arguments);
+        }
+        if matches!(function, Function::Offset | Function::Indirect) {
+            return match self.reference_view(&Expr::Function(function, arguments.to_vec())) {
+                Ok(view) => view.scalar(self),
+                Err(error) => Value::Error(error),
+            };
+        }
 
         let mut values = Vec::new();
         for argument in arguments {
@@ -1854,7 +1973,13 @@ impl Workbook {
             | Function::Hyperlink
             | Function::Rank
             | Function::Text
-            | Function::Rri => Value::Error(CalcError::InvalidArguments),
+            | Function::Rri
+            | Function::Today
+            | Function::Now
+            | Function::Rand
+            | Function::RandBetween
+            | Function::Offset
+            | Function::Indirect => Value::Error(CalcError::InvalidArguments),
         }
     }
 
@@ -2567,6 +2692,9 @@ impl Workbook {
             Expr::Function(function @ (Function::Transpose | Function::MMult), arguments) => {
                 self.matrix_array(*function, arguments)
             }
+            Expr::Function(Function::Offset | Function::Indirect, _) => self
+                .reference_view(expression)
+                .map(|reference| reference.array(self)),
             Expr::Function(Function::Index, arguments) => self.index_array(arguments),
             Expr::Function(Function::ReferenceSpan, arguments) => self
                 .reference_span(arguments)
@@ -3017,6 +3145,9 @@ impl<'a> ArrayInput<'a> {
             Expr::Function(Function::Transpose | Function::MMult, _) => {
                 workbook.evaluate_array(expression).map(Self::Computed)
             }
+            Expr::Function(Function::Offset | Function::Indirect, _) => {
+                workbook.reference_view(expression).map(Self::Selection)
+            }
             Expr::Reference(_) | Expr::Function(Function::ReferenceSpan, _) => {
                 workbook.reference_view(expression).map(Self::Selection)
             }
@@ -3104,7 +3235,12 @@ fn contains_array_operand(expression: &Expr<usize>) -> bool {
         Expr::RangeNode { .. }
         | Expr::Array(_)
         | Expr::Function(
-            Function::Index | Function::ReferenceSpan | Function::Transpose | Function::MMult,
+            Function::Index
+            | Function::ReferenceSpan
+            | Function::Transpose
+            | Function::MMult
+            | Function::Offset
+            | Function::Indirect,
             _,
         ) => true,
         Expr::UnaryMinus(inner) | Expr::Percent(inner) => contains_array_operand(inner),
@@ -3180,6 +3316,10 @@ fn is_elementwise(function: Function) -> bool {
             | Function::Text
             | Function::Hyperlink
             | Function::Rri
+            | Function::Today
+            | Function::Now
+            | Function::Rand
+            | Function::RandBetween
     )
 }
 
@@ -4058,9 +4198,7 @@ fn format_text_value(value: &Value, format: &str) -> Result<String, CalcError> {
     };
     match format {
         TextFormat::General => format_general(number),
-        TextFormat::Integer { group, optional } => {
-            format_scaled(number, 0, group, optional, "")
-        }
+        TextFormat::Integer { group, optional } => format_scaled(number, 0, group, optional, ""),
         TextFormat::Fixed { decimals, group } => {
             format_scaled(number, i32::from(decimals), group, false, "")
         }
@@ -5063,7 +5201,7 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         self.skip_space();
         if self.peek() == Some(b')') {
             self.offset += 1;
-            return Ok(Expr::Function(function, arguments));
+            return self.finish_call(function, arguments);
         }
         loop {
             self.skip_space();
@@ -5083,7 +5221,86 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
                 _ => return Err(FormulaError::UnexpectedToken(self.offset)),
             }
         }
-        Ok(Expr::Function(function, arguments))
+        self.finish_call(function, arguments)
+    }
+
+    fn finish_call(&self, function: Function, arguments: Vec<Expr>) -> Result<Expr, FormulaError> {
+        match function {
+            Function::Indirect => Ok(self.lower_indirect(arguments)),
+            Function::Offset => Ok(self.lower_offset(arguments)),
+            _ => Ok(Expr::Function(function, arguments)),
+        }
+    }
+
+    /// A string literal becomes the reference it names. A single cell stays
+    /// dynamic so editing its text rebinds. Anything else is `#REF!`.
+    fn lower_indirect(&self, arguments: Vec<Expr>) -> Expr {
+        if arguments.len() != 1 {
+            return Expr::Function(Function::Indirect, arguments);
+        }
+        let kind = match &arguments[0] {
+            Expr::Text(text) => Some(Err(text.clone())),
+            Expr::Reference(_) => None,
+            Expr::Error(error) => Some(Ok(error.clone())),
+            _ => Some(Ok(CalcError::InvalidReference)),
+        };
+        match kind {
+            Some(Err(text)) => hard::resolve_a1_reference(&text, self.sheet, self.sheet_names)
+                .unwrap_or(Expr::Error(CalcError::InvalidReference)),
+            None => Expr::Function(Function::Indirect, arguments),
+            Some(Ok(error)) => Expr::Error(error),
+        }
+    }
+
+    /// Constant row, column, height and width compile to the shifted rectangle.
+    fn lower_offset(&self, arguments: Vec<Expr>) -> Expr {
+        if !matches!(arguments.len(), 3..=5) {
+            return Expr::Function(Function::Offset, arguments);
+        }
+        if !matches!(
+            arguments[0],
+            Expr::Reference(_) | Expr::Range { members: None, .. }
+        ) {
+            return Expr::Function(Function::Offset, arguments);
+        }
+        let Some((anchor, end)) = reference_bounds(&arguments[0]) else {
+            return Expr::Function(Function::Offset, arguments);
+        };
+        let number = |expression: &Expr| match expression {
+            Expr::Number(value) if value.is_finite() => Some(*value),
+            _ => None,
+        };
+        let Some(rows) = number(&arguments[1]) else {
+            return Expr::Function(Function::Offset, arguments);
+        };
+        let Some(columns) = number(&arguments[2]) else {
+            return Expr::Function(Function::Offset, arguments);
+        };
+        let base_rows = f64::from(end.row - anchor.row + 1);
+        let base_columns = f64::from(end.column - anchor.column + 1);
+        let height = match arguments.get(3) {
+            None | Some(Expr::Empty) => base_rows,
+            Some(expression) => match number(expression) {
+                Some(value) => value,
+                None => return Expr::Function(Function::Offset, arguments),
+            },
+        };
+        let width = match arguments.get(4) {
+            None | Some(Expr::Empty) => base_columns,
+            Some(expression) => match number(expression) {
+                Some(value) => value,
+                None => return Expr::Function(Function::Offset, arguments),
+            },
+        };
+        match hard::rectangle_shift(anchor, rows, columns, height, width) {
+            Ok((origin, rows, columns)) => Expr::Range {
+                anchor: origin,
+                members: None,
+                rows,
+                columns,
+            },
+            Err(error) => Expr::Error(error),
+        }
     }
 
     fn skip_space(&mut self) {
@@ -5229,6 +5446,12 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("REPT", Function::Rept),
     ("ROW", Function::Row),
     ("COLUMN", Function::Column),
+    ("TODAY", Function::Today),
+    ("NOW", Function::Now),
+    ("RAND", Function::Rand),
+    ("RANDBETWEEN", Function::RandBetween),
+    ("OFFSET", Function::Offset),
+    ("INDIRECT", Function::Indirect),
 ];
 
 /// The supported function names in registry order.
@@ -7195,11 +7418,7 @@ mod tests {
                 "=RANK(1,A8:A8)",
                 Value::Error(CalcError::DivisionByZero),
             ),
-            (
-                31,
-                "=RANK(1,A5:A6)",
-                Value::Error(CalcError::NotAvailable),
-            ),
+            (31, "=RANK(1,A5:A6)", Value::Error(CalcError::NotAvailable)),
             (
                 32,
                 "=RANK(\"x\",A1:A3)",
@@ -7221,7 +7440,11 @@ mod tests {
                 "=HYPERLINK(\"url\",NA())",
                 Value::Error(CalcError::NotAvailable),
             ),
-            (37, "=HYPERLINK()", Value::Error(CalcError::InvalidArguments)),
+            (
+                37,
+                "=HYPERLINK()",
+                Value::Error(CalcError::InvalidArguments),
+            ),
         ] {
             workbook.set_formula(cell(0, column), formula).unwrap();
             assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
@@ -7235,10 +7458,22 @@ mod tests {
             assert_close(workbook.value(cell(0, column)), expected, 1e-9, formula);
         }
         for (column, formula, expected) in [
-            (41, "=RRI(0,100,121)", Value::Error(CalcError::InvalidNumber)),
+            (
+                41,
+                "=RRI(0,100,121)",
+                Value::Error(CalcError::InvalidNumber),
+            ),
             (42, "=RRI(10,0,121)", Value::Error(CalcError::InvalidNumber)),
-            (43, "=RRI(10,-100,121)", Value::Error(CalcError::InvalidNumber)),
-            (44, "=RRI(10,\"x\",121)", Value::Error(CalcError::InvalidValue)),
+            (
+                43,
+                "=RRI(10,-100,121)",
+                Value::Error(CalcError::InvalidNumber),
+            ),
+            (
+                44,
+                "=RRI(10,\"x\",121)",
+                Value::Error(CalcError::InvalidValue),
+            ),
             (45, "=RRI(1,2)", Value::Error(CalcError::InvalidArguments)),
         ] {
             workbook.set_formula(cell(0, column), formula).unwrap();
@@ -7569,15 +7804,17 @@ mod tests {
     }
 
     #[test]
-    fn keeps_clock_dependent_date_functions_out_of_the_engine() {
+    fn today_and_now_stay_na_until_a_tick_is_stored() {
         let mut workbook = Workbook::default();
+        workbook.set_formula(cell(0, 0), "=TODAY()").unwrap();
+        workbook.set_formula(cell(0, 1), "=NOW()").unwrap();
         assert_eq!(
-            workbook.set_formula(cell(0, 0), "=TODAY()"),
-            Err(FormulaError::UnsupportedFunction("TODAY".into()))
+            workbook.value(cell(0, 0)),
+            Value::Error(CalcError::NotAvailable)
         );
         assert_eq!(
-            workbook.set_formula(cell(0, 0), "=NOW()"),
-            Err(FormulaError::UnsupportedFunction("NOW".into()))
+            workbook.value(cell(0, 1)),
+            Value::Error(CalcError::NotAvailable)
         );
     }
 

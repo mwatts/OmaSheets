@@ -270,6 +270,7 @@ fn calc_error_label(error: &CalcError) -> &'static str {
         CalcError::InvalidNumber => "#NUM!",
         CalcError::InvalidName => "#NAME?",
         CalcError::NullIntersection => "#NULL!",
+        CalcError::Spill => "#SPILL!",
         CalcError::InvalidArguments => "#ARGS!",
     }
 }
@@ -1355,6 +1356,9 @@ impl Document {
         document.imports = snapshot.imports.clone();
         document.proposals = snapshot.proposals.clone();
         document.last_tick = snapshot.last_tick;
+        if let Some((tick, at)) = snapshot.last_tick {
+            document.calc.install_tick(tick, at);
+        }
         document.branches = snapshot.branches.clone();
         document.checks = snapshot.checks.clone();
         document.watches = snapshot.watches.clone();
@@ -3089,6 +3093,7 @@ impl Document {
                     return Err(ApplyError::TickNotMonotonic);
                 }
                 self.last_tick = Some((*tick, *at));
+                self.calc.set_tick(*at);
             }
             Operation::Propose {
                 proposal,
@@ -3821,10 +3826,10 @@ mod tests {
                 Command::SetFormula {
                     sheet,
                     a1: "B1".into(),
-                    source: "=TODAY()".into(),
+                    source: "=SUBSTITUTE(\"a\",\"a\",\"b\")".into(),
                 },
             ),
-            ApplyError::Formula(FormulaError::UnsupportedFunction("TODAY".into()))
+            ApplyError::Formula(FormulaError::UnsupportedFunction("SUBSTITUTE".into()))
         );
         fixture.run(
             human(),
@@ -4506,6 +4511,27 @@ mod tests {
                 assert_eq!(Some(inferred), document.inferred_column_type(sheet, column));
             }
         }
+    }
+
+    #[test]
+    fn hard_formula_behaviors() {
+        let mut fixture = Fixture::new();
+        fixture.formula("A1", "=TODAY()");
+        fixture.formula("B1", "=NOW()");
+        assert_eq!(fixture.value("A1"), CellValue::Error("#N/A".into()));
+        fixture.run(human(), Command::Tick { at: 0 });
+        assert_eq!(fixture.value("A1"), CellValue::Number(25_569.0));
+        assert_eq!(fixture.value("B1"), CellValue::Number(25_569.0));
+        fixture.run(human(), Command::Tick { at: 43_200_000 });
+        assert_eq!(fixture.value("B1"), CellValue::Number(25_569.5));
+        let replayed = Document::replay(&fixture.events).unwrap();
+        assert_eq!(replayed.digest(), fixture.document.digest());
+        let restored = Document::from_snapshot(&fixture.document.snapshot()).unwrap();
+        assert_eq!(restored.digest(), fixture.document.digest());
+        assert_eq!(
+            restored.value(fixture.document.resolve_a1(fixture.sheet, "A1").unwrap()),
+            CellValue::Number(25_569.0)
+        );
     }
 
     #[test]

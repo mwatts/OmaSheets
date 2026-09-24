@@ -177,6 +177,21 @@ impl ReferenceView {
         (row < self.rows && column < self.columns).then_some((row, column))
     }
 
+    pub(crate) fn rectangle(anchor: CellId, rows: usize, columns: usize) -> Self {
+        Self {
+            node: None,
+            anchor,
+            row: 0,
+            column: 0,
+            rows,
+            columns,
+        }
+    }
+
+    pub(crate) fn origin(self, workbook: &Workbook) -> (CellId, usize, usize) {
+        (self.cell(workbook, 0, 0), self.rows, self.columns)
+    }
+
     fn select(self, row: usize, column: usize, rows: usize, columns: usize) -> Self {
         Self {
             row: self.row + row,
@@ -269,8 +284,64 @@ impl Workbook {
                 Ok(input.select(row, column, rows, columns))
             }
             Expr::Function(Function::ReferenceSpan, arguments) => self.reference_span(arguments),
+            Expr::Function(Function::Offset, arguments) => self.offset_view(arguments),
+            Expr::Function(Function::Indirect, arguments) => self.indirect_view(arguments),
             Expr::Error(error) => Err(error.clone()),
             _ => Err(CalcError::InvalidArguments),
+        }
+    }
+
+    pub(crate) fn offset_view(
+        &self,
+        arguments: &[Expr<usize>],
+    ) -> Result<ReferenceView, CalcError> {
+        if !(3..=5).contains(&arguments.len()) {
+            return Err(CalcError::InvalidArguments);
+        }
+        if self.dynamic_error_for_current() {
+            return Err(CalcError::InvalidReference);
+        }
+        let (origin, base_rows, base_columns) = self.reference_view(&arguments[0])?.origin(self);
+        let rows = number(self.evaluate(&arguments[1]))?;
+        let columns = number(self.evaluate(&arguments[2]))?;
+        let height = match arguments.get(3) {
+            None | Some(Expr::Empty) => base_rows as f64,
+            Some(expression) => number(self.evaluate(expression))?,
+        };
+        let width = match arguments.get(4) {
+            None | Some(Expr::Empty) => base_columns as f64,
+            Some(expression) => number(self.evaluate(expression))?,
+        };
+        let (anchor, rows, columns) = hard::rectangle_shift(origin, rows, columns, height, width)?;
+        Ok(ReferenceView::rectangle(anchor, rows, columns))
+    }
+
+    pub(crate) fn indirect_view(
+        &self,
+        arguments: &[Expr<usize>],
+    ) -> Result<ReferenceView, CalcError> {
+        if arguments.len() != 1 {
+            return Err(CalcError::InvalidArguments);
+        }
+        if self.dynamic_error_for_current() {
+            return Err(CalcError::InvalidReference);
+        }
+        let value = self.evaluate(&arguments[0]);
+        if let Value::Error(error) = value {
+            return Err(error);
+        }
+        let Value::Text(text) = value else {
+            return Err(CalcError::InvalidReference);
+        };
+        match hard::resolve_a1_reference(&text, self.evaluating.get().sheet, &self.sheet_names) {
+            Some(Expr::Reference(cell)) => Ok(ReferenceView::rectangle(cell, 1, 1)),
+            Some(Expr::Range {
+                anchor,
+                rows,
+                columns,
+                members: None,
+            }) => Ok(ReferenceView::rectangle(anchor, rows, columns)),
+            _ => Err(CalcError::InvalidReference),
         }
     }
 

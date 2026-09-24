@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-114 function names listed below, grouped for reading.
+120 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -19,8 +19,10 @@ aggregate arguments (`SUM(IF(A1:A5=0,0,B1:B5))`, `SUMPRODUCT((A1:A5>2)*B1:B5)`).
 Rectangular array constants support numbers, text, booleans and error literals,
 comma-separated columns and semicolon-separated rows, up to 1,000,000 values.
 They work in aggregates, elementwise expressions and INDEX/MATCH/LOOKUP,
-VLOOKUP/HLOOKUP/XLOOKUP. A scalar use takes the first value; spilling into
-neighbouring cells is not implemented. `_xlfn.` and `_xlfn._xlws.` prefixes
+VLOOKUP/HLOOKUP/XLOOKUP. A scalar use takes the first value. A root
+`TRANSPOSE`, `MMULT` or array constant spills into the rectangle whose
+top-left is the formula, up to 1,000,000 values; a blocked or out-of-grid
+rectangle is `#SPILL!`. `_xlfn.` and `_xlfn._xlws.` prefixes
 resolve only to functions already in the registry.
 
 `INDEX` also returns references: `SUM(A1:INDEX(A1:A100,D1))` follows the
@@ -33,10 +35,13 @@ retain their bounded envelope; potential cycles within it are still refused. A m
 whose current A1 spelling cannot preserve those identities reports a projection
 refusal instead of exporting different references.
 
-Deliberately unsupported: `TODAY`, `NOW`, `RAND` and every other volatile
-function (until the calculation context consumes stored tick events), external workbook references,
-3D references, spilling array formulas, `INDIRECT`, `OFFSET`,
-`CELL`, add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`,
+`TODAY`, `NOW`, `RAND` and `RANDBETWEEN` read the stored tick and never the
+system clock. With no tick they are `#N/A`. `OFFSET` with constant arguments
+is an ordinary range; a dynamic shift keeps that shift's rectangle as its
+dependency envelope. `INDIRECT` accepts one A1 reference or range, optionally
+sheet-qualified. Deliberately unsupported: external workbook references,
+3D references, `CELL`, `FILTER`, `UNIQUE`, `SORT`, add-in (`_xll.`) calls,
+locale-sensitive parsing such as `DATEVALUE`,
 and the 1904 date system. `TEXT` accepts only the locale-free codes listed
 with the text functions below.
 
@@ -144,6 +149,8 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `LOG`
 - `LOG10`
 - `PI`
+- `RAND`
+- `RANDBETWEEN`
 
 ### Text
 
@@ -174,6 +181,8 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `ROW`
 - `COLUMN`
 - `LOOKUP`
+- `OFFSET`
+- `INDIRECT`
 
 ### Dates (1900 serial system)
 
@@ -188,6 +197,8 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `DAYS360`
 - `NETWORKDAYS`
 - `WORKDAY`
+- `TODAY`
+- `NOW`
 
 ### Financial
 
@@ -199,6 +210,13 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `XIRR`
 - `RRI`
 
+
+`TODAY` is the 1900 serial of the tick instant's UTC date. `NOW` adds the
+time-of-day fraction. `RAND` and `RANDBETWEEN` are deterministic in the tick
+number and the calling cell: the same tick replays the same value, and a new
+tick changes it. `OFFSET` refuses a result outside the grid with `#REF!` and
+a height or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of anything
+other than A1 text (`#REF!`, R1C1, 3D or an external workbook) is `#REF!`.
 
 `TEXTJOIN` joins scalar and bounded range arguments in row order, can skip blanks
 and empty strings, propagates errors, and refuses output beyond 32,767 UTF-16 units.
