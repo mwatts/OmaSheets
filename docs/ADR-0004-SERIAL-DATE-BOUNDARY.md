@@ -47,9 +47,11 @@ calendar rule to `omasheets_calc::serial_date`:
   engine once tick events exist, so reopening or recalculating a workbook can
   never silently change a stored value.
 - The XLSX importer keeps date-formatted cells as the raw serial the file
-  stores and refuses workbooks that declare the 1904 date system with an
-  explicit `UnsupportedDateSystem` error. Shifting those serials by 1462 days
-  would make formulas in the same workbook disagree with their cached values.
+  stores. A workbook declares either the 1900 or the 1904 system, and
+  `serial_date` interprets serials in that system. Shifting 1904 serials by
+  1462 days on import is still rejected: the caches are already in the file's
+  epoch, and a shift would make `DATE` and `YEAR` disagree with them. In the
+  1904 system serial 0 is 1904-01-01 and there is no fictitious 1900-02-29.
 - The deterministic fixture generator can emit a `Dates` sheet whose cached
   values are computed independently in Python from the real calendar, and CI
   requires the owned engine to match every cached value on it.

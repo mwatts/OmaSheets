@@ -4,7 +4,9 @@
 //! those numbers into the text Excel would paint from the cell's format code.
 //! It does not read a clock.
 
-use omasheets_calc::serial_date::{civil_from_serial, serial_from_number};
+use omasheets_calc::serial_date::{
+    civil_from_serial_in, serial_from_number_in, DateSystem,
+};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -30,6 +32,11 @@ pub fn format_number_with_code(value: f64, code: &str) -> String {
 
 /// Formats `value` and reports the color named by the chosen format section.
 pub fn paint_number(value: f64, code: &str) -> PaintedNumber {
+    paint_number_in(DateSystem::Excel1900, value, code)
+}
+
+/// Formats `value` in the workbook's date system.
+pub fn paint_number_in(system: DateSystem, value: f64, code: &str) -> PaintedNumber {
     let code = code.trim();
     if code.is_empty() || code.eq_ignore_ascii_case("General") || !value.is_finite() {
         return PaintedNumber {
@@ -39,7 +46,7 @@ pub fn paint_number(value: f64, code: &str) -> PaintedNumber {
     }
     if is_date_code(code) {
         return PaintedNumber {
-            text: format_date(value, code),
+            text: format_date(system, value, code),
             color: first_color(code),
         };
     }
@@ -356,11 +363,11 @@ const INDEXED_COLORS: [u32; 56] = [
     0x3366_FF, 0x33CC_CC, 0x99CC_00, 0xFFCC_00, 0xFF99_00, 0xFF66_00, 0x6666_99, 0x9696_96,
 ];
 
-fn format_date(value: f64, code: &str) -> String {
-    let Ok(serial) = serial_from_number(value) else {
+fn format_date(system: DateSystem, value: f64, code: &str) -> String {
+    let Ok(serial) = serial_from_number_in(system, value) else {
         return general_number(value);
     };
-    let Ok(date) = civil_from_serial(serial) else {
+    let Ok(date) = civil_from_serial_in(system, serial) else {
         return general_number(value);
     };
     let mut out = String::new();
@@ -741,7 +748,7 @@ fn group_thousands(whole: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omasheets_calc::serial_date::serial_from_civil;
+    use omasheets_calc::serial_date::{civil_from_serial, serial_from_civil};
 
     #[test]
     fn percent_with_one_decimal_multiplies_by_one_hundred() {

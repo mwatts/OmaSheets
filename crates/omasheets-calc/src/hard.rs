@@ -192,6 +192,9 @@ fn formula_needs_dynamic(expression: &Expr<usize>) -> bool {
     }
 }
 
+/// Uniform draw in `[0, 1)`, the range Microsoft documents for `RAND`.
+/// Excel does not publish the seed of a saved workbook, so a new tick uses
+/// this per-cell value. The same tick and cell replay it.
 fn volatile_unit(tick: u64, cell: CellId) -> f64 {
     let mut z = tick.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ u64::from(cell.row).wrapping_mul(0xBF58_476D_1CE4_E5B9)
@@ -204,6 +207,8 @@ fn volatile_unit(tick: u64, cell: CellId) -> f64 {
     ((z >> 11) as f64) / ((1_u64 << 53) as f64)
 }
 
+/// `RANDBETWEEN`: both bounds truncate toward zero, then the result is an
+/// integer from `bottom` through `top`. `bottom > top` is `#NUM!`.
 fn rand_between(unit: f64, bottom: f64, top: f64) -> Result<f64, CalcError> {
     let bottom = trunc_offset(bottom)? as f64;
     let top = trunc_offset(top)? as f64;
@@ -221,6 +226,17 @@ fn rand_between(unit: f64, bottom: f64, top: f64) -> Result<f64, CalcError> {
     Ok(picked.min(top))
 }
 
+fn excel_integer(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let rounded = value.round();
+    if (value - rounded).abs() > 1e-9 || rounded.abs() > i64::MAX as f64 {
+        return None;
+    }
+    Some(rounded as i64)
+}
+
 impl Workbook {
     /// Records the next tick at Unix millisecond `at` and recalculates every
     /// formula that reads the tick. Does not read the system clock.
@@ -234,6 +250,7 @@ impl Workbook {
 
     /// Installs a known tick, such as the pair already stored on a snapshot.
     pub fn install_tick(&mut self, tick: u64, at: i64) -> RecalcReport {
+        self.rand_replay.clear();
         self.tick = Some((tick, at));
         self.touch_tick()
     }
@@ -278,31 +295,59 @@ impl Workbook {
             return Value::Error(CalcError::InvalidArguments);
         }
         if function == Function::RandBetween {
-            let bottom = match number(self.evaluate(&arguments[0])) {
+            let bottom = match excel_number(self.evaluate(&arguments[0])) {
                 Ok(value) => value,
                 Err(error) => return Value::Error(error),
             };
-            let top = match number(self.evaluate(&arguments[1])) {
+            let top = match excel_number(self.evaluate(&arguments[1])) {
                 Ok(value) => value,
                 Err(error) => return Value::Error(error),
             };
+            let bottom_i = match trunc_offset(bottom) {
+                Ok(value) => value,
+                Err(error) => return Value::Error(error),
+            };
+            let top_i = match trunc_offset(top) {
+                Ok(value) => value,
+                Err(error) => return Value::Error(error),
+            };
+            if bottom_i > top_i {
+                return Value::Error(CalcError::InvalidNumber);
+            }
+            let cell = self.evaluating.get();
+            if let Some(&cached) = self.rand_replay.get(&cell) {
+                if let Some(integer) = excel_integer(cached) {
+                    if (bottom_i..=top_i).contains(&integer) {
+                        return Value::Number(integer as f64);
+                    }
+                }
+            }
             let Some((tick, _)) = self.tick else {
                 return Value::Error(CalcError::NotAvailable);
             };
-            return match rand_between(volatile_unit(tick, self.evaluating.get()), bottom, top) {
+            return match rand_between(volatile_unit(tick, cell), bottom, top) {
                 Ok(value) => number_value(value),
                 Err(error) => Value::Error(error),
             };
+        }
+        if function == Function::Rand {
+            let cell = self.evaluating.get();
+            if let Some(&cached) = self.rand_replay.get(&cell) {
+                if (0.0..1.0).contains(&cached) {
+                    return Value::Number(cached);
+                }
+            }
         }
         let Some((tick, at)) = self.tick else {
             return Value::Error(CalcError::NotAvailable);
         };
         match function {
-            Function::Today => match serial_date::serial_from_unix_millis(at) {
+            Function::Today => match serial_date::serial_from_unix_millis_in(self.date_system, at)
+            {
                 Ok(serial) => Value::Number(serial.trunc()),
                 Err(error) => Value::Error(error),
             },
-            Function::Now => match serial_date::serial_from_unix_millis(at) {
+            Function::Now => match serial_date::serial_from_unix_millis_in(self.date_system, at) {
                 Ok(serial) => number_value(serial),
                 Err(error) => Value::Error(error),
             },
@@ -1087,6 +1132,40 @@ mod tests {
     }
 
     #[test]
+    fn cached_rand_draws_replay_until_the_next_tick() {
+        let mut workbook = Workbook::default();
+        let draw = cell(0, 0);
+        workbook.replay_cached_random(draw, 0.25);
+        workbook.replay_cached_random(cell(1, 0), 4.0);
+        workbook.set_formula(draw, "=RAND()").unwrap();
+        workbook.set_formula(cell(0, 1), "=A1*4").unwrap();
+        workbook.set_formula(cell(1, 0), "=RANDBETWEEN(1,6)").unwrap();
+        workbook.set_formula(cell(1, 1), "=A2*2").unwrap();
+        assert_eq!(workbook.value(draw), Value::Number(0.25));
+        assert_eq!(workbook.value(cell(0, 1)), Value::Number(1.0));
+        assert_eq!(workbook.value(cell(1, 0)), Value::Number(4.0));
+        assert_eq!(workbook.value(cell(1, 1)), Value::Number(8.0));
+        workbook.replay_cached_random(cell(2, 0), 1.0);
+        workbook.set_formula(cell(2, 0), "=RAND()").unwrap();
+        assert_eq!(
+            workbook.value(cell(2, 0)),
+            Value::Error(CalcError::NotAvailable)
+        );
+        workbook.replay_cached_random(cell(2, 1), 9.0);
+        workbook.set_formula(cell(2, 1), "=RANDBETWEEN(1,6)").unwrap();
+        assert_eq!(
+            workbook.value(cell(2, 1)),
+            Value::Error(CalcError::NotAvailable)
+        );
+        workbook.set_tick(0);
+        assert_ne!(workbook.value(draw), Value::Number(0.25));
+        match workbook.value(draw) {
+            Value::Number(value) => assert!((0.0..1.0).contains(&value)),
+            other => panic!("fresh rand {other:?}"),
+        }
+    }
+
+    #[test]
     fn hard_formula_behaviors() {
         let mut workbook = Workbook::default();
         workbook.set_formula(cell(0, 0), "=TODAY()").unwrap();
@@ -1131,6 +1210,40 @@ mod tests {
                 .map(|_| workbook.value(cell(2, 3))),
             Ok(Value::Error(CalcError::InvalidNumber))
         );
+        workbook.set_formula(cell(3, 3), "=RANDBETWEEN(1.9,3.2)").unwrap();
+        match workbook.value(cell(3, 3)) {
+            Value::Number(value) => assert!(
+                value.fract() == 0.0 && (1.0..=3.0).contains(&value),
+                "{value}"
+            ),
+            other => panic!("truncated randbetween {other:?}"),
+        }
+        workbook
+            .set_formula(cell(3, 4), "=RANDBETWEEN(\"1\",\"3\")")
+            .unwrap();
+        match workbook.value(cell(3, 4)) {
+            Value::Number(value) => assert!((1.0..=3.0).contains(&value)),
+            other => panic!("numeric text randbetween {other:?}"),
+        }
+        assert_eq!(
+            workbook
+                .set_formula(cell(3, 5), "=RANDBETWEEN(\"x\",1)")
+                .map(|_| workbook.value(cell(3, 5))),
+            Ok(Value::Error(CalcError::InvalidValue))
+        );
+        workbook
+            .set_formula(cell(4, 0), "=RANDBETWEEN(-1.9,0.2)")
+            .unwrap();
+        for step in 0..40 {
+            workbook.set_tick(step * 86_400_000);
+            match workbook.value(cell(4, 0)) {
+                Value::Number(value) => assert!(
+                    value.fract() == 0.0 && (-1.0..=0.0).contains(&value),
+                    "{value}"
+                ),
+                other => panic!("negative truncation {other:?}"),
+            }
+        }
 
         workbook.set_number(cell(4, 1), 9.0);
         workbook.set_formula(cell(4, 0), "={1,2;3,4}").unwrap();

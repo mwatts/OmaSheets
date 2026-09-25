@@ -366,7 +366,11 @@ pub fn edit(
                             ));
                         }
                         longest = longest.max(
-                            display(document.value(cell), &effective_style(document, cell))
+                            display(
+                                document.value(cell),
+                                &effective_style(document, cell),
+                                document.date_system(),
+                            )
                                 .chars()
                                 .count(),
                         );
@@ -876,7 +880,11 @@ pub fn effective_style(document: &Document, cell: CellRef) -> CellStyle {
     style
 }
 
-pub fn display(value: CellValue, style: &CellStyle) -> String {
+pub fn display(
+    value: CellValue,
+    style: &CellStyle,
+    date_system: omasheets_calc::serial_date::DateSystem,
+) -> String {
     let CellValue::Number(number) = value else {
         return plain(&value);
     };
@@ -884,8 +892,9 @@ pub fn display(value: CellValue, style: &CellStyle) -> String {
     if matches!(
         format,
         "yyyy-mm-dd" | "dd/mm/yyyy" | "mm/dd/yyyy" | "m/d/yy"
-    ) && let Ok(serial) = omasheets_calc::serial_date::serial_from_number(number)
-        && let Ok(date) = omasheets_calc::serial_date::civil_from_serial(serial)
+    ) && let Ok(serial) =
+        omasheets_calc::serial_date::serial_from_number_in(date_system, number)
+        && let Ok(date) = omasheets_calc::serial_date::civil_from_serial_in(date_system, serial)
     {
         return match format {
             "yyyy-mm-dd" => format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),

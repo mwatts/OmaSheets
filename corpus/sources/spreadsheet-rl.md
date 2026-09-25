@@ -2,7 +2,7 @@
 
 Source: [Spreadsheet-RL](https://huggingface.co/datasets/Spreadsheet-RL/Spreadsheet-RL) on Hugging Face, released with the Spreadsheet-RL paper and code drop dated 2026-05-17. License: CC-BY-SA-4.0.
 
-The recorded baseline is a 16-file sample of workbooks from that release (Excel-forum and SpreadsheetBench tasks). Three further SpreadsheetBench-2 workbooks were added to the local sample on 2026-09-24 and scored on their own; that pass is below and is not folded into the 16-file table. Workbooks are not vendored. This sample is not the Enron corpus and not the full 33,015-file zip. The full zip was not scored.
+The recorded baseline is a 16-file sample of workbooks from that release (Excel-forum and SpreadsheetBench tasks). Three further SpreadsheetBench-2 workbooks were added to the local sample on 2026-09-24 and scored on their own; that pass is below and is not folded into the 16-file table. On 2026-09-25 the local sample gained the rest of the SpreadsheetBench-2 Financial_Model inputs (100 in that group) and Debugging 04_01, 05_01, and 06_01. Those additions are not in the totals below and have not been scored. Workbooks are not vendored. This sample is not the Enron corpus and not the full 33,015-file zip. The full zip was not scored.
 
 ## Results
 

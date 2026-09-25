@@ -927,6 +927,10 @@ pub struct Workbook {
     late_range_barriers: usize,
     /// Legacy CSE array formulas: the entered rectangle, in cells, for the anchor.
     array_formulas: HashMap<CellId, (usize, usize)>,
+    /// Excel epoch for date serials. Set before formulas are installed.
+    date_system: serial_date::DateSystem,
+    /// Saved `RAND` / `RANDBETWEEN` draws. The next tick discards them.
+    rand_replay: HashMap<CellId, f64>,
 }
 
 impl Default for Workbook {
@@ -958,11 +962,32 @@ impl Default for Workbook {
             eval_marks: Vec::new(),
             late_range_barriers: 0,
             array_formulas: HashMap::new(),
+            date_system: serial_date::DateSystem::Excel1900,
+            rand_replay: HashMap::new(),
         }
     }
 }
 
 impl Workbook {
+    /// Selects the workbook epoch. Call this before installing formulas.
+    /// Stored serials are not shifted.
+    pub fn set_date_system(&mut self, system: serial_date::DateSystem) {
+        self.date_system = system;
+    }
+
+    pub fn date_system(&self) -> serial_date::DateSystem {
+        self.date_system
+    }
+
+    /// Remembers one saved draw for `cell`. `RAND` uses it only when it is in
+    /// `[0, 1)`. `RANDBETWEEN` uses it only when it is an integer inside the
+    /// current bounds. The next tick drops every remembered draw.
+    pub fn replay_cached_random(&mut self, cell: CellId, value: f64) {
+        if value.is_finite() {
+            self.rand_replay.insert(cell, value);
+        }
+    }
+
     pub fn define_sheet(&mut self, index: u32, name: impl Into<String>) {
         self.sheet_names.insert(name.into().to_lowercase(), index);
     }
@@ -2624,7 +2649,7 @@ impl Workbook {
             Ok(format) => format,
             Err(error) => return Value::Error(error),
         };
-        match format_text_value(&value, &format) {
+        match format_text_value(self.date_system, &value, &format) {
             Ok(text) => Value::Text(text),
             Err(error) => Value::Error(error),
         }
@@ -2828,11 +2853,14 @@ impl Workbook {
                 Err(error) => return Value::Error(error),
             }
         }
+        let system = self.date_system;
         let result = match function {
-            Function::Date => serial_date::date_serial(numbers[0], numbers[1], numbers[2]),
+            Function::Date => {
+                serial_date::date_serial_in(system, numbers[0], numbers[1], numbers[2])
+            }
             Function::Year | Function::Month | Function::Day => {
-                serial_date::serial_from_number(numbers[0])
-                    .and_then(serial_date::civil_from_serial)
+                serial_date::serial_from_number_in(system, numbers[0])
+                    .and_then(|serial| serial_date::civil_from_serial_in(system, serial))
                     .map(|date| match function {
                         Function::Year => date.year,
                         Function::Month => i64::from(date.month),
@@ -2841,22 +2869,24 @@ impl Workbook {
             }
             Function::EDate | Function::EoMonth => {
                 match (
-                    serial_date::serial_from_number(numbers[0]),
+                    serial_date::serial_from_number_in(system, numbers[0]),
                     serial_offset(numbers[1]),
                 ) {
                     (Ok(start), Ok(months)) if function == Function::EDate => {
-                        serial_date::add_months(start, months)
+                        serial_date::add_months_in(system, start, months)
                     }
-                    (Ok(start), Ok(months)) => serial_date::end_of_month(start, months),
+                    (Ok(start), Ok(months)) => serial_date::end_of_month_in(system, start, months),
                     (Err(error), _) | (_, Err(error)) => Err(error),
                 }
             }
             Function::Weekday => {
                 match (
-                    serial_date::serial_from_number(numbers[0]),
+                    serial_date::serial_from_number_in(system, numbers[0]),
                     numbers.get(1).copied().map_or(Ok(1), serial_offset),
                 ) {
-                    (Ok(serial), Ok(return_type)) => serial_date::weekday(serial, return_type),
+                    (Ok(serial), Ok(return_type)) => {
+                        serial_date::weekday_in(system, serial, return_type)
+                    }
                     (Err(error), _) | (_, Err(error)) => Err(error),
                 }
             }
@@ -2878,7 +2908,7 @@ impl Workbook {
             match value {
                 Value::Blank => {}
                 Value::Number(number) => {
-                    serials.insert(serial_date::serial_from_number(number)?);
+                    serials.insert(serial_date::serial_from_number_in(self.date_system, number)?);
                 }
                 Value::Error(error) => return Err(error),
                 Value::Text(_) | Value::Boolean(_) => return Err(CalcError::InvalidValue),
@@ -2899,7 +2929,7 @@ impl Workbook {
                 Value::Error(error) => return Value::Error(error),
                 _ => return Value::Error(CalcError::InvalidValue),
             };
-            return match serial_date::date_value(&text) {
+            return match serial_date::date_value_in(self.date_system, &text) {
                 Ok(serial) => Value::Number(serial as f64),
                 Err(error) => Value::Error(error),
             };
@@ -2913,8 +2943,9 @@ impl Workbook {
         if !expected_arity.contains(&arguments.len()) {
             return Value::Error(CalcError::InvalidArguments);
         }
+        let system = self.date_system;
         let first = match date_number(self.evaluate(&arguments[0]))
-            .and_then(serial_date::serial_from_number)
+            .and_then(|number| serial_date::serial_from_number_in(system, number))
         {
             Ok(serial) => serial,
             Err(error) => return Value::Error(error),
@@ -2928,9 +2959,11 @@ impl Workbook {
                 let basis = arguments.get(2).map_or(Ok(0), |argument| {
                     number(self.evaluate(argument)).and_then(serial_offset)
                 });
-                serial_date::serial_from_number(second)
+                serial_date::serial_from_number_in(system, second)
                     .and_then(|end| {
-                        basis.and_then(|basis| serial_date::year_fraction(first, end, basis))
+                        basis.and_then(|basis| {
+                            serial_date::year_fraction_in(system, first, end, basis)
+                        })
                     })
                     .map(Value::Number)
             }
@@ -2938,9 +2971,11 @@ impl Workbook {
                 let european = arguments
                     .get(2)
                     .map_or(Ok(false), |argument| truthy(self.evaluate(argument)));
-                serial_date::serial_from_number(second)
+                serial_date::serial_from_number_in(system, second)
                     .and_then(|end| {
-                        european.and_then(|european| serial_date::days_360(first, end, european))
+                        european.and_then(|european| {
+                            serial_date::days_360_in(system, first, end, european)
+                        })
                     })
                     .map(|days| Value::Number(days as f64))
             }
@@ -2948,9 +2983,11 @@ impl Workbook {
                 let holidays = arguments.get(2).map_or(Ok(HashSet::new()), |argument| {
                     self.holiday_serials(argument)
                 });
-                serial_date::serial_from_number(second).and_then(|end| {
+                serial_date::serial_from_number_in(system, second).and_then(|end| {
                     holidays.map(|holidays| {
-                        Value::Number(serial_date::network_days(first, end, &holidays) as f64)
+                        Value::Number(
+                            serial_date::network_days_in(system, first, end, &holidays) as f64,
+                        )
                     })
                 })
             }
@@ -2960,7 +2997,9 @@ impl Workbook {
                 });
                 serial_offset(second)
                     .and_then(|days| {
-                        holidays.and_then(|holidays| serial_date::work_day(first, days, &holidays))
+                        holidays.and_then(|holidays| {
+                            serial_date::work_day_in(system, first, days, &holidays)
+                        })
                     })
                     .map(|serial| Value::Number(serial as f64))
             }
@@ -3103,7 +3142,7 @@ impl Workbook {
                 self.flatten_values(values_argument, &mut values);
                 let mut dates = Vec::new();
                 self.flatten_values(dates_argument, &mut dates);
-                let cash_flows = match dated_cash_flows(&values, &dates) {
+                let cash_flows = match dated_cash_flows(self.date_system, &values, &dates) {
                     Ok(cash_flows) => cash_flows,
                     Err(error) => return Value::Error(error),
                 };
@@ -4842,7 +4881,11 @@ fn net_present_value(rate: f64, values: &[f64]) -> Result<f64, CalcError> {
 /// Cash flows paired with the number of days from the first date, as `XNPV`
 /// and `XIRR` read them: both lists numeric and the same length, no date
 /// before the first.
-fn dated_cash_flows(values: &[Value], dates: &[Value]) -> Result<Vec<(f64, f64)>, CalcError> {
+fn dated_cash_flows(
+    system: serial_date::DateSystem,
+    values: &[Value],
+    dates: &[Value],
+) -> Result<Vec<(f64, f64)>, CalcError> {
     if let Some(error) = first_error(values).or_else(|| first_error(dates)) {
         return Err(error);
     }
@@ -4853,7 +4896,10 @@ fn dated_cash_flows(values: &[Value], dates: &[Value]) -> Result<Vec<(f64, f64)>
     for (value, date) in values.iter().zip(dates) {
         match (value, date) {
             (Value::Number(value), Value::Number(date)) => {
-                cash_flows.push((*value, serial_date::serial_from_number(*date)? as f64));
+                cash_flows.push((
+                    *value,
+                    serial_date::serial_from_number_in(system, *date)? as f64,
+                ));
             }
             _ => return Err(CalcError::InvalidValue),
         }
@@ -5258,7 +5304,11 @@ fn text_format(code: &str) -> Option<TextFormat> {
     }
 }
 
-fn format_text_value(value: &Value, format: &str) -> Result<String, CalcError> {
+fn format_text_value(
+    system: serial_date::DateSystem,
+    value: &Value,
+    format: &str,
+) -> Result<String, CalcError> {
     let format = text_format(format).ok_or(CalcError::InvalidValue)?;
     let number = match value {
         Value::Number(number) => *number,
@@ -5281,14 +5331,18 @@ fn format_text_value(value: &Value, format: &str) -> Result<String, CalcError> {
             format_scaled(number * 100.0, i32::from(decimals), false, false, "%")
         }
         TextFormat::DateIso | TextFormat::DateUs | TextFormat::DateUsShort => {
-            format_text_date(number, format)
+            format_text_date(system, number, format)
         }
     }
 }
 
-fn format_text_date(number: f64, format: TextFormat) -> Result<String, CalcError> {
-    let serial = serial_date::serial_from_number(number)?;
-    let date = serial_date::civil_from_serial(serial)?;
+fn format_text_date(
+    system: serial_date::DateSystem,
+    number: f64,
+    format: TextFormat,
+) -> Result<String, CalcError> {
+    let serial = serial_date::serial_from_number_in(system, number)?;
+    let date = serial_date::civil_from_serial_in(system, serial)?;
     Ok(match format {
         TextFormat::DateIso => format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
         TextFormat::DateUsShort => format!(
@@ -10233,6 +10287,43 @@ mod tests {
             ParsedFormula::parse("=Missing!A1", 0, &names),
             Err(FormulaError::UnknownSheet("Missing".into()))
         );
+    }
+
+    #[test]
+    fn evaluates_the_1904_date_system_from_its_own_epoch() {
+        let mut workbook = Workbook::default();
+        workbook.set_date_system(serial_date::DateSystem::Excel1904);
+        workbook.define_sheet(0, "Sheet1");
+        let cases = [
+            (0, "=DATE(1904,1,1)", Value::Number(0.0)),
+            (1, "=YEAR(0)", Value::Number(1904.0)),
+            (2, "=MONTH(0)", Value::Number(1.0)),
+            (3, "=DAY(0)", Value::Number(1.0)),
+            (4, "=DATE(1904,3,1)", Value::Number(60.0)),
+            (5, "=WEEKDAY(0)", Value::Number(6.0)),
+            (6, "=TEXT(0,\"yyyy-mm-dd\")", Value::Text("1904-01-01".into())),
+            (
+                7,
+                "=DATE(1900,1,1)",
+                Value::Error(CalcError::InvalidNumber),
+            ),
+            (
+                8,
+                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,31))",
+                Value::Number(23.0),
+            ),
+        ];
+        for (column, formula, expected) in cases {
+            workbook
+                .set_formula(CellId::new(0, 0, column), formula)
+                .unwrap();
+            assert_eq!(workbook.value(CellId::new(0, 0, column)), expected, "{formula}");
+        }
+        workbook.set_tick(0);
+        workbook
+            .set_formula(CellId::new(0, 1, 0), "=TODAY()")
+            .unwrap();
+        assert_eq!(workbook.value(CellId::new(0, 1, 0)), Value::Number(24_107.0));
     }
 
     fn assert_close(actual: Value, expected: f64, tolerance: f64, label: &str) {

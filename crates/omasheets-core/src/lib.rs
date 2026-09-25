@@ -17,6 +17,7 @@ mod formula_projection;
 pub mod presentation;
 pub use presentation::SheetPresentation;
 
+use omasheets_calc::serial_date::DateSystem;
 use omasheets_calc::{
     CalcError, CellId, FormulaError, ParsedFormula, ReferenceGroup, StructuredColumn,
     StructuredContext, StructuredTable, Value, Workbook,
@@ -497,6 +498,9 @@ pub enum Operation {
         import: ImportId,
         source_sha256: String,
         format: String,
+        /// `"1900"` or `"1904"`. Absent events are the 1900 system.
+        #[serde(default = "default_date_system")]
+        date_system: String,
     },
     /// An explicit clock tick. Nothing in the core reads wall-clock time.
     Tick {
@@ -914,6 +918,9 @@ pub enum Command {
     Import {
         source_sha256: String,
         format: String,
+        /// `"1900"` or `"1904"`. Omitted commands use the 1900 system.
+        #[serde(default = "default_date_system")]
+        date_system: String,
     },
     Tick {
         at: i64,
@@ -1039,7 +1046,14 @@ pub struct Table {
 pub struct ImportRecord {
     pub source_sha256: String,
     pub format: String,
+    /// `"1900"` or `"1904"`.
+    #[serde(default = "default_date_system")]
+    pub date_system: String,
     pub provenance: Provenance,
+}
+
+fn default_date_system() -> String {
+    "1900".into()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1260,6 +1274,11 @@ impl Document {
             return Err(ApplyError::UnsupportedSchema(snapshot.schema));
         }
         let mut document = Self::empty(snapshot.document);
+        for record in snapshot.imports.values() {
+            if let Some(system) = DateSystem::parse(&record.date_system) {
+                document.calc.set_date_system(system);
+            }
+        }
         document.calc.begin_bulk();
         document.name = snapshot.name.clone();
         document.branch = snapshot.branch;
@@ -1654,6 +1673,10 @@ impl Document {
     }
 
     /// Canonical projection of the whole state.
+    pub fn date_system(&self) -> DateSystem {
+        self.calc.date_system()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let sheets = self
             .sheet_order
@@ -1866,10 +1889,12 @@ impl Document {
             Command::Import {
                 source_sha256,
                 format,
+                date_system,
             } => Operation::Import {
                 import: ImportId::derive(&seed, 0),
                 source_sha256,
                 format,
+                date_system,
             },
             Command::Tick { at } => Operation::Tick {
                 tick: self.last_tick.map_or(1, |(tick, _)| tick + 1),
@@ -3074,17 +3099,21 @@ impl Document {
                 import,
                 source_sha256,
                 format,
+                date_system,
             } => {
                 self.check_fresh(import.0)?;
                 if decode_hex(source_sha256, 32).is_none() || format.is_empty() {
                     return Err(ApplyError::InvalidValue);
                 }
                 check_name(format)?;
+                let system = DateSystem::parse(date_system).ok_or(ApplyError::InvalidValue)?;
+                self.calc.set_date_system(system);
                 self.imports.insert(
                     *import,
                     ImportRecord {
                         source_sha256: source_sha256.clone(),
                         format: format.clone(),
+                        date_system: date_system.clone(),
                         provenance,
                     },
                 );
@@ -3951,6 +3980,7 @@ mod tests {
             Command::Import {
                 source_sha256: "a".repeat(64),
                 format: "xlsx".into(),
+                date_system: "1900".into(),
             },
         );
         fixture.run(

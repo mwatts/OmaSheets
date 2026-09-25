@@ -5,7 +5,8 @@
 //! a document command. A formula the owned engine compiled shows that result.
 //! A formula it refused keeps the stored cache.
 
-use crate::format::{self, paint_number};
+use crate::format::{self, paint_number_in};
+use omasheets_calc::serial_date::DateSystem;
 use omasheets_calc::{CellId, Value};
 use omasheets_core::ApplyError;
 use omasheets_xlsx::{ImportError, ImportLimits, import_xlsx};
@@ -70,6 +71,7 @@ pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
     }
     let stored_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let look = format::read_workbook_look(path);
+    let date_system = DateSystem::parse(imported.date_system).unwrap_or(DateSystem::Excel1900);
     let names: HashMap<u32, String> = imported
         .sheets
         .iter()
@@ -93,7 +95,7 @@ pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
             .get(&(sheet_name.to_string(), source.cell.row, source.cell.column))
             .map(String::as_str)
             .unwrap_or("");
-        let (text, numeric, format_color) = display_value(&value, code);
+        let (text, numeric, format_color) = display_value(&value, code, date_system);
         let input = match &source.formula {
             Some(formula) => {
                 formulas += 1;
@@ -163,11 +165,15 @@ fn formula_source(formula: &str) -> String {
     }
 }
 
-fn display_value(value: &Value, code: &str) -> (String, bool, Option<u32>) {
+fn display_value(
+    value: &Value,
+    code: &str,
+    date_system: DateSystem,
+) -> (String, bool, Option<u32>) {
     match value {
         Value::Blank => (String::new(), false, None),
         Value::Number(number) => {
-            let painted = paint_number(*number, code);
+            let painted = paint_number_in(date_system, *number, code);
             (painted.text, true, painted.color)
         }
         Value::Text(text) => (text.clone(), false, None),

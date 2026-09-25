@@ -54,9 +54,10 @@ that blank shows 0. A sheet whose refresh failed still returns the cells
 the cache lists; a cell that sheet does not list is `#REF!`. An unknown
 sheet or link is `#REF!`. A missing cell inside a cached external range
 on a sheet that refreshed is blank.
-Deliberately unsupported: 3D references, add-in (`_xll.`) calls, and the
-1904 date system. VBA and other workbook-defined procedures are not
-Excel functions and are not implemented. `TEXT` accepts only the locale-free codes listed
+Deliberately unsupported: add-in (`_xll.`) calls. A workbook may use the
+1900 or the 1904 date system; serials stay in the file's own epoch. VBA and
+other workbook-defined procedures are not Excel functions and are not
+implemented. `TEXT` accepts only the locale-free codes listed
 with the text functions below.
 
 Approximate lookups (`VLOOKUP`/`HLOOKUP` without `FALSE`, `MATCH` types 1 and
@@ -234,14 +235,20 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `RRI`
 
 
-`TODAY` is the 1900 serial of the tick instant's UTC date. `NOW` adds the
-time-of-day fraction. Import replays a cached `TODAY()` or `NOW()` serial
-as that instant and does not read a clock. A workbook whose stored
-`YEARFRAC(TODAY(), …)` results all agree on one serial uses that Excel
-calculation date instead. `RAND` still will not match
-Excel's generator. `RAND` and `RANDBETWEEN` are deterministic in the tick
-number and the calling cell: the same tick replays the same value, and a new
-tick changes it. `OFFSET` refuses a result outside the grid with `#REF!` and
+`TODAY` is the serial of the tick instant's UTC date in the workbook's date
+system. `NOW` adds the time-of-day fraction. Import replays a cached `TODAY()`
+or `NOW()` serial as that instant and does not read a clock. A workbook whose
+stored `YEARFRAC(TODAY(), …)` results all agree on one serial uses that Excel
+calculation date instead. `RAND` returns a number greater than or equal to 0
+and less than 1. `RANDBETWEEN(bottom, top)` truncates both arguments toward
+zero and returns an integer from that bottom through that top; `bottom > top`
+is `#NUM!` and a non-numeric argument is `#VALUE!`. Import replays a cached
+bare `RAND()` when the cache is in that half-open interval, and a cached bare
+`RANDBETWEEN` when the cache is an integer. Formulas that read those cells
+then see Excel's saved draw. The next tick discards the saved draws. A new
+draw is deterministic in the tick number and the calling cell. Excel does not
+publish the seed of a saved workbook, so a fresh draw is not Excel's next
+number. `OFFSET` refuses a result outside the grid with `#REF!` and
 a height or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of A1 text, including text a formula produces and a whole
 column or row, is that reference. R1C1, 3D references and an external
 workbook are `#REF!`.

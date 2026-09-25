@@ -58,7 +58,8 @@ compiled. The other opened workbook has values and no formulas; three macro
 sheets on it are skipped, so skipped sheets move from 48 to 51 and workbooks
 with skipped sheets from 23 to 24. The score process took about 142s after the
 release build. Owned peak RSS was 11,888,443,392 bytes. The only workbooks
-still refused declare the 1904 date system.
+this score still refused declare the 1904 date system. Support for that
+system landed after this score; those two workbooks are not in this table.
 
 First-failure groups are 8,672 external workbook references, 30,084
 unsupported functions, 7,495 cycles, and 5 structured references. The new
