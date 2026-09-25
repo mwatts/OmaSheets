@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-129 function names listed below, grouped for reading.
+132 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -227,6 +227,9 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 ### Financial
 
 - `PMT`
+- `IPMT`
+- `PPMT`
+- `PERCENTILE`
 - `PV`
 - `IRR`
 - `NPV`

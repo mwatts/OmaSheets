@@ -471,6 +471,9 @@ enum Function {
     WorkDay,
     Lookup,
     Pmt,
+    Ipmt,
+    Ppmt,
+    Percentile,
     Pv,
     Irr,
     Npv,
@@ -2323,6 +2326,8 @@ impl Workbook {
         if matches!(
             function,
             Function::Pmt
+                | Function::Ipmt
+                | Function::Ppmt
                 | Function::Pv
                 | Function::Irr
                 | Function::Npv
@@ -2330,6 +2335,9 @@ impl Workbook {
                 | Function::Xirr
         ) {
             return self.evaluate_financial_function(function, arguments);
+        }
+        if function == Function::Percentile {
+            return self.evaluate_percentile(arguments);
         }
         if matches!(
             function,
@@ -2511,6 +2519,9 @@ impl Workbook {
             | Function::NetworkDays
             | Function::WorkDay
             | Function::Pmt
+            | Function::Ipmt
+            | Function::Ppmt
+            | Function::Percentile
             | Function::Pv
             | Function::Irr
             | Function::Npv
@@ -3069,6 +3080,33 @@ impl Workbook {
     /// Present values, annuity payments, and periodic or dated returns.
     fn evaluate_financial_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
         let result = match function {
+            Function::Ipmt | Function::Ppmt => {
+                if !matches!(arguments.len(), 4..=6) {
+                    return Value::Error(CalcError::InvalidArguments);
+                }
+                let mut numbers = Vec::with_capacity(6);
+                for argument in arguments {
+                    match number(self.evaluate(argument)) {
+                        Ok(value) => numbers.push(value),
+                        Err(error) => return Value::Error(error),
+                    }
+                }
+                let future = numbers.get(4).copied().unwrap_or(0.0);
+                let at_start = numbers.get(5).copied().unwrap_or(0.0) != 0.0;
+                let calculate = if function == Function::Ipmt {
+                    interest_payment
+                } else {
+                    principal_payment
+                };
+                calculate(
+                    numbers[0],
+                    numbers[1],
+                    numbers[2],
+                    numbers[3],
+                    future,
+                    at_start,
+                )
+            }
             Function::Pmt | Function::Pv => {
                 if !matches!(arguments.len(), 3..=5) {
                     return Value::Error(CalcError::InvalidArguments);
@@ -3161,6 +3199,27 @@ impl Workbook {
             _ => unreachable!("dispatched above"),
         };
         match result {
+            Ok(value) => Value::Number(value),
+            Err(error) => Value::Error(error),
+        }
+    }
+
+    /// `PERCENTILE` is Excel's inclusive percentile: rank `k * (n - 1)` on the
+    /// sorted numbers, with linear interpolation. Text and blanks are ignored.
+    fn evaluate_percentile(&self, arguments: &[Expr<usize>]) -> Value {
+        if arguments.len() != 2 {
+            return Value::Error(CalcError::InvalidArguments);
+        }
+        let mut values = Vec::new();
+        self.flatten_values(&arguments[0], &mut values);
+        if let Some(error) = first_error(&values) {
+            return Value::Error(error);
+        }
+        let k = match number(self.evaluate(&arguments[1])) {
+            Ok(value) => value,
+            Err(error) => return Value::Error(error),
+        };
+        match percentile_inclusive(&values, k) {
             Ok(value) => Value::Number(value),
             Err(error) => Value::Error(error),
         }
@@ -4034,6 +4093,8 @@ fn is_elementwise(function: Function) -> bool {
             | Function::YearFrac
             | Function::Days360
             | Function::Pmt
+            | Function::Ipmt
+            | Function::Ppmt
             | Function::Pv
             | Function::NormDist
             | Function::NormSDist
@@ -4426,6 +4487,127 @@ fn square_of(value: f64) -> f64 {
 /// binary `(1 + rate) ^ periods` is high by about 1e-8 on a long monthly loan,
 /// and that excess compounds into the closing balance.
 const PAYMENT_DIGITS: u32 = 16;
+
+/// `IPMT`: interest due in one period. `per` truncates toward zero and must
+/// land in `1..=nper`. A payment at the beginning of period 1 has no interest.
+fn interest_payment(
+    rate: f64,
+    per: f64,
+    periods: f64,
+    present: f64,
+    future: f64,
+    at_start: bool,
+) -> Result<f64, CalcError> {
+    let per = loan_period(per, periods)?;
+    if at_start && per == 1 {
+        return Ok(0.0);
+    }
+    if rate == 0.0 {
+        return Ok(0.0);
+    }
+    let paid = payment(rate, periods, present, future, at_start)?;
+    let balance = future_value(rate, (per - 1) as f64, paid, present, at_start)?;
+    let interest = balance * rate;
+    if interest.is_finite() {
+        Ok(interest)
+    } else {
+        Err(CalcError::InvalidNumber)
+    }
+}
+
+/// `PPMT`: the principal part of the same period. It is the payment minus
+/// [`interest_payment`], so the two parts add back to `PMT`.
+fn principal_payment(
+    rate: f64,
+    per: f64,
+    periods: f64,
+    present: f64,
+    future: f64,
+    at_start: bool,
+) -> Result<f64, CalcError> {
+    let interest = interest_payment(rate, per, periods, present, future, at_start)?;
+    let paid = payment(rate, periods, present, future, at_start)?;
+    let principal = paid - interest;
+    if principal.is_finite() {
+        Ok(principal)
+    } else {
+        Err(CalcError::InvalidNumber)
+    }
+}
+
+fn loan_period(per: f64, periods: f64) -> Result<i64, CalcError> {
+    if !per.is_finite() || !periods.is_finite() || periods <= 0.0 || per.abs() > 1.0e9 {
+        return Err(CalcError::InvalidNumber);
+    }
+    let per = per.trunc() as i64;
+    if per < 1 || (per as f64) > periods {
+        Err(CalcError::InvalidNumber)
+    } else {
+        Ok(per)
+    }
+}
+
+/// Future value of `present` after `periods` payments of `paid`.
+fn future_value(
+    rate: f64,
+    periods: f64,
+    paid: f64,
+    present: f64,
+    at_start: bool,
+) -> Result<f64, CalcError> {
+    if !rate.is_finite() || !periods.is_finite() || !paid.is_finite() || !present.is_finite() {
+        return Err(CalcError::InvalidNumber);
+    }
+    if periods == 0.0 {
+        return Ok(-present);
+    }
+    if rate == 0.0 {
+        return Ok(-(present + paid * periods));
+    }
+    let growth = (1.0 + rate).powf(periods);
+    if !growth.is_finite() {
+        return Err(CalcError::InvalidNumber);
+    }
+    let timing = if at_start { 1.0 + rate } else { 1.0 };
+    let result = -(present * growth + paid * timing * (growth - 1.0) / rate);
+    if result.is_finite() {
+        Ok(result)
+    } else {
+        Err(CalcError::InvalidNumber)
+    }
+}
+
+/// Inclusive percentile. `k` is in `0..=1`. Rank `k * (n - 1)` interpolates
+/// the sorted numbers, which is Excel's `PERCENTILE` / `PERCENTILE.INC`.
+fn percentile_inclusive(values: &[Value], k: f64) -> Result<f64, CalcError> {
+    if !k.is_finite() || !(0.0..=1.0).contains(&k) {
+        return Err(CalcError::InvalidNumber);
+    }
+    let mut numbers = Vec::new();
+    for value in values {
+        if let Value::Number(number) = value {
+            if number.is_finite() {
+                numbers.push(*number);
+            }
+        }
+    }
+    if numbers.is_empty() {
+        return Err(CalcError::InvalidNumber);
+    }
+    numbers.sort_by(f64::total_cmp);
+    if numbers.len() == 1 {
+        return Ok(numbers[0]);
+    }
+    let rank = k * (numbers.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        Ok(numbers[lower])
+    } else {
+        let fraction = rank - lower as f64;
+        Ok(numbers[lower] + fraction * (numbers[upper] - numbers[lower]))
+    }
+}
 
 /// `PMT`: the constant payment of an annuity.
 fn payment(
@@ -7629,6 +7811,9 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("WORKDAY", Function::WorkDay),
     ("LOOKUP", Function::Lookup),
     ("PMT", Function::Pmt),
+    ("IPMT", Function::Ipmt),
+    ("PPMT", Function::Ppmt),
+    ("PERCENTILE", Function::Percentile),
     ("PV", Function::Pv),
     ("IRR", Function::Irr),
     ("NPV", Function::Npv),
@@ -10515,6 +10700,16 @@ mod tests {
                 1e-9,
             ),
             ("=PMT(0,10,1000)", -100.0, 1e-12),
+            ("=IPMT(0.1/12,1,3*12,8000)", -66.66666666666667, 1e-12),
+            ("=IPMT(0.1,3,3,8000)", -292.4471299093658, 1e-9),
+            ("=IPMT(0.1/12,10,3*12,8000)", -51.81825234324818, 1e-9),
+            ("=PPMT(0.1/12,1,3*12,8000)", -191.47083088403394, 1e-9),
+            ("=IPMT(0.1/12,1,3*12,8000,0,1)", 0.0, 1e-12),
+            ("=IPMT(0.1/12,1.9,3*12,8000)", -66.66666666666667, 1e-12),
+            ("=PERCENTILE({1,2,3,4},0.3)", 1.9, 1e-12),
+            ("=PERCENTILE({1,2,3,4},0.5)", 2.5, 1e-12),
+            ("=PERCENTILE({1,2,3,4},0)", 1.0, 1e-12),
+            ("=PERCENTILE({1,2,3,4},1)", 4.0, 1e-12),
             ("=NPV(0.1,-10000,3000,4200,6800)", 1188.4434123, 1e-9),
             ("=NPV(0.1,A2:A5)", 10332.456799, 1e-9),
             ("=XNPV(0.09,A1:A5,B1:B5)", 2086.647602, 1e-8),
@@ -10534,6 +10729,14 @@ mod tests {
         }
         for (formula, expected) in [
             ("=PMT(0.1,0,1000)", CalcError::InvalidNumber),
+            ("=IPMT(0.1/12,0,36,8000)", CalcError::InvalidNumber),
+            ("=IPMT(0.1/12,37,36,8000)", CalcError::InvalidNumber),
+            ("=PPMT(0.1/12,1,0,8000)", CalcError::InvalidNumber),
+            ("=PERCENTILE({1,2,3},-0.1)", CalcError::InvalidNumber),
+            ("=PERCENTILE({1,2,3},1.1)", CalcError::InvalidNumber),
+            ("=IPMT(0.1,1,3,\"x\")", CalcError::InvalidValue),
+            ("=PERCENTILE({1,2},\"x\")", CalcError::InvalidValue),
+            ("=IPMT(0.1,1,3)", CalcError::InvalidArguments),
             ("=NORMDIST(1,0,0,TRUE)", CalcError::InvalidNumber),
             ("=XNPV(0.09,A1:A5,B1:B4)", CalcError::InvalidNumber),
             ("=XNPV(-1,A1:A5,B1:B5)", CalcError::InvalidNumber),
