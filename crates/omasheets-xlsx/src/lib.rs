@@ -1,15 +1,17 @@
 //! Bounded `.xlsx` import into the owned OmaSheets M0 calculation engine.
 //!
 //! Date-formatted cells are imported as the raw serial numbers the file stores,
-//! matching `omasheets_calc::serial_date`; workbooks that declare the 1904 date
-//! system are rejected rather than silently offset by 1462 days.
+//! matching `omasheets_calc::serial_date`. A workbook that declares the 1904
+//! date system keeps those serials and evaluates dates from 1904-01-01.
 
-use calamine::{Cell, CellErrorType, Data, DataType, Range, Reader, Xlsx, XlsxFormulaMetadata};
+use calamine::{Cell, CellErrorType, Data, DataType, Reader, Xlsx, XlsxFormulaMetadata};
+#[cfg(test)]
+use calamine::Range;
 use omasheets_calc::pivot::{
     PivotAggregate, PivotCache, PivotCacheField, PivotDataField, PivotDateFilter, PivotDateGroup,
     PivotGroupBy, PivotScalar, PivotTable, cache_datetime_serial,
 };
-use omasheets_calc::serial_date::DATE_SYSTEM;
+use omasheets_calc::serial_date::{DateSystem, DATE_SYSTEM};
 use omasheets_calc::{
     CalcError, CellId, FormulaError, StructuredColumn, StructuredTable, Value, Workbook,
 };
@@ -146,7 +148,7 @@ pub struct ImportedWorkbook {
     pub workbook: Workbook,
     pub sheets: Vec<SheetInfo>,
     pub source_sha256: String,
-    /// Always `"1900"`: the importer refuses every other date system.
+    /// `"1900"` or `"1904"`. Serials are the file's own numbers.
     pub date_system: &'static str,
     pub unsupported: Vec<UnsupportedFormula>,
     /// Sheets named in `xl/workbook.xml` without a worksheet part, skipped by
@@ -388,7 +390,11 @@ fn import_xlsx_body(
 ) -> Result<ImportedWorkbook, ImportError> {
     let source_sha256 = hash_file(path)?;
     let (mut source, skipped_sheets) = open_repaired(path)?;
-    check_date_system(source.has_1904_epoch())?;
+    let date_system = if source.has_1904_epoch() {
+        DateSystem::Excel1904
+    } else {
+        DateSystem::Excel1900
+    };
     let sheet_names = source.sheet_names();
     if sheet_names.len() > limits.max_sheets {
         return Err(ImportError::TooManySheets {
@@ -429,6 +435,7 @@ fn import_xlsx_body(
         &array_formulas,
         pivots,
         source_sha256,
+        date_system,
         limits,
     )?;
     imported.skipped_sheets = skipped_sheets;
@@ -1394,14 +1401,6 @@ fn drop_dangling_sheets(
     (output, skipped)
 }
 
-fn check_date_system(has_1904_epoch: bool) -> Result<(), ImportError> {
-    if has_1904_epoch {
-        Err(ImportError::UnsupportedDateSystem { observed: "1904" })
-    } else {
-        Ok(())
-    }
-}
-
 fn hash_file(path: &Path) -> Result<String, ImportError> {
     let mut source = File::open(path).map_err(|error| ImportError::Open(error.to_string()))?;
     let mut digest = Sha256::new();
@@ -1937,6 +1936,7 @@ fn import_ranges(
         &HashMap::new(),
         PivotLoad::default(),
         source_sha256,
+        DateSystem::Excel1900,
         limits,
     )
 }
@@ -1950,6 +1950,7 @@ fn import_ranges_with_names(
     array_formulas: &HashMap<(u32, u32, u32), (usize, usize)>,
     pivots: PivotLoad,
     source_sha256: String,
+    date_system: DateSystem,
     limits: ImportLimits,
 ) -> Result<ImportedWorkbook, ImportError> {
     if ranges.len() > limits.max_sheets {
@@ -2000,6 +2001,7 @@ fn import_ranges_with_names(
         })
         .collect();
     let mut workbook = Workbook::default();
+    workbook.set_date_system(date_system);
     // One recalculation for the whole import instead of one per cell.
     workbook.begin_bulk();
     for sheet in &sheets {
@@ -2093,8 +2095,8 @@ fn import_ranges_with_names(
     }
 
     let source_cells: Vec<_> = source_cells.into_values().collect();
-    if let Some(at) =
-        tick_from_cached_volatile(&source_cells).or_else(|| infer_yearfrac_today(&source_cells))
+    if let Some(at) = tick_from_cached_volatile(&source_cells, date_system)
+        .or_else(|| infer_yearfrac_today(&source_cells, date_system))
     {
         // Before formulas are installed, so TODAY() and NOW() replay this
         // serial instead of staying #N/A. Does not read the system clock.
@@ -2119,13 +2121,14 @@ fn import_ranges_with_names(
             }),
         }
     }
+    replay_cached_randoms(&mut workbook, &source_cells);
     let formula_cells_loaded = compiled_cells.len();
     workbook.end_bulk();
     Ok(ImportedWorkbook {
         workbook,
         sheets,
         source_sha256,
-        date_system: DATE_SYSTEM,
+        date_system: date_system.as_str(),
         unsupported,
         skipped_sheets: Vec::new(),
         source_cells,
@@ -2317,7 +2320,7 @@ fn parse_area(reference: &str) -> Option<(u32, u32, u32, u32)> {
 /// Serial for `YEARFRAC(TODAY(), date, basis)` when the cell stores the
 /// formula result and the other arguments are numbers. One serial has to
 /// satisfy every such formula. Does not read the system clock.
-fn infer_yearfrac_today(cells: &[ImportedCell]) -> Option<i64> {
+fn infer_yearfrac_today(cells: &[ImportedCell], system: DateSystem) -> Option<i64> {
     let numbers: HashMap<(u32, u32, u32), f64> = cells
         .iter()
         .filter_map(|cell| match cell.stored {
@@ -2329,7 +2332,7 @@ fn infer_yearfrac_today(cells: &[ImportedCell]) -> Option<i64> {
         .collect();
     let probes: Vec<YearFracProbe> = cells
         .iter()
-        .filter_map(|cell| yearfrac_probe(cell, &numbers))
+        .filter_map(|cell| yearfrac_probe(system, cell, &numbers))
         .collect();
     if probes.is_empty() {
         return None;
@@ -2357,7 +2360,7 @@ fn infer_yearfrac_today(cells: &[ImportedCell]) -> Option<i64> {
     let mut best_serial = None;
     let mut best_error = f64::MAX;
     for serial in candidates {
-        let Some(error) = yearfrac_probe_error(serial, &probes) else {
+        let Some(error) = yearfrac_probe_error(system, serial, &probes) else {
             continue;
         };
         if error < best_error {
@@ -2367,9 +2370,12 @@ fn infer_yearfrac_today(cells: &[ImportedCell]) -> Option<i64> {
     }
     let serial = best_serial?;
     let acceptable = probes.iter().all(|probe| {
-        let Ok(fraction) =
-            omasheets_calc::serial_date::year_fraction(serial, probe.end_serial, probe.basis)
-        else {
+        let Ok(fraction) = omasheets_calc::serial_date::year_fraction_in(
+            system,
+            serial,
+            probe.end_serial,
+            probe.basis,
+        ) else {
             return false;
         };
         let predicted = match probe.rate {
@@ -2381,7 +2387,7 @@ fn infer_yearfrac_today(cells: &[ImportedCell]) -> Option<i64> {
     if !acceptable {
         return None;
     }
-    omasheets_calc::serial_date::unix_millis_from_serial(serial as f64).ok()
+    omasheets_calc::serial_date::unix_millis_from_serial_in(system, serial as f64).ok()
 }
 
 struct YearFracProbe {
@@ -2404,12 +2410,20 @@ fn implied_year_fraction(probe: &YearFracProbe) -> Option<f64> {
     }
 }
 
-fn yearfrac_probe_error(serial: i64, probes: &[YearFracProbe]) -> Option<f64> {
+fn yearfrac_probe_error(
+    system: DateSystem,
+    serial: i64,
+    probes: &[YearFracProbe],
+) -> Option<f64> {
     let mut error = 0.0;
     for probe in probes {
-        let fraction =
-            omasheets_calc::serial_date::year_fraction(serial, probe.end_serial, probe.basis)
-                .ok()?;
+        let fraction = omasheets_calc::serial_date::year_fraction_in(
+            system,
+            serial,
+            probe.end_serial,
+            probe.basis,
+        )
+        .ok()?;
         let predicted = match probe.rate {
             Some(rate) => (1.0 + rate).powf(-fraction),
             None => fraction,
@@ -2420,6 +2434,7 @@ fn yearfrac_probe_error(serial: i64, probes: &[YearFracProbe]) -> Option<f64> {
 }
 
 fn yearfrac_probe(
+    system: DateSystem,
     cell: &ImportedCell,
     numbers: &HashMap<(u32, u32, u32), f64>,
 ) -> Option<YearFracProbe> {
@@ -2461,7 +2476,7 @@ fn yearfrac_probe(
     };
     let (end_row, end_column) = parse_cell_reference(end_ref)?;
     let end = numbers.get(&(cell.cell.sheet, end_row, end_column))?;
-    let end_serial = omasheets_calc::serial_date::serial_from_number(*end).ok()?;
+    let end_serial = omasheets_calc::serial_date::serial_from_number_in(system, *end).ok()?;
     let rate = match rate_ref {
         Some(reference) => {
             let (row, column) = parse_cell_reference(&reference)?;
@@ -2481,7 +2496,7 @@ fn yearfrac_probe(
 /// UTC Unix milliseconds. Anything that is not exactly that call is ignored,
 /// so `TODAY()+1` cannot move the tick. No cached volatile leaves the
 /// workbook without a tick.
-fn tick_from_cached_volatile(cells: &[ImportedCell]) -> Option<i64> {
+fn tick_from_cached_volatile(cells: &[ImportedCell], system: DateSystem) -> Option<i64> {
     let mut today = None;
     let mut now = None;
     for cell in cells {
@@ -2498,11 +2513,105 @@ fn tick_from_cached_volatile(cells: &[ImportedCell]) -> Option<i64> {
         }
     }
     for serial in [now, today].into_iter().flatten() {
-        if let Ok(millis) = omasheets_calc::serial_date::unix_millis_from_serial(serial) {
+        if let Ok(millis) =
+            omasheets_calc::serial_date::unix_millis_from_serial_in(system, serial)
+        {
             return Some(millis);
         }
     }
     None
+}
+
+/// Bare `RAND()` or `RANDBETWEEN(bottom, top)`, ignoring `=` and unary `+`.
+/// A draw nested inside another formula is not replayed: the cache would be
+/// the outer result, not the random number.
+fn replay_cached_randoms(workbook: &mut Workbook, cells: &[ImportedCell]) {
+    for cell in cells {
+        let Some(formula) = cell.formula.as_deref() else {
+            continue;
+        };
+        let Value::Number(value) = cell.stored else {
+            continue;
+        };
+        match cached_random_formula(formula) {
+            Some(CachedRandom::Rand) if (0.0..1.0).contains(&value) => {
+                workbook.replay_cached_random(cell.cell, value);
+            }
+            Some(CachedRandom::RandBetween) if (value - value.round()).abs() <= 1e-9 => {
+                workbook.replay_cached_random(cell.cell, value);
+            }
+            _ => {}
+        }
+    }
+}
+
+enum CachedRandom {
+    Rand,
+    RandBetween,
+}
+
+fn cached_random_formula(formula: &str) -> Option<CachedRandom> {
+    let compact = compact_formula(formula)?;
+    if compact.eq_ignore_ascii_case("RAND()") {
+        return Some(CachedRandom::Rand);
+    }
+    let inner = compact
+        .get(.."RANDBETWEEN(".len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case("RANDBETWEEN("))
+        .and_then(|_| compact.get("RANDBETWEEN(".len()..))
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    if top_level_commas(inner) == Some(1) {
+        Some(CachedRandom::RandBetween)
+    } else {
+        None
+    }
+}
+
+fn compact_formula(formula: &str) -> Option<String> {
+    let mut text = formula.trim();
+    if let Some(rest) = text.strip_prefix('=') {
+        text = rest.trim_start();
+    }
+    while text.starts_with('+') {
+        text = text[1..].trim_start();
+    }
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if compact.is_empty() { None } else { Some(compact) }
+}
+
+/// Commas that separate arguments, not commas inside strings or calls.
+fn top_level_commas(text: &str) -> Option<usize> {
+    let mut commas = 0;
+    let mut depth = 0_i32;
+    let mut quoted = false;
+    for character in text.chars() {
+        if quoted {
+            if character == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => quoted = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            ',' if depth == 0 => commas += 1,
+            _ => {}
+        }
+    }
+    if quoted || depth != 0 {
+        None
+    } else {
+        Some(commas)
+    }
 }
 
 /// `Some(true)` is `NOW()`, `Some(false)` is `TODAY()`. Optional `=` and
@@ -2599,8 +2708,7 @@ fn set_source_value(workbook: &mut Workbook, cell: CellId, value: &Data) {
             workbook.set_text(cell, value.clone());
         }
         Data::DateTime(value) => {
-            // The raw 1900-system serial; `check_date_system` has already
-            // rejected 1904 workbooks, so no epoch shift is applied.
+            // The file's own serial. A 1904 workbook is not shifted by 1462.
             workbook.set_number(cell, value.as_f64());
         }
         Data::Error(error) => {
@@ -3391,6 +3499,7 @@ mod tests {
             &HashMap::new(),
             PivotLoad::default(),
             "j".repeat(64),
+            DateSystem::Excel1900,
             ImportLimits::default(),
         )
         .unwrap();
@@ -3426,17 +3535,75 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_1904_date_system_before_reading_any_cell() {
-        assert_eq!(check_date_system(false), Ok(()));
-        let error = check_date_system(true).unwrap_err();
+    fn imports_a_1904_workbook_without_shifting_serials() {
+        let path = std::env::temp_dir().join(format!(
+            "omasheets-1904-{}.xlsx",
+            std::process::id()
+        ));
+        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><workbookPr date1904="1"/><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f>DATE(1904,1,1)</f><v>0</v></c><c r="B1"><v>0</v></c></row></sheetData></worksheet>"#;
+        write_owned(
+            &path,
+            &[
+                ("[Content_Types].xml", content_types("")),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/workbook.xml", workbook.to_string()),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/worksheets/sheet1.xml", sheet.to_string()),
+            ],
+        );
+        let imported = import_xlsx(&path, ImportLimits::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(imported.date_system, "1904");
         assert_eq!(
-            error,
-            ImportError::UnsupportedDateSystem { observed: "1904" }
+            imported.workbook.value(CellId::new(0, 0, 0)),
+            Value::Number(0.0)
         );
         assert_eq!(
-            error.to_string(),
-            "workbook uses the 1904 date system; only the 1900 date system is supported"
+            imported.workbook.value(CellId::new(0, 0, 1)),
+            Value::Number(0.0)
         );
+        assert_eq!(imported.parity().stored_values_matched, 1);
+    }
+
+    #[test]
+    fn replays_cached_rand_draws_into_the_formulas_that_read_them() {
+        let path = std::env::temp_dir().join(format!(
+            "omasheets-rand-{}.xlsx",
+            std::process::id()
+        ));
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f t="shared" ref="A1:B1" si="0">RAND()</f><v>0.25</v></c><c r="B1"><f t="shared" si="0"/><v>0.5</v></c><c r="C1"><f>A1+B1</f><v>0.75</v></c></row><row r="2"><c r="A2"><f>RANDBETWEEN(1,6)</f><v>4</v></c><c r="B2"><f>A2*2</f><v>8</v></c></row></sheetData></worksheet>"#;
+        write_plain_workbook_xml(&path, sheet);
+        let imported = import_xlsx(&path, ImportLimits::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 0)),
+            Value::Number(0.25)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 1)),
+            Value::Number(0.5)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 2)),
+            Value::Number(0.75)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 1, 0)),
+            Value::Number(4.0)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 1, 1)),
+            Value::Number(8.0)
+        );
+        assert_eq!(imported.parity().stored_values_mismatched, 0);
+        assert_eq!(imported.parity().stored_values_matched, 5);
     }
 
     #[test]
