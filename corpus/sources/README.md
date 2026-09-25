@@ -31,7 +31,7 @@ unsupported-function distribution and the failure kinds), and
 baseline engine named in that delta. Both are aggregate only; the JSON records
 the exact engine revisions and runners.
 
-The latest score was taken on 2026-09-24 at engine `f08a50a` on Darwin arm64.
+The latest score was taken on 2026-09-25 at engine `0f169a8` on Darwin arm64.
 macOS does not implement `RLIMIT_AS`, so that ceiling was not applied and the
 probe still ran. The frozen 1,000-workbook manifest is unchanged and still
 exposes 924,235 formula cells. `enron-figshare.score-delta.json` remains the
@@ -39,26 +39,25 @@ exposes 924,235 formula cells. `enron-figshare.score-delta.json` remains the
 [Workflow evidence](https://github.com/tcballard/OmaSheets/actions/runs/34254502652)
 for that earlier run.
 
-| Owned engine lane | 2026-09-08 (`12d1c8c`) | 2026-09-24 (`f08a50a`) | 2026-09-24 (this pass) |
+| Owned engine lane | 2026-09-08 (`12d1c8c`) | 2026-09-24 (`f08a50a`) | 2026-09-25 (`0f169a8`) |
 |---|---:|---:|---:|
 | Workbooks opened | 996 / 1,000 | 996 / 1,000 | 996 / 1,000 |
 | Formula cells observed | 924,235 | 924,235 | 924,235 |
-| Loaded and compared | 829,529 (89.75%) | 881,148 (95.34%) | 886,329 (95.90%) |
-| Stored values matched | 828,437 | 874,541 | 883,480 |
+| Loaded and compared | 829,529 (89.75%) | 881,148 (95.34%) | 886,449 (95.91%) |
+| Stored values matched | 828,437 | 874,541 | 883,617 |
 | Match rate of compared | 99.87% | 99.25% | 99.68% |
-| Stored values mismatched | 1,092 | 6,607 | 2,849 |
-| Not compiled | 94,706 | 43,087 | 37,906 |
+| Stored values mismatched | 1,092 | 6,607 | 2,832 |
+| Not compiled | 94,706 | 43,087 | 37,786 |
 
-This pass is the uncommitted tree after `f08a50a`. The score process took
-about 137s after the release build. Owned peak RSS was 11,890,491,392 bytes.
-Stored values mismatched fell from 3,575 on the previous measurement of this
-tree to 2,849. Blank `DATEVALUE(TEXT(...))`, empty external text, the Vol Move
-`LINEST`/`OFFSET` slopes, and the AEC `YEARFRAC` discounts now match.
+This pass is commit `0f169a8`. The score process took about 140s after the
+release build. Owned peak RSS was 11,890,917,376 bytes. The 120
+three-dimensional sums on the plant model, previously unknown names, now
+match the stored values. Two number-versus-number misses and 28 cycles remain
+on that workbook. Stored-value mismatches fell from 2,849 to 2,832.
 
 First-failure groups are 8,549 external workbook references, 21,737
-unsupported functions, 7,495 cycles, 120 unknown names and 5 structured
-references. `ROWS`, `CELL`, and `LINEST` are no longer in the unsupported
-function table. These are compatibility measurements, not target-desktop
+unsupported functions, 7,495 cycles, and 5 structured references. Unknown
+names are gone. These are compatibility measurements, not target-desktop
 performance claims.
 
 
