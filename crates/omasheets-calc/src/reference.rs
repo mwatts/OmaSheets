@@ -123,7 +123,7 @@ fn narrow_index(arguments: &mut Vec<Expr>) {
 #[derive(Clone, Copy)]
 pub(super) struct ReferenceView {
     node: Option<usize>,
-    anchor: CellId,
+    pub(super) anchor: CellId,
     row: usize,
     column: usize,
     pub(super) rows: usize,
@@ -131,7 +131,7 @@ pub(super) struct ReferenceView {
 }
 
 impl ReferenceView {
-    fn cell(self, workbook: &Workbook, row: usize, column: usize) -> CellId {
+    pub(super) fn cell(self, workbook: &Workbook, row: usize, column: usize) -> CellId {
         if let Some(node) = self.node {
             match workbook.range_shape(node) {
                 RangeShape::Rectangle { anchor, .. } => CellId::new(
@@ -151,30 +151,6 @@ impl ReferenceView {
                 self.anchor.column + (self.column + column) as u32,
             )
         }
-    }
-
-    fn position(self, workbook: &Workbook, cell: CellId) -> Option<(usize, usize)> {
-        let (row, column) = match self.node.map(|node| (node, workbook.range_shape(node))) {
-            Some((node, RangeShape::Members { columns, .. })) => {
-                let index = workbook.cells[node]
-                    .dependencies
-                    .iter()
-                    .position(|index| workbook.cells[*index].id == cell)?;
-                (index / columns, index % columns)
-            }
-            _ => {
-                if cell.sheet != self.anchor.sheet {
-                    return None;
-                }
-                (
-                    cell.row.checked_sub(self.anchor.row)? as usize,
-                    cell.column.checked_sub(self.anchor.column)? as usize,
-                )
-            }
-        };
-        let row = row.checked_sub(self.row)?;
-        let column = column.checked_sub(self.column)?;
-        (row < self.rows && column < self.columns).then_some((row, column))
     }
 
     pub(crate) fn rectangle(anchor: CellId, rows: usize, columns: usize) -> Self {
@@ -207,10 +183,18 @@ impl ReferenceView {
     }
 
     pub(super) fn array(self, workbook: &Workbook) -> ArrayValue {
+        let count = self.rows.saturating_mul(self.columns);
+        if count > super::DENSE_RANGE_CELLS {
+            return ArrayValue {
+                rows: 1,
+                columns: 1,
+                values: vec![Value::Error(CalcError::InvalidValue)],
+            };
+        }
         ArrayValue {
             rows: self.rows,
             columns: self.columns,
-            values: (0..self.rows * self.columns)
+            values: (0..count)
                 .map(|index| self.value(workbook, index))
                 .collect(),
         }
@@ -349,36 +333,37 @@ impl Workbook {
         &self,
         arguments: &[Expr<usize>],
     ) -> Result<ReferenceView, CalcError> {
-        let [first, last, envelope] = arguments else {
+        let [first, last, _] = arguments else {
             return Err(CalcError::InvalidArguments);
         };
         let first = self.reference_view(first)?;
         let last = self.reference_view(last)?;
-        let envelope = self.reference_view(envelope)?;
-        let endpoints = [
+        let corners = [
             first.cell(self, 0, 0),
-            first.cell(self, first.rows - 1, first.columns - 1),
+            first.cell(
+                self,
+                first.rows.saturating_sub(1),
+                first.columns.saturating_sub(1),
+            ),
             last.cell(self, 0, 0),
-            last.cell(self, last.rows - 1, last.columns - 1),
+            last.cell(
+                self,
+                last.rows.saturating_sub(1),
+                last.columns.saturating_sub(1),
+            ),
         ];
-        let mut min_row = usize::MAX;
-        let mut min_column = usize::MAX;
-        let mut max_row = 0;
-        let mut max_column = 0;
-        for cell in endpoints {
-            let (row, column) = envelope
-                .position(self, cell)
-                .ok_or(CalcError::InvalidReference)?;
-            min_row = min_row.min(row);
-            min_column = min_column.min(column);
-            max_row = max_row.max(row);
-            max_column = max_column.max(column);
+        let sheet = corners[0].sheet;
+        if corners.iter().any(|cell| cell.sheet != sheet) {
+            return Err(CalcError::InvalidReference);
         }
-        Ok(envelope.select(
-            min_row,
-            min_column,
-            max_row - min_row + 1,
-            max_column - min_column + 1,
+        let min_row = corners.iter().map(|cell| cell.row).min().unwrap();
+        let max_row = corners.iter().map(|cell| cell.row).max().unwrap();
+        let min_column = corners.iter().map(|cell| cell.column).min().unwrap();
+        let max_column = corners.iter().map(|cell| cell.column).max().unwrap();
+        Ok(ReferenceView::rectangle(
+            CellId::new(sheet, min_row, min_column),
+            (max_row - min_row + 1) as usize,
+            (max_column - min_column + 1) as usize,
         ))
     }
 

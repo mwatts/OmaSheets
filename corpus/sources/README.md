@@ -31,45 +31,35 @@ unsupported-function distribution and the failure kinds), and
 baseline engine named in that delta. Both are aggregate only; the JSON records
 the exact engine revisions and runners.
 
-The latest score was taken on 2026-09-24 at engine `371fc30` in one Linux
-aarch64 container. The frozen 1,000-workbook manifest is unchanged and still
+The latest score was taken on 2026-09-24 at engine `f08a50a` on Darwin arm64.
+macOS does not implement `RLIMIT_AS`, so that ceiling was not applied and the
+probe still ran. The frozen 1,000-workbook manifest is unchanged and still
 exposes 924,235 formula cells. `enron-figshare.score-delta.json` remains the
 2026-09-08 paired comparison and was not recomputed.
 [Workflow evidence](https://github.com/tcballard/OmaSheets/actions/runs/34254502652)
 for that earlier run.
 
-| Owned engine lane | 2026-09-08 (`12d1c8c`) | 2026-09-24 (`371fc30`) |
-|---|---:|---:|
-| Workbooks opened | 996 / 1,000 | 996 / 1,000 |
-| Formula cells observed | 924,235 | 924,235 |
-| Loaded and compared | 829,529 (89.75%) | 881,148 (95.34%) |
-| Stored values matched | 828,437 | 852,505 |
-| Match rate of compared | 99.87% | 96.75% |
-| Stored values mismatched | 1,092 | 28,643 |
-| Not compiled | 94,706 | 43,087 |
+| Owned engine lane | 2026-09-08 (`12d1c8c`) | 2026-09-24 (`f08a50a`) | 2026-09-24 (this pass) |
+|---|---:|---:|---:|
+| Workbooks opened | 996 / 1,000 | 996 / 1,000 | 996 / 1,000 |
+| Formula cells observed | 924,235 | 924,235 | 924,235 |
+| Loaded and compared | 829,529 (89.75%) | 881,148 (95.34%) | 886,329 (95.90%) |
+| Stored values matched | 828,437 | 874,541 | 883,480 |
+| Match rate of compared | 99.87% | 99.25% | 99.68% |
+| Stored values mismatched | 1,092 | 6,607 | 2,849 |
+| Not compiled | 94,706 | 43,087 | 37,906 |
 
-This compiles 51,619 more formulas than the 2026-09-08 aggregate and matches
-24,068 more stored values, without changing the sample or denominator.
-Mismatches rise from 1,092 to 28,643, so the match rate of compared cells
-falls from 99.87% to 96.75%. The aggregate cannot attribute those mismatches
-to individual formulas or establish that every previously matched cell is
-unchanged.
+This pass is the uncommitted tree after `f08a50a`. The score process took
+about 137s after the release build. Owned peak RSS was 11,890,491,392 bytes.
+Stored values mismatched fell from 3,575 on the previous measurement of this
+tree to 2,849. Blank `DATEVALUE(TEXT(...))`, empty external text, the Vol Move
+`LINEST`/`OFFSET` slopes, and the AEC `YEARFRAC` discounts now match.
 
-First-failure classes also move. Invalid references fall from 10,551 to none,
-while cycles rise from 2,292 to 7,494 and structured references account for
-5. Unsupported functions fall from 28,967 to 23,367 and unsupported names
-from 5,767 to 3,550. A lower count in an early failure class does not mean
-every affected formula now compiles.
-
-The remaining first-failure groups are 8,549 external workbook references,
-23,367 unsupported functions, 7,494 cycles, 3,550 unsupported name
-definitions, 122 unknown names and 5 structured references. Within
-unsupported functions, 21,737 cells still call proprietary add-ins. Ordinary
-gaps that remain include locale-sensitive `DATEVALUE`, `LINEST`, `CELL` and
-`ROWS`. `OFFSET`, `INDIRECT`, `TEXT`, `TODAY`, `NOW`, `RAND` and the database
-aggregates are no longer in the first-failure table. External references that
-still do not resolve, and add-in execution, remain refused. These are
-compatibility measurements, not target-desktop performance claims.
+First-failure groups are 8,549 external workbook references, 21,737
+unsupported functions, 7,495 cycles, 120 unknown names and 5 structured
+references. `ROWS`, `CELL`, and `LINEST` are no longer in the unsupported
+function table. These are compatibility measurements, not target-desktop
+performance claims.
 
 
 Generate both files from a measured schema-2 scorer report with
