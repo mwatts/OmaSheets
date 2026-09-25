@@ -4060,16 +4060,15 @@ mod tests {
         }
         let imported = import_xlsx(path, ImportLimits::default()).unwrap();
         let report = imported.report();
-        // The opening balance matches until the schedule switches to the
-        // constant payment. PMT is high by about 1.29e-8, and that excess
-        // compounds to about 1.3e-6 by the last draw. The seven cycles are an
-        // annual total that sums the months which are fractions of that total.
+        // The seven cycles are an annual total that sums the months which
+        // are fractions of that total. PMT for the amortizing draw matches
+        // the cached payment, so the funding close matches too.
         assert_eq!(
             (
                 report.stored_values_mismatched,
                 report.unsupported_reasons.get("cycle").copied()
             ),
-            (5, Some(7)),
+            (0, Some(7)),
             "{:?}",
             report.mismatch_value_kinds
         );
