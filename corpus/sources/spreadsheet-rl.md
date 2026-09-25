@@ -6,7 +6,7 @@ The recorded baseline is a 16-file sample of workbooks from that release (Excel-
 
 ## Results
 
-[`spreadsheet-rl.score-summary.json`](spreadsheet-rl.score-summary.json) is the aggregate two-lane score of that 16-file sample. Scored 2026-09-24 on the uncommitted tree after `f08a50a`. The record is aggregate only: no workbook paths, cell contents, or per-file results.
+[`spreadsheet-rl.score-summary.json`](spreadsheet-rl.score-summary.json) is the aggregate two-lane score of that 16-file sample. Rescored 2026-09-25 at `0f169a8`. The totals are unchanged from the 2026-09-24 score. The record is aggregate only: no workbook paths, cell contents, or per-file results.
 
 The owned lane opened every workbook. The Formualizer candidate lane opened 11 of 16, so its formula-cell totals cover only those 11. The five candidate opens that failed stay in the file count (2 formula-parse errors, 1 undefined name, 2 undefined tables). None timed out.
 
@@ -40,11 +40,9 @@ Three SpreadsheetBench-2 inputs with a reputation for structural complexity were
 |---|---:|---:|---:|---:|---:|---:|
 | Debugging 10_01, 99-sheet operating rollup | 99 | 77,194 | 77,151 | 77,151 | 0 | 43 cycles |
 | Financial_Model 08_04, DCF and three statements | 13 | 133,888 | 133,881 | 133,881 | 0 | 7 cycles |
-| Financial_Model 04_02, valuation model | 9 | 74,578 | 74,571 | 74,565 | 6 | 7 `PROPER` |
-| Three-file total after the `OFFSET` and `PMT` fixes |  | 285,660 | 285,603 | 285,597 | 6 | 57 |
+| Financial_Model 04_02, valuation model | 9 | 74,578 | 74,578 | 74,572 | 6 | 0 |
+| Three-file total at `0f169a8` |  | 285,660 | 285,610 | 285,604 | 6 | 50 |
 
-The first score of these three, before that wait, matched 84.10% of compared cells (45,399 mismatched, almost all in the DCF workbook). Owned peak resident set was 148,094,976 bytes. Candidate peak was 504,332,288 bytes. The DCF row above is a later reimport on the same tree. The other two rows are from the first score, and the total adds those rows to the reimport.
-
-The operating rollup matches every formula that compiled. Its 43 refusals are scenario holds that read their own cell on the inactive branch, such as `IF($C$2=3,$R31,AV20)` in `AV20`. The valuation model's six mismatches are `((later/earlier)^(1/5)-1)` on a negative ratio: the cache is a real fifth root and the engine returns `#NUM!`. Its seven refusals are `PROPER`.
+The first score of these three, before the OFFSET wait, matched 84.10% of compared cells (45,399 mismatched, almost all in the DCF workbook). The table above is the 2026-09-25 rescore at `0f169a8`, with a 120-second timeout. The operating rollup matches every formula that compiled. Its 43 refusals are scenario holds that read their own cell on the inactive branch, such as `IF($C$2=3,$R31,AV20)` in `AV20`. The valuation model's six mismatches are `((later/earlier)^(1/5)-1)` on a negative ratio: the cache is a real fifth root and the engine returns `#NUM!`. Its seven `PROPER` formulas now match, so that workbook has nothing left uncompiled. The DCF workbook is unchanged: no stored-value mismatches, and the same seven cycles.
 
 A dynamic `OFFSET` discovered during the calculation pass now waits for the formula cells in the rectangle it resolves. `PMT` for an integer number of periods is evaluated at 16 significant digits, so `-PMT(0.06/12,84,50000000)` matches the cached payment instead of running about 1.29e-8 high. Reimporting the DCF workbook after both changes leaves no stored-value mismatches. The 7 cycles are an annual total that sums the months, where each month is a fraction of that total.
