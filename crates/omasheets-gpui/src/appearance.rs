@@ -5,11 +5,18 @@
 //! is touched.
 
 use omasheets_core::parse_a1;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
 const PART_LIMIT: u64 = 8 * 1024 * 1024;
+/// Styles for one worksheet of a corpus model. Larger than [`PART_LIMIT`]
+/// because a single financial-model sheet can pass 8 MiB.
+const CHROME_PART_LIMIT: u64 = 32 * 1024 * 1024;
+const CHROME_COLOR_CAP: usize = 200_000;
+const CHROME_MERGE_CAP: usize = 8_192;
+const CHROME_WIDTH_CAP: usize = 512;
 const EXCEL_DEFAULT_WIDTH: f64 = 8.43;
 
 /// Zero-based inclusive window the grid is about to paint.
@@ -143,6 +150,244 @@ impl From<std::io::Error> for AppearanceError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+struct WidthSpan {
+    start: u32,
+    end: u32,
+    width: f64,
+    custom: bool,
+}
+
+/// Column widths, merges, and explicit RGB colors for one whole worksheet.
+/// Built once per sheet so scrolling only slices the visible window.
+pub(crate) struct SheetChrome {
+    sheet_name: String,
+    widths: Vec<WidthSpan>,
+    merges: Vec<MergeRect>,
+    colors: HashMap<(u32, u32), (Option<RgbColor>, Option<RgbColor>)>,
+}
+
+impl SheetChrome {
+    pub(crate) fn tile(&self, window: VisibleWindow) -> AppearanceTile {
+        let mut column_widths = Vec::new();
+        if let Some(last) = window_last(window.origin_column, window.columns) {
+            for column in window.origin_column..=last {
+                if let Some(span) = self
+                    .widths
+                    .iter()
+                    .find(|span| (span.start..=span.end).contains(&column))
+                {
+                    column_widths.push(ColumnWidth {
+                        column,
+                        width: span.width,
+                        custom: span.custom,
+                    });
+                }
+            }
+        }
+        let merges = self
+            .merges
+            .iter()
+            .copied()
+            .filter(|merge| merge.intersects(window))
+            .collect();
+        let mut colors = Vec::new();
+        if let (Some(last_row), Some(last_column)) = (
+            window_last(window.origin_row, window.rows),
+            window_last(window.origin_column, window.columns),
+        ) {
+            for row in window.origin_row..=last_row {
+                for column in window.origin_column..=last_column {
+                    let Some(&(font, fill)) = self.colors.get(&(row, column)) else {
+                        continue;
+                    };
+                    if font.is_none() && fill.is_none() {
+                        continue;
+                    }
+                    colors.push(CellColor {
+                        row,
+                        column,
+                        fill,
+                        font,
+                    });
+                }
+            }
+        }
+        AppearanceTile {
+            sheet_name: self.sheet_name.clone(),
+            column_widths,
+            merges,
+            colors,
+        }
+    }
+}
+
+/// Reads styles for `sheet_name` from the package. Theme and indexed colors
+/// are dropped. A missing or oversized sheet part is an error; the grid still
+/// shows values without colors.
+pub(crate) fn load_sheet_chrome(
+    path: &Path,
+    sheet_name: &str,
+) -> Result<SheetChrome, AppearanceError> {
+    let file = File::open(path)?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|error| AppearanceError::Zip(error.to_string()))?;
+    let workbook = read_part_limited(&mut archive, "xl/workbook.xml", CHROME_PART_LIMIT)?;
+    let relationships = read_part_limited(
+        &mut archive,
+        "xl/_rels/workbook.xml.rels",
+        CHROME_PART_LIMIT,
+    )?;
+    let sheet_part = sheet_part_named(&workbook, &relationships, sheet_name)?;
+    let sheet = read_part_limited(&mut archive, &sheet_part, CHROME_PART_LIMIT)?;
+    let styles =
+        read_part_limited(&mut archive, "xl/styles.xml", CHROME_PART_LIMIT).unwrap_or_default();
+    let palette = StylePalette::parse(&styles);
+    Ok(chrome_from_sheet(sheet_name, &sheet, &palette))
+}
+
+fn chrome_from_sheet(sheet_name: &str, sheet: &str, palette: &StylePalette) -> SheetChrome {
+    let mut widths = Vec::new();
+    visit_open_tags(sheet, "col", |tag| {
+        if widths.len() >= CHROME_WIDTH_CAP {
+            return false;
+        }
+        let Some(min) = attribute(tag, "min").and_then(|text| text.parse::<u32>().ok()) else {
+            return true;
+        };
+        let max = attribute(tag, "max")
+            .and_then(|text| text.parse::<u32>().ok())
+            .unwrap_or(min);
+        let Some(width) = attribute(tag, "width").and_then(|text| text.parse::<f64>().ok()) else {
+            return true;
+        };
+        if !width.is_finite() || min == 0 {
+            return true;
+        }
+        let flagged = attribute(tag, "customWidth").is_some_and(|value| is_truthy(&value));
+        let custom = flagged || (width - EXCEL_DEFAULT_WIDTH).abs() > 0.05;
+        let start = min.max(1) - 1;
+        let end = max.max(min).max(1) - 1;
+        widths.push(WidthSpan {
+            start,
+            end,
+            width,
+            custom,
+        });
+        true
+    });
+
+    let mut merges = Vec::new();
+    visit_open_tags(sheet, "mergeCell", |tag| {
+        if merges.len() >= CHROME_MERGE_CAP {
+            return false;
+        }
+        if let Some(reference) = attribute(tag, "ref") {
+            if let Some(merge) = parse_merge(&reference) {
+                merges.push(merge);
+            }
+        }
+        true
+    });
+
+    let mut colors = HashMap::new();
+    visit_open_tags(sheet, "c", |tag| {
+        if colors.len() >= CHROME_COLOR_CAP {
+            return false;
+        }
+        let Some(reference) = attribute(tag, "r") else {
+            return true;
+        };
+        let Some(style) = attribute(tag, "s").and_then(|text| text.parse::<usize>().ok()) else {
+            return true;
+        };
+        let Some((row, column)) = parse_a1(&reference) else {
+            return true;
+        };
+        let (font, fill) = palette.resolve(style);
+        if font.is_none() && fill.is_none() {
+            return true;
+        }
+        colors.insert((row as u32, column as u32), (font, fill));
+        true
+    });
+
+    SheetChrome {
+        sheet_name: sheet_name.to_string(),
+        widths,
+        merges,
+        colors,
+    }
+}
+
+fn sheet_part_named(
+    workbook: &str,
+    relationships: &str,
+    wanted: &str,
+) -> Result<String, AppearanceError> {
+    let mut folded = None;
+    for sheet in start_tags(workbook, "sheet") {
+        let Some(name) = attribute(&sheet, "name") else {
+            continue;
+        };
+        let Some(id) = attribute(&sheet, "r:id").or_else(|| attribute_suffix(&sheet, "id")) else {
+            continue;
+        };
+        let Some(relationship) = start_tags(relationships, "Relationship")
+            .into_iter()
+            .find(|tag| attribute(tag, "Id").as_deref() == Some(id.as_str()))
+        else {
+            continue;
+        };
+        let Some(target) = attribute(&relationship, "Target") else {
+            continue;
+        };
+        let part = worksheet_part(&target);
+        if name == wanted {
+            return Ok(part);
+        }
+        if folded.is_none() && name.eq_ignore_ascii_case(wanted) {
+            folded = Some(part);
+        }
+    }
+    folded.ok_or_else(|| AppearanceError::Package(format!("workbook has no sheet {wanted}")))
+}
+
+fn visit_open_tags(xml: &str, name: &str, mut visit: impl FnMut(&str) -> bool) {
+    let mut index = 0;
+    while let Some(relative) = xml[index..].find('<') {
+        let at = index + relative;
+        if is_open_tag(xml, at, name) {
+            if let Some(end) = xml[at..].find('>') {
+                let tag = &xml[at..at + end + 1];
+                if !visit(tag) {
+                    return;
+                }
+                index = at + end + 1;
+                continue;
+            }
+        }
+        index = at + 1;
+    }
+}
+
+fn read_part_limited(
+    archive: &mut zip::ZipArchive<File>,
+    name: &str,
+    limit: u64,
+) -> Result<String, AppearanceError> {
+    let mut part = archive
+        .by_name(name)
+        .map_err(|error| AppearanceError::Zip(format!("{name}: {error}")))?;
+    if part.size() > limit {
+        return Err(AppearanceError::Package(format!(
+            "{name} exceeds the part size limit"
+        )));
+    }
+    let mut text = String::new();
+    part.read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// Reads one xlsx and returns column widths, merges, and explicit RGB colors
@@ -562,5 +807,43 @@ mod tests {
             explicit_color || custom_width,
             "expected an explicit rgb color or a non-default column width"
         );
+    }
+
+    #[test]
+    fn sheet_chrome_matches_the_visible_projection() {
+        let path = Path::new(SAMPLE_53647);
+        if !path.is_file() {
+            eprintln!("skipping; sample workbook is absent");
+            return;
+        }
+        let window = VisibleWindow {
+            origin_row: 0,
+            origin_column: 0,
+            rows: 40,
+            columns: 16,
+        };
+        let projected = project_xlsx_appearance(path, window).expect("project");
+        let chrome = load_sheet_chrome(path, &projected.sheet_name).expect("chrome");
+        let tiled = chrome.tile(window);
+        let mut projected_merges = projected.merges.clone();
+        let mut tiled_merges = tiled.merges.clone();
+        projected_merges.sort_by_key(|merge| {
+            (
+                merge.start_row,
+                merge.start_column,
+                merge.end_row,
+                merge.end_column,
+            )
+        });
+        tiled_merges.sort_by_key(|merge| {
+            (
+                merge.start_row,
+                merge.start_column,
+                merge.end_row,
+                merge.end_column,
+            )
+        });
+        assert_eq!(tiled_merges, projected_merges);
+        assert_eq!(tiled.colors.len(), projected.colors.len());
     }
 }

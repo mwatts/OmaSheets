@@ -9,6 +9,23 @@ pub(super) struct SpillRecord {
     members: Vec<usize>,
 }
 
+fn fit_array(array: ArrayValue, rows: usize, columns: usize) -> ArrayValue {
+    if array.rows == rows && array.columns == columns {
+        return array;
+    }
+    let mut values = vec![Value::Error(CalcError::NotAvailable); rows.saturating_mul(columns)];
+    for row in 0..rows.min(array.rows) {
+        for column in 0..columns.min(array.columns) {
+            values[row * columns + column] = array.at(row, column);
+        }
+    }
+    ArrayValue {
+        rows,
+        columns,
+        values,
+    }
+}
+
 pub(crate) enum StepResult {
     Deferred,
     Barrier,
@@ -122,9 +139,30 @@ pub(crate) fn resolve_a1_reference(
         if right.contains(':') {
             return None;
         }
-        let first = parse_a1(left.trim(), sheet).ok()?;
-        let second = parse_a1(right.trim(), sheet).ok()?;
-        return expand_range(first, second).ok();
+        let left = left.trim();
+        let right = right.trim();
+        if let (Ok(first), Ok(second)) = (parse_a1(left, sheet), parse_a1(right, sheet)) {
+            return expand_range(first, second).ok();
+        }
+        if let (Some(first), Some(second)) =
+            (super::column_number(left), super::column_number(right))
+        {
+            let start = first.min(second);
+            let end = first.max(second);
+            return expand_range(
+                CellId::new(sheet, 0, start),
+                CellId::new(sheet, super::MAX_ROWS - 1, end),
+            )
+            .ok();
+        }
+        if let (Some(first), Some(second)) = (super::row_number(left), super::row_number(right)) {
+            return expand_range(
+                CellId::new(sheet, first.min(second), 0),
+                CellId::new(sheet, first.max(second), super::MAX_COLUMNS - 1),
+            )
+            .ok();
+        }
+        return None;
     }
     parse_a1(body, sheet).ok().map(Expr::Reference)
 }
@@ -303,6 +341,13 @@ impl Workbook {
                     self.walk_parsed(origin, argument, binding);
                 }
             }
+            Expr::Function(Function::ReferenceSpan, arguments) => {
+                binding.present = true;
+                self.note_parsed_span(arguments, binding);
+                for argument in arguments.iter().take(2) {
+                    self.walk_parsed(origin, argument, binding);
+                }
+            }
             Expr::Function(Function::Indirect, arguments) => {
                 binding.present = true;
                 self.note_parsed_indirect(origin, arguments, binding);
@@ -324,6 +369,90 @@ impl Workbook {
             }
             _ => {}
         }
+    }
+
+    fn note_parsed_span(&self, arguments: &[Expr<CellId>], binding: &mut Binding) {
+        let [first, last, _] = arguments else {
+            return;
+        };
+        let Some((first_start, first_end)) = self.parsed_corners(first) else {
+            return;
+        };
+        let Some((last_start, last_end)) = self.parsed_corners(last) else {
+            return;
+        };
+        let corners = [first_start, first_end, last_start, last_end];
+        let sheet = corners[0].sheet;
+        if corners.iter().any(|cell| cell.sheet != sheet) {
+            return;
+        }
+        let min_row = corners.iter().map(|cell| cell.row).min().unwrap();
+        let max_row = corners.iter().map(|cell| cell.row).max().unwrap();
+        let min_column = corners.iter().map(|cell| cell.column).min().unwrap();
+        let max_column = corners.iter().map(|cell| cell.column).max().unwrap();
+        binding.ranges.push(range_key(
+            CellId::new(sheet, min_row, min_column),
+            None,
+            (max_row - min_row + 1) as usize,
+            (max_column - min_column + 1) as usize,
+        ));
+    }
+
+    fn parsed_corners(&self, expression: &Expr<CellId>) -> Option<(CellId, CellId)> {
+        match expression {
+            Expr::Reference(cell) => Some((*cell, *cell)),
+            Expr::Range {
+                anchor,
+                rows,
+                columns,
+                members: None,
+            } => Some((
+                *anchor,
+                CellId::new(
+                    anchor.sheet,
+                    anchor.row + *rows as u32 - 1,
+                    anchor.column + *columns as u32 - 1,
+                ),
+            )),
+            Expr::Function(Function::Offset, arguments) => {
+                let (origin, end) = reference_bounds(arguments.first()?)?;
+                let rows = self.parsed_number(arguments.get(1)?)?;
+                let columns = self.parsed_number(arguments.get(2)?)?;
+                let base_rows = f64::from(end.row - origin.row + 1);
+                let base_columns = f64::from(end.column - origin.column + 1);
+                let height = match arguments.get(3) {
+                    None | Some(Expr::Empty) => base_rows,
+                    Some(expression) => self.parsed_number(expression)?,
+                };
+                let width = match arguments.get(4) {
+                    None | Some(Expr::Empty) => base_columns,
+                    Some(expression) => self.parsed_number(expression)?,
+                };
+                let (anchor, rows, columns) =
+                    rectangle_shift(origin, rows, columns, height, width).ok()?;
+                Some((
+                    anchor,
+                    CellId::new(
+                        anchor.sheet,
+                        anchor.row + rows as u32 - 1,
+                        anchor.column + columns as u32 - 1,
+                    ),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn note_compiled_span(&self, arguments: &[Expr<usize>], binding: &mut Binding) {
+        let Ok(view) = self.reference_span(arguments) else {
+            return;
+        };
+        binding.ranges.push(range_key(
+            view.anchor,
+            None,
+            view.rows,
+            view.columns,
+        ));
     }
 
     fn note_parsed_offset(&self, arguments: &[Expr<CellId>], binding: &mut Binding) {
@@ -379,12 +508,25 @@ impl Workbook {
     fn parsed_number(&self, expression: &Expr<CellId>) -> Option<f64> {
         match expression {
             Expr::Number(value) if value.is_finite() => Some(*value),
-            Expr::Reference(cell) => match self.value(*cell) {
-                Value::Number(value) if value.is_finite() => Some(value),
-                Value::Blank => Some(0.0),
-                Value::Boolean(value) => Some(if value { 1.0 } else { 0.0 }),
-                _ => None,
-            },
+            Expr::Reference(cell) => {
+                let index = self.indices.get(cell)?;
+                let stored = &self.cells[*index];
+                // A bulk load keeps `value` blank until the final pass, while
+                // the literal already sits on the cell. A formula that has not
+                // been calculated yet is unknown, not zero: treating it as
+                // zero makes `OFFSET(N41,D41,0)` look like a self-reference.
+                let value = match (&stored.value, &stored.input) {
+                    (Value::Blank, Input::Literal(literal)) => literal,
+                    (Value::Blank, Input::Formula(_)) => return None,
+                    (value, _) => value,
+                };
+                match value {
+                    Value::Number(value) if value.is_finite() => Some(*value),
+                    Value::Blank => Some(0.0),
+                    Value::Boolean(value) => Some(if *value { 1.0 } else { 0.0 }),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -439,16 +581,17 @@ impl Workbook {
             return false;
         }
         self.dynamic_errors.remove(&formula);
+        // A rectangle discovered during this pass was not in the opening
+        // dirty set, so nothing is waiting on it yet. Arm it from the cells
+        // it covers, or the formula reads them while they are still blank.
+        self.arm_late_ranges(&indices, generation);
         let waiting = indices
             .iter()
             .copied()
             .filter(|dependency| {
                 self.dirty_marks.get(*dependency).copied() == Some(generation)
                     && self.eval_marks.get(*dependency).copied() != Some(generation)
-                    && !matches!(
-                        self.cells[*dependency].input,
-                        Input::Range { .. } | Input::Tick
-                    )
+                    && !matches!(self.cells[*dependency].input, Input::Tick)
             })
             .count();
         if waiting == 0 {
@@ -456,6 +599,62 @@ impl Workbook {
         }
         self.pending[formula] = waiting;
         true
+    }
+
+    /// Puts a range node discovered mid-pass onto the same barrier the
+    /// opening mark would have built. Cells already calculated are not
+    /// counted; each cell still to run decrements the barrier once.
+    fn arm_late_ranges(&mut self, indices: &[usize], generation: u64) {
+        for node in indices {
+            if !matches!(self.cells[*node].input, Input::Range { .. }) {
+                continue;
+            }
+            if self.eval_marks.get(*node).copied() == Some(generation)
+                || self.dirty_marks.get(*node).copied() == Some(generation)
+            {
+                continue;
+            }
+            let waiting = self.unevaluated_covered(*node, generation);
+            if waiting == 0 {
+                self.eval_marks[*node] = generation;
+                continue;
+            }
+            self.dirty_marks[*node] = generation;
+            self.pending[*node] = waiting;
+            self.late_range_barriers += 1;
+        }
+    }
+
+    fn unevaluated_covered(&self, node: usize, generation: u64) -> usize {
+        let still_due = |index: usize| {
+            self.dirty_marks.get(index).copied() == Some(generation)
+                && self.eval_marks.get(index).copied() != Some(generation)
+        };
+        match self.cells[node].input {
+            Input::Range {
+                shape: RangeShape::Rectangle {
+                    anchor,
+                    rows,
+                    columns,
+                },
+            } => {
+                let mut count = 0;
+                self.for_each_rectangle_cell(anchor, rows, columns, |_position, index| {
+                    if still_due(index) {
+                        count += 1;
+                    }
+                });
+                count
+            }
+            Input::Range {
+                shape: RangeShape::Members { .. },
+            } => self.cells[node]
+                .dependencies
+                .iter()
+                .filter(|index| still_due(**index))
+                .count(),
+            _ => 0,
+        }
     }
 
     fn binding_of_compiled(&self, expression: &Expr<usize>) -> Binding {
@@ -474,6 +673,13 @@ impl Workbook {
                 binding.present = true;
                 self.note_offset(arguments, binding);
                 for argument in arguments {
+                    self.walk_compiled(argument, binding);
+                }
+            }
+            Expr::Function(Function::ReferenceSpan, arguments) => {
+                binding.present = true;
+                self.note_compiled_span(arguments, binding);
+                for argument in arguments.iter().take(2) {
                     self.walk_compiled(argument, binding);
                 }
             }
@@ -621,22 +827,38 @@ impl Workbook {
             Input::Formula(expression) => expression.clone(),
             _ => return Value::Blank,
         };
+        if let Some(&(rows, columns)) = self.array_formulas.get(&self.cells[index].id) {
+            let array = match self.evaluate_array(&expression) {
+                Ok(array) => fit_array(array, rows, columns),
+                Err(error) => {
+                    return Value::Error(error);
+                }
+            };
+            self.clear_array_literals(index, array.rows, array.columns);
+            return self.publish_spill(index, array);
+        }
         let preview = match &expression {
             Expr::Array(array) if array.rows.saturating_mul(array.columns) > 1 => {
                 SpillPreview::Array(array.clone())
             }
-            Expr::Function(function @ (Function::Transpose | Function::MMult), arguments) => {
-                match self.matrix_array(*function, arguments) {
-                    Ok(array) if array.rows.saturating_mul(array.columns) > 1 => {
-                        SpillPreview::Array(array)
-                    }
-                    Ok(array) => SpillPreview::Scalar(
-                        array.values.into_iter().next().unwrap_or(Value::Blank),
-                    ),
-                    Err(error) => SpillPreview::Scalar(Value::Error(error)),
+            Expr::Function(
+                function @ (Function::Transpose
+                | Function::MMult
+                | Function::Filter
+                | Function::Unique
+                | Function::Sort
+                | Function::Linest),
+                arguments,
+            ) => match self.array_result(*function, arguments) {
+                Ok(array) if array.rows.saturating_mul(array.columns) > 1 => {
+                    SpillPreview::Array(array)
                 }
-            }
-            other => SpillPreview::Scalar(self.evaluate(other)),
+                Ok(array) => {
+                    SpillPreview::Scalar(array.values.into_iter().next().unwrap_or(Value::Blank))
+                }
+                Err(error) => SpillPreview::Scalar(Value::Error(error)),
+            },
+            other => SpillPreview::Scalar(self.evaluate_stored(other)),
         };
         match preview {
             SpillPreview::Scalar(value) => {
@@ -729,6 +951,26 @@ impl Workbook {
         self.spill_followups.extend(cleared);
         self.spill_followups.extend(members);
         anchor_value
+    }
+
+    fn clear_array_literals(&mut self, anchor: usize, rows: usize, columns: usize) {
+        let id = self.cells[anchor].id;
+        for row in 0..rows {
+            for column in 0..columns {
+                if row == 0 && column == 0 {
+                    continue;
+                }
+                let cell = CellId::new(id.sheet, id.row + row as u32, id.column + column as u32);
+                let Some(index) = self.indices.get(&cell).copied() else {
+                    continue;
+                };
+                if matches!(self.cells[index].input, Input::Literal(_) | Input::Vacant) {
+                    self.cells[index].input = Input::Vacant;
+                    self.cells[index].value = Value::Blank;
+                    self.cells[index].dependencies.clear();
+                }
+            }
+        }
     }
 
     fn blocks_spill(&self, index: usize, anchor: usize) -> bool {
@@ -972,5 +1214,13 @@ mod tests {
             .set_formula(cell(17, 1), "=SUM(INDIRECT(\"A18:A19\"))")
             .unwrap();
         assert_eq!(workbook.value(cell(17, 1)), Value::Number(7.0));
+        workbook.set_text(cell(20, 0), "B21");
+        workbook.set_number(cell(20, 1), 9.0);
+        workbook
+            .set_formula(cell(21, 0), "=INDIRECT(A21&\"\")")
+            .unwrap();
+        assert_eq!(workbook.value(cell(21, 0)), Value::Number(9.0));
+        workbook.set_number(cell(20, 1), 12.0);
+        assert_eq!(workbook.value(cell(21, 0)), Value::Number(12.0));
     }
 }

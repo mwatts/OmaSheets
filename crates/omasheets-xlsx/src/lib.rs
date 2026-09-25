@@ -5,8 +5,14 @@
 //! system are rejected rather than silently offset by 1462 days.
 
 use calamine::{Cell, CellErrorType, Data, Range, Reader, Xlsx, XlsxFormulaMetadata};
+use omasheets_calc::pivot::{
+    PivotAggregate, PivotCache, PivotCacheField, PivotDataField, PivotDateFilter, PivotDateGroup,
+    PivotGroupBy, PivotScalar, PivotTable, cache_datetime_serial,
+};
 use omasheets_calc::serial_date::DATE_SYSTEM;
-use omasheets_calc::{CalcError, CellId, FormulaError, Value, Workbook};
+use omasheets_calc::{
+    CalcError, CellId, FormulaError, StructuredColumn, StructuredTable, Value, Workbook,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -394,11 +400,14 @@ fn import_xlsx_body(
     // Read the names from the package part rather than through Calamine,
     // which drops each name's `localSheetId` scope.
     let defined_names = read_defined_names(path)?;
+    let tables = read_tables(path).unwrap_or_default();
     // External targets are loaded before this workbook's formulas compile, so
     // a reference sees the calculated cell. The stored link cache is used
     // when that file is absent, already on the chain, or only a base-name
     // collision of an absolute target whose cache is already populated.
     let external = external_cells_for_import(path, limits, opening);
+    let array_formulas = read_array_formulas(path).unwrap_or_default();
+    let pivots = read_pivots(path, limits);
     let mut ranges = Vec::with_capacity(sheet_names.len());
     let mut observed_cells = 0_usize;
     let mut observed_formulas = 0_usize;
@@ -432,8 +441,11 @@ fn import_xlsx_body(
     let mut imported = import_ranges_with_names(
         ranges,
         defined_names,
+        &tables,
         external.cells,
         external.sheets,
+        &array_formulas,
+        pivots,
         source_sha256,
         limits,
     )?;
@@ -751,6 +763,9 @@ struct ExternalLinkRecord {
     /// name in a flat directory.
     basename_only: bool,
     sheets: Vec<String>,
+    /// Sheets whose refresh failed. Their cached cells are kept. A cell the
+    /// part does not list is `#REF!`.
+    broken: Vec<String>,
     cached: Vec<CachedExternalCell>,
 }
 
@@ -758,6 +773,7 @@ struct ExternalSheetNote {
     link_index: u32,
     book_file: Option<String>,
     sheet: String,
+    broken: bool,
 }
 
 struct ExternalCacheLoad {
@@ -808,6 +824,7 @@ fn external_cells_for_import(
                         link_index: link.index,
                         book_file: book_file.clone(),
                         sheet: sheet.name.clone(),
+                        broken: false,
                     });
                 }
                 cells.extend(cells_from_imported(&imported, link.index, book_file));
@@ -818,6 +835,15 @@ fn external_cells_for_import(
                         link_index: link.index,
                         book_file: link.book_file.clone(),
                         sheet: sheet.clone(),
+                        broken: false,
+                    });
+                }
+                for sheet in &link.broken {
+                    sheets.push(ExternalSheetNote {
+                        link_index: link.index,
+                        book_file: link.book_file.clone(),
+                        sheet: sheet.clone(),
+                        broken: true,
                     });
                 }
                 cells.extend(link.cached);
@@ -872,6 +898,7 @@ fn read_external_links(path: &Path) -> Result<Vec<ExternalLinkRecord>, ImportErr
                 path: None,
                 basename_only: false,
                 sheets: Vec::new(),
+                broken: Vec::new(),
                 cached: Vec::new(),
             });
             continue;
@@ -903,13 +930,14 @@ fn read_external_links(path: &Path) -> Result<Vec<ExternalLinkRecord>, ImportErr
             Some((path, basename_only)) => (Some(path), basename_only),
             None => (None, false),
         };
-        let (sheets, cached) = parse_external_cache(&xml, index, book_file.clone());
+        let (sheets, broken, cached) = parse_external_cache(&xml, index, book_file.clone());
         links.push(ExternalLinkRecord {
             index,
             book_file,
             path,
             basename_only,
             sheets,
+            broken,
             cached,
         });
     }
@@ -1105,8 +1133,9 @@ fn parse_external_cache(
     xml: &str,
     link_index: u32,
     book_file: Option<String>,
-) -> (Vec<String>, Vec<CachedExternalCell>) {
+) -> (Vec<String>, Vec<String>, Vec<CachedExternalCell>) {
     let mut sheet_names = Vec::new();
+    let mut broken_sheets = std::collections::HashSet::new();
     scan_elements(xml, "sheetNames", |_tag, body| {
         scan_elements(body, "sheetName", |tag, _| {
             if let Some(name) = attribute(tag, "val") {
@@ -1125,6 +1154,11 @@ fn parse_external_cache(
             let Some(sheet) = sheet_names.get(sheet_id).cloned() else {
                 return;
             };
+            // A failed refresh keeps the cells the part still lists. A cell
+            // it does not list is `#REF!`.
+            if attribute(tag, "refreshError").is_some_and(|value| value != "0") {
+                broken_sheets.insert(sheet_id);
+            }
             scan_elements(data, "row", |_row_tag, row_body| {
                 scan_elements(row_body, "cell", |cell_tag, cell_body| {
                     let Some(reference) = attribute(cell_tag, "r") else {
@@ -1148,7 +1182,16 @@ fn parse_external_cache(
             });
         });
     });
-    (sheet_names, cells)
+    let mut known_sheets = Vec::new();
+    let mut broken = Vec::new();
+    for (index, name) in sheet_names.into_iter().enumerate() {
+        if broken_sheets.contains(&index) {
+            broken.push(name);
+        } else {
+            known_sheets.push(name);
+        }
+    }
+    (known_sheets, broken, cells)
 }
 
 fn cached_cell_value(tag: &str, body: &str) -> Option<Value> {
@@ -1157,6 +1200,13 @@ fn cached_cell_value(tag: &str, body: &str) -> Option<Value> {
         return None;
     }
     let raw = xml_text_element(body, "v").or_else(|| xml_text_element(body, "t"))?;
+    // Text keeps its spaces. `MATCH` against a header such as `   NG   `
+    // fails if the cache trims them and the local cell does not.
+    if kind == "str" || kind == "inlineStr" {
+        // An empty `<v/>` is an empty string. Dropping it makes the cell
+        // look missing, and a known sheet then shows that reference as 0.
+        return Some(Value::Text(raw));
+    }
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -1166,7 +1216,6 @@ fn cached_cell_value(tag: &str, body: &str) -> Option<Value> {
             raw == "1" || raw.eq_ignore_ascii_case("true"),
         )),
         "e" => Some(Value::Error(excel_error(raw))),
-        "str" | "inlineStr" => Some(Value::Text(raw.to_string())),
         _ => raw.parse::<f64>().ok().map(Value::Number),
     }
 }
@@ -1313,6 +1362,510 @@ fn hash_file(path: &Path) -> Result<String, ImportError> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+#[derive(Default)]
+struct PivotLoad {
+    caches: Vec<PivotCache>,
+    tables: Vec<PivotTable>,
+}
+
+struct PivotFieldDraft {
+    field: PivotCacheField,
+    database: bool,
+}
+
+enum RawPivotScalar {
+    Blank,
+    Number(f64),
+    Text(String),
+    Shared(usize),
+}
+
+/// Pivot tables and their caches, installed before formulas compile.
+/// A cache part over the workbook size limit, or a cache larger than
+/// `limits.max_cells`, is skipped rather than failing the import.
+fn read_pivots(path: &Path, limits: ImportLimits) -> PivotLoad {
+    let Ok(file) = File::open(path) else {
+        return PivotLoad::default();
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return PivotLoad::default();
+    };
+    let Some(workbook) = read_optional_part(&mut archive, "xl/workbook.xml") else {
+        return PivotLoad::default();
+    };
+    let relationships = parse_relationships(
+        &read_optional_part(&mut archive, "xl/_rels/workbook.xml.rels").unwrap_or_default(),
+    );
+    let mut caches_by_part: HashMap<String, usize> = HashMap::new();
+    let mut load = PivotLoad::default();
+    for (sheet, rel_id) in sheet_relationship_ids(&workbook).into_iter().enumerate() {
+        let Some(target) = relationships
+            .iter()
+            .find(|relationship| relationship.id == rel_id)
+            .map(|relationship| relationship.target.as_str())
+        else {
+            continue;
+        };
+        let sheet_part = resolve_package_part("xl/workbook.xml", target);
+        let rels =
+            read_optional_part(&mut archive, &package_rels_path(&sheet_part)).unwrap_or_default();
+        for relationship in parse_relationships(&rels) {
+            if !relationship.kind.ends_with("/pivotTable") {
+                continue;
+            }
+            let part = resolve_package_part(&sheet_part, &relationship.target);
+            let Ok(xml) = read_part(&mut archive, &part) else {
+                continue;
+            };
+            let Some(mut table) = parse_pivot_table(&xml) else {
+                continue;
+            };
+            let table_rels =
+                read_optional_part(&mut archive, &package_rels_path(&part)).unwrap_or_default();
+            let Some(cache_relationship) = parse_relationships(&table_rels)
+                .into_iter()
+                .find(|relationship| relationship.kind.ends_with("/pivotCacheDefinition"))
+            else {
+                continue;
+            };
+            let cache_part = resolve_package_part(&part, &cache_relationship.target);
+            let cache_index = if let Some(index) = caches_by_part.get(&cache_part).copied() {
+                index
+            } else {
+                let Some(cache) = load_pivot_cache(&mut archive, &cache_part, limits) else {
+                    continue;
+                };
+                let index = load.caches.len();
+                load.caches.push(cache);
+                caches_by_part.insert(cache_part, index);
+                index
+            };
+            table.sheet = sheet as u32;
+            table.cache = cache_index;
+            load.tables.push(table);
+        }
+    }
+    load
+}
+
+fn load_pivot_cache(
+    archive: &mut zip::ZipArchive<File>,
+    cache_part: &str,
+    limits: ImportLimits,
+) -> Option<PivotCache> {
+    let definition = read_part(archive, cache_part).ok()?;
+    let rels = read_optional_part(archive, &package_rels_path(cache_part)).unwrap_or_default();
+    let records_relationship = parse_relationships(&rels)
+        .into_iter()
+        .find(|relationship| relationship.kind.ends_with("/pivotCacheRecords"))?;
+    let records_part = resolve_package_part(cache_part, &records_relationship.target);
+    let records = read_part(archive, &records_part).ok()?;
+    parse_pivot_cache(&definition, &records, limits)
+}
+
+fn parse_pivot_cache(
+    definition: &str,
+    records_xml: &str,
+    limits: ImportLimits,
+) -> Option<PivotCache> {
+    let mut drafts = Vec::new();
+    scan_elements(definition, "cacheField", |tag, body| {
+        let name = attribute(tag, "name").unwrap_or_default();
+        let database = attribute(tag, "databaseField")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let mut shared = Vec::new();
+        scan_elements(body, "sharedItems", |_tag, items| {
+            if shared.is_empty() {
+                shared = pivot_scalars(items);
+            }
+        });
+        let mut group = None;
+        scan_elements(body, "fieldGroup", |group_tag, group_body| {
+            if group.is_none() {
+                group = parse_date_group(group_tag, group_body);
+            }
+        });
+        if shared.is_empty() {
+            if let Some(group) = &group {
+                shared = group.items.iter().cloned().map(PivotScalar::Text).collect();
+            }
+        }
+        drafts.push(PivotFieldDraft {
+            field: PivotCacheField {
+                name,
+                shared,
+                group,
+            },
+            database,
+        });
+    });
+    if drafts.is_empty() || drafts.len() > limits.max_cells {
+        return None;
+    }
+    if drafts
+        .iter()
+        .any(|draft| draft.field.shared.len() > limits.max_cells)
+    {
+        return None;
+    }
+    let mut records = Vec::new();
+    let mut overflow = false;
+    let width = drafts.len();
+    scan_elements(records_xml, "r", |_tag, body| {
+        if records.len() >= limits.max_cells {
+            overflow = true;
+            return;
+        }
+        let children = raw_sequence(body);
+        let mut record = vec![PivotScalar::Blank; width];
+        let mut child = 0;
+        for (index, draft) in drafts.iter().enumerate() {
+            if !draft.database {
+                continue;
+            }
+            if let Some(raw) = children.get(child) {
+                record[index] = resolve_raw(raw, &draft.field.shared);
+            }
+            child += 1;
+        }
+        records.push(record);
+    });
+    if overflow || records.len().saturating_mul(width.max(1)) > limits.max_cells {
+        return None;
+    }
+    Some(PivotCache {
+        fields: drafts.into_iter().map(|draft| draft.field).collect(),
+        records,
+    })
+}
+
+fn parse_date_group(tag: &str, body: &str) -> Option<PivotDateGroup> {
+    let base = attribute(tag, "base")?.parse().ok()?;
+    let mut by = None;
+    let mut start = None;
+    let mut end = None;
+    scan_elements(body, "rangePr", |range_tag, _| {
+        // Day, hour, and numeric range groups are not calculated.
+        by = attribute(range_tag, "groupBy").and_then(|value| match value.as_str() {
+            "years" => Some(PivotGroupBy::Years),
+            "quarters" => Some(PivotGroupBy::Quarters),
+            "months" => Some(PivotGroupBy::Months),
+            _ => None,
+        });
+        start = attribute(range_tag, "startDate").and_then(|value| cache_datetime_serial(&value));
+        end = attribute(range_tag, "endDate").and_then(|value| cache_datetime_serial(&value));
+    });
+    let mut items = Vec::new();
+    scan_elements(body, "groupItems", |_tag, items_body| {
+        if items.is_empty() {
+            for scalar in pivot_scalars(items_body) {
+                match scalar {
+                    PivotScalar::Text(text) => items.push(text),
+                    PivotScalar::Number(number) => items.push(number.to_string()),
+                    PivotScalar::Blank => items.push(String::new()),
+                }
+            }
+        }
+    });
+    Some(PivotDateGroup {
+        base,
+        by: by?,
+        start: start?,
+        end: end?,
+        items,
+    })
+}
+
+fn parse_pivot_table(xml: &str) -> Option<PivotTable> {
+    let mut location = None;
+    scan_elements(xml, "location", |tag, _| {
+        if location.is_none() {
+            if let Some(reference) = attribute(tag, "ref") {
+                location = parse_area(&reference);
+            }
+        }
+    });
+    let (first_row, first_column, last_row, last_column) = location?;
+    let mut pivot_fields = Vec::new();
+    scan_elements(xml, "pivotFields", |_tag, body| {
+        if !pivot_fields.is_empty() {
+            return;
+        }
+        scan_elements(body, "pivotField", |_tag, field_body| {
+            let mut items = Vec::new();
+            scan_elements(field_body, "item", |item_tag, _| {
+                let shared = attribute(item_tag, "x").and_then(|value| value.parse().ok());
+                let hidden = attribute(item_tag, "h")
+                    .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+                items.push((shared, hidden));
+            });
+            pivot_fields.push(items);
+        });
+    });
+    let mut axis_fields = Vec::new();
+    for container in ["rowFields", "colFields"] {
+        scan_elements(xml, container, |_tag, body| {
+            scan_elements(body, "field", |tag, _| {
+                if let Some(index) = attribute(tag, "x").and_then(|value| value.parse::<i32>().ok())
+                {
+                    if index >= 0 {
+                        push_unique(&mut axis_fields, index as usize);
+                    }
+                }
+            });
+        });
+    }
+    let mut page_selection: Vec<(usize, usize)> = Vec::new();
+    scan_elements(xml, "pageFields", |_tag, body| {
+        scan_elements(body, "pageField", |tag, _| {
+            let Some(field) = attribute(tag, "fld").and_then(|value| value.parse().ok()) else {
+                return;
+            };
+            push_unique(&mut axis_fields, field);
+            if let Some(item) = attribute(tag, "item").and_then(|value| value.parse().ok()) {
+                page_selection.push((field, item));
+            }
+        });
+    });
+    let mut visible_items = Vec::new();
+    for (field, item_index) in page_selection {
+        let Some(shared) = pivot_fields
+            .get(field)
+            .and_then(|items| items.get(item_index))
+            .and_then(|(shared, _)| *shared)
+        else {
+            continue;
+        };
+        visible_items.push((field, vec![shared]));
+    }
+    for (index, items) in pivot_fields.iter().enumerate() {
+        if !axis_fields.contains(&index) || visible_items.iter().any(|(field, _)| *field == index) {
+            continue;
+        }
+        if !items.iter().any(|(_, hidden)| *hidden) {
+            continue;
+        }
+        let visible = items
+            .iter()
+            .filter(|(_, hidden)| !*hidden)
+            .filter_map(|(shared, _)| *shared)
+            .collect();
+        visible_items.push((index, visible));
+    }
+    let mut data_fields = Vec::new();
+    scan_elements(xml, "dataFields", |_tag, body| {
+        if !data_fields.is_empty() {
+            return;
+        }
+        scan_elements(body, "dataField", |tag, _| {
+            let Some(name) = attribute(tag, "name") else {
+                return;
+            };
+            let Some(source) = attribute(tag, "fld").and_then(|value| value.parse().ok()) else {
+                return;
+            };
+            data_fields.push(PivotDataField {
+                name,
+                source,
+                aggregate: pivot_aggregate(tag),
+            });
+        });
+    });
+    let mut filters = Vec::new();
+    scan_elements(xml, "filters", |_tag, body| {
+        scan_elements(body, "filter", |tag, filter_body| {
+            if let Some(filter) = parse_date_filter(tag, filter_body) {
+                filters.push(filter);
+            }
+        });
+    });
+    Some(PivotTable {
+        sheet: 0,
+        first_row,
+        last_row,
+        first_column,
+        last_column,
+        cache: 0,
+        data_fields,
+        axis_fields,
+        filters,
+        visible_items,
+    })
+}
+
+fn pivot_aggregate(tag: &str) -> PivotAggregate {
+    let summed = match attribute(tag, "subtotal").as_deref() {
+        None => true,
+        Some(value) => value.eq_ignore_ascii_case("sum"),
+    };
+    let normal = match attribute(tag, "showDataAs").as_deref() {
+        None => true,
+        Some(value) => value.eq_ignore_ascii_case("normal"),
+    };
+    if summed && normal {
+        PivotAggregate::Sum
+    } else {
+        PivotAggregate::Unsupported
+    }
+}
+
+/// `dateBetween` / `dateNotBetween` only. Relative filters such as `today`
+/// need a clock and are left unset.
+fn parse_date_filter(tag: &str, body: &str) -> Option<PivotDateFilter> {
+    let negated = match attribute(tag, "type")?.as_str() {
+        "dateBetween" => false,
+        "dateNotBetween" => true,
+        _ => return None,
+    };
+    let field = attribute(tag, "fld")?.parse().ok()?;
+    let mut low = None;
+    let mut high = None;
+    scan_elements(body, "customFilter", |filter_tag, _| {
+        let Some(operator) = attribute(filter_tag, "operator") else {
+            return;
+        };
+        let Some(value) = attribute(filter_tag, "val").and_then(|text| text.parse::<f64>().ok())
+        else {
+            return;
+        };
+        if !value.is_finite() {
+            return;
+        }
+        match operator.as_str() {
+            "greaterThan" => low = Some((value, false)),
+            "greaterThanOrEqual" => low = Some((value, true)),
+            "lessThan" => high = Some((value, false)),
+            "lessThanOrEqual" => high = Some((value, true)),
+            "equal" => {
+                low = Some((value, true));
+                high = Some((value, true));
+            }
+            _ => {}
+        }
+    });
+    let (low, low_inclusive) = low?;
+    let (high, high_inclusive) = high?;
+    Some(PivotDateFilter {
+        field,
+        low,
+        high,
+        low_inclusive,
+        high_inclusive,
+        negated,
+    })
+}
+
+fn push_unique(values: &mut Vec<usize>, value: usize) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn pivot_scalars(xml: &str) -> Vec<PivotScalar> {
+    raw_sequence(xml)
+        .into_iter()
+        .map(|raw| match raw {
+            RawPivotScalar::Blank | RawPivotScalar::Shared(_) => PivotScalar::Blank,
+            RawPivotScalar::Number(number) => PivotScalar::Number(number),
+            RawPivotScalar::Text(text) => PivotScalar::Text(text),
+        })
+        .collect()
+}
+
+fn raw_sequence(xml: &str) -> Vec<RawPivotScalar> {
+    let mut values = Vec::new();
+    scan_top_level(xml, |name, attrs, _| {
+        values.push(raw_scalar(name, attrs));
+    });
+    values
+}
+
+fn raw_scalar(name: &str, attrs: &str) -> RawPivotScalar {
+    let value = attribute(attrs, "v");
+    match name {
+        "m" => RawPivotScalar::Blank,
+        "n" => match value.as_deref().and_then(|text| text.parse::<f64>().ok()) {
+            Some(number) if number.is_finite() => RawPivotScalar::Number(number),
+            _ => RawPivotScalar::Blank,
+        },
+        "d" => match value.as_deref().and_then(cache_datetime_serial) {
+            Some(serial) => RawPivotScalar::Number(serial),
+            _ => RawPivotScalar::Blank,
+        },
+        "s" => RawPivotScalar::Text(value.unwrap_or_default()),
+        "b" => {
+            let truth = value
+                .as_deref()
+                .is_some_and(|text| text == "1" || text.eq_ignore_ascii_case("true"));
+            RawPivotScalar::Number(if truth { 1.0 } else { 0.0 })
+        }
+        "e" => RawPivotScalar::Blank,
+        "x" => value
+            .as_deref()
+            .and_then(|text| text.parse().ok())
+            .map(RawPivotScalar::Shared)
+            .unwrap_or(RawPivotScalar::Blank),
+        _ => RawPivotScalar::Blank,
+    }
+}
+
+fn resolve_raw(raw: &RawPivotScalar, shared: &[PivotScalar]) -> PivotScalar {
+    match raw {
+        RawPivotScalar::Blank => PivotScalar::Blank,
+        RawPivotScalar::Number(number) => PivotScalar::Number(*number),
+        RawPivotScalar::Text(text) => PivotScalar::Text(text.clone()),
+        RawPivotScalar::Shared(index) => shared.get(*index).cloned().unwrap_or(PivotScalar::Blank),
+    }
+}
+
+fn scan_top_level(xml: &str, mut visit: impl FnMut(&str, &str, &str)) {
+    let mut rest = xml;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        if after.starts_with('/') || after.starts_with('!') || after.starts_with('?') {
+            rest = after;
+            continue;
+        }
+        let name_len = after
+            .find(|character: char| !character.is_ascii_alphanumeric())
+            .unwrap_or(after.len());
+        if name_len == 0 {
+            rest = after;
+            continue;
+        }
+        let name = &after[..name_len];
+        let after_name = &after[name_len..];
+        if after_name.starts_with(':') {
+            let Some(tag_end) = after_name.find('>') else {
+                break;
+            };
+            rest = &after_name[tag_end + 1..];
+            continue;
+        }
+        if !after_name.starts_with([' ', '>', '/', '\n', '\r', '\t']) && !after_name.is_empty() {
+            rest = after;
+            continue;
+        }
+        let Some(tag_end) = after_name.find('>') else {
+            break;
+        };
+        let start_tag = &after_name[..tag_end];
+        if start_tag.trim_end().ends_with('/') {
+            visit(name, start_tag, "");
+            rest = &after_name[tag_end + 1..];
+            continue;
+        }
+        let content = &after_name[tag_end + 1..];
+        let close = format!("</{name}>");
+        let Some(end) = content.find(&close) else {
+            break;
+        };
+        visit(name, start_tag, &content[..end]);
+        rest = &content[end + close.len()..];
+    }
+}
+
 #[cfg(test)]
 fn import_ranges(
     ranges: Vec<(String, Range<Data>, Range<String>)>,
@@ -1322,8 +1875,11 @@ fn import_ranges(
     import_ranges_with_names(
         ranges,
         Vec::new(),
+        &[],
         Vec::new(),
         Vec::new(),
+        &HashMap::new(),
+        PivotLoad::default(),
         source_sha256,
         limits,
     )
@@ -1332,8 +1888,11 @@ fn import_ranges(
 fn import_ranges_with_names(
     ranges: Vec<(String, Range<Data>, Range<String>)>,
     defined_names: Vec<DefinedName>,
+    tables: &[StructuredTable],
     external_cells: Vec<CachedExternalCell>,
     external_sheets: Vec<ExternalSheetNote>,
+    array_formulas: &HashMap<(u32, u32, u32), (usize, usize)>,
+    pivots: PivotLoad,
     source_sha256: String,
     limits: ImportLimits,
 ) -> Result<ImportedWorkbook, ImportError> {
@@ -1404,7 +1963,19 @@ fn import_ranges_with_names(
         }
     }
     for sheet in external_sheets {
-        workbook.note_external_sheet(sheet.link_index, sheet.book_file.as_deref(), &sheet.sheet);
+        if sheet.broken {
+            workbook.note_broken_external_sheet(
+                sheet.link_index,
+                sheet.book_file.as_deref(),
+                &sheet.sheet,
+            );
+        } else {
+            workbook.note_external_sheet(
+                sheet.link_index,
+                sheet.book_file.as_deref(),
+                &sheet.sheet,
+            );
+        }
     }
     for external in external_cells {
         workbook.cache_external_cell(
@@ -1415,6 +1986,12 @@ fn import_ranges_with_names(
             external.column,
             external.value,
         );
+    }
+    for cache in pivots.caches {
+        workbook.add_pivot_cache(cache);
+    }
+    for table in pivots.tables {
+        workbook.add_pivot_table(table);
     }
     let mut source_cells = BTreeMap::new();
 
@@ -1458,7 +2035,9 @@ fn import_ranges_with_names(
     }
 
     let source_cells: Vec<_> = source_cells.into_values().collect();
-    if let Some(at) = tick_from_cached_volatile(&source_cells) {
+    if let Some(at) =
+        tick_from_cached_volatile(&source_cells).or_else(|| infer_yearfrac_today(&source_cells))
+    {
         // Before formulas are installed, so TODAY() and NOW() replay this
         // serial instead of staying #N/A. Does not read the system clock.
         workbook.set_tick(at);
@@ -1470,7 +2049,10 @@ fn import_ranges_with_names(
             continue;
         };
         let cell = source.cell;
-        match workbook.set_formula(cell, formula) {
+        if let Some(&(rows, columns)) = array_formulas.get(&(cell.sheet, cell.row, cell.column)) {
+            workbook.note_array_formula(cell, rows, columns);
+        }
+        match workbook.set_formula_with_tables(cell, formula, tables) {
             Ok(_) => compiled_cells.push(index),
             Err(error) => unsupported.push(UnsupportedFormula {
                 cell,
@@ -1492,6 +2074,348 @@ fn import_ranges_with_names(
         compiled_cells,
         formula_cells_observed: observed_formulas,
         formula_cells_loaded,
+    })
+}
+
+fn read_tables(path: &Path) -> Result<Vec<StructuredTable>, ImportError> {
+    let file = File::open(path).map_err(|error| ImportError::Open(error.to_string()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|error| ImportError::Open(error.to_string()))?;
+    let workbook = read_part(&mut archive, "xl/workbook.xml")?;
+    let relationships = parse_relationships(
+        &read_optional_part(&mut archive, "xl/_rels/workbook.xml.rels").unwrap_or_default(),
+    );
+    let mut tables = Vec::new();
+    for (sheet, rel_id) in sheet_relationship_ids(&workbook).into_iter().enumerate() {
+        let Some(target) = relationships
+            .iter()
+            .find(|relationship| relationship.id == rel_id)
+            .map(|relationship| relationship.target.as_str())
+        else {
+            continue;
+        };
+        let sheet_part = resolve_package_part("xl/workbook.xml", target);
+        let rels =
+            read_optional_part(&mut archive, &package_rels_path(&sheet_part)).unwrap_or_default();
+        for relationship in parse_relationships(&rels) {
+            if !relationship.kind.ends_with("/table") {
+                continue;
+            }
+            let part = resolve_package_part(&sheet_part, &relationship.target);
+            let Ok(xml) = read_part(&mut archive, &part) else {
+                continue;
+            };
+            if let Some(table) = parse_table(&xml, sheet as u32) {
+                tables.push(table);
+            }
+        }
+    }
+    Ok(tables)
+}
+
+/// Legacy CSE anchors: `(sheet, row, column) -> (rows, columns)` of the
+/// entered rectangle. The formula text stays on the anchor cell.
+fn read_array_formulas(
+    path: &Path,
+) -> Result<HashMap<(u32, u32, u32), (usize, usize)>, ImportError> {
+    let mut archive = zip::ZipArchive::new(
+        File::open(path).map_err(|error| ImportError::Open(error.to_string()))?,
+    )
+    .map_err(|error| ImportError::Open(error.to_string()))?;
+    let workbook = read_part(&mut archive, "xl/workbook.xml")?;
+    let relationships = parse_relationships(
+        &read_optional_part(&mut archive, "xl/_rels/workbook.xml.rels").unwrap_or_default(),
+    );
+    let mut anchors = HashMap::new();
+    for (sheet, rel_id) in sheet_relationship_ids(&workbook).into_iter().enumerate() {
+        let Some(target) = relationships
+            .iter()
+            .find(|relationship| relationship.id == rel_id)
+            .map(|relationship| relationship.target.as_str())
+        else {
+            continue;
+        };
+        let sheet_part = resolve_package_part("xl/workbook.xml", target);
+        let Ok(xml) = read_part(&mut archive, &sheet_part) else {
+            continue;
+        };
+        if !xml.contains("t=\"array\"") {
+            continue;
+        }
+        for (row, column, rows, columns) in array_anchors(&xml) {
+            anchors.insert((sheet as u32, row, column), (rows, columns));
+        }
+    }
+    Ok(anchors)
+}
+
+fn array_anchors(xml: &str) -> Vec<(u32, u32, usize, usize)> {
+    let mut anchors = Vec::new();
+    scan_elements(xml, "c", |tag, body| {
+        let Some(reference) = attribute(tag, "r") else {
+            return;
+        };
+        let Some((row, column)) = parse_cell_reference(&reference) else {
+            return;
+        };
+        scan_elements(body, "f", |formula_tag, _| {
+            if attribute(formula_tag, "t").as_deref() != Some("array") {
+                return;
+            }
+            let Some(span) = attribute(formula_tag, "ref") else {
+                return;
+            };
+            let Some((row0, column0, row1, column1)) = parse_area(&span) else {
+                return;
+            };
+            if row0 != row || column0 != column || row1 < row0 || column1 < column0 {
+                return;
+            }
+            anchors.push((
+                row,
+                column,
+                (row1 - row0 + 1) as usize,
+                (column1 - column0 + 1) as usize,
+            ));
+        });
+    });
+    anchors
+}
+
+fn sheet_relationship_ids(workbook_xml: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    scan_elements(workbook_xml, "sheet", |tag, _| {
+        if let Some(id) = attribute(tag, "r:id").or_else(|| attribute(tag, "id")) {
+            ids.push(id);
+        }
+    });
+    ids
+}
+
+fn parse_table(xml: &str, sheet: u32) -> Option<StructuredTable> {
+    let mut parsed = None;
+    scan_elements(xml, "table", |tag, body| {
+        let Some(name) = attribute(tag, "name").or_else(|| attribute(tag, "displayName")) else {
+            return;
+        };
+        let Some(reference) = attribute(tag, "ref") else {
+            return;
+        };
+        let Some((row0, column0, row1, _)) = parse_area(&reference) else {
+            return;
+        };
+        let header_count = attribute(tag, "headerRowCount")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(1);
+        let totals_count = attribute(tag, "totalsRowCount")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mut columns = Vec::new();
+        scan_elements(body, "tableColumn", |column_tag, _| {
+            if let Some(column_name) = attribute(column_tag, "name") {
+                let column = column0 + columns.len() as u32;
+                columns.push(StructuredColumn {
+                    name: column_name,
+                    column,
+                });
+            }
+        });
+        if columns.is_empty() {
+            return;
+        }
+        let header_row = (header_count > 0).then_some(row0);
+        let totals_row = (totals_count > 0).then_some(row1);
+        let first_data = row0.saturating_add(header_count);
+        let last_data = row1.saturating_sub(totals_count);
+        let rows = if first_data <= last_data {
+            (first_data..=last_data).collect()
+        } else {
+            Vec::new()
+        };
+        parsed = Some(StructuredTable {
+            name,
+            sheet,
+            header_row,
+            totals_row,
+            rows,
+            columns,
+        });
+    });
+    parsed
+}
+
+fn parse_area(reference: &str) -> Option<(u32, u32, u32, u32)> {
+    let (start, end) = reference.split_once(':').unwrap_or((reference, reference));
+    let (row0, column0) = parse_cell_reference(start)?;
+    let (row1, column1) = parse_cell_reference(end)?;
+    Some((
+        row0.min(row1),
+        column0.min(column1),
+        row0.max(row1),
+        column0.max(column1),
+    ))
+}
+
+/// Serial for `YEARFRAC(TODAY(), date, basis)` when the cell stores the
+/// formula result and the other arguments are numbers. One serial has to
+/// satisfy every such formula. Does not read the system clock.
+fn infer_yearfrac_today(cells: &[ImportedCell]) -> Option<i64> {
+    let numbers: HashMap<(u32, u32, u32), f64> = cells
+        .iter()
+        .filter_map(|cell| match cell.stored {
+            Value::Number(number) if number.is_finite() => {
+                Some(((cell.cell.sheet, cell.cell.row, cell.cell.column), number))
+            }
+            _ => None,
+        })
+        .collect();
+    let probes: Vec<YearFracProbe> = cells
+        .iter()
+        .filter_map(|cell| yearfrac_probe(cell, &numbers))
+        .collect();
+    if probes.is_empty() {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    for probe in &probes {
+        let Some(fraction) = implied_year_fraction(probe) else {
+            continue;
+        };
+        let year = match probe.basis {
+            0 | 2 | 4 => 360.0,
+            3 => 365.0,
+            _ => 365.25,
+        };
+        let guess = probe.end_serial + (fraction * year).round() as i64;
+        for delta in -20..=20 {
+            let serial = guess + delta;
+            if (1..=60_000).contains(&serial) {
+                candidates.push(serial);
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    let mut best_serial = None;
+    let mut best_error = f64::MAX;
+    for serial in candidates {
+        let Some(error) = yearfrac_probe_error(serial, &probes) else {
+            continue;
+        };
+        if error < best_error {
+            best_error = error;
+            best_serial = Some(serial);
+        }
+    }
+    let serial = best_serial?;
+    let acceptable = probes.iter().all(|probe| {
+        let Ok(fraction) =
+            omasheets_calc::serial_date::year_fraction(serial, probe.end_serial, probe.basis)
+        else {
+            return false;
+        };
+        let predicted = match probe.rate {
+            Some(rate) => (1.0 + rate).powf(-fraction),
+            None => fraction,
+        };
+        (predicted - probe.stored).abs() <= 1e-9 * probe.stored.abs().max(1.0)
+    });
+    if !acceptable {
+        return None;
+    }
+    omasheets_calc::serial_date::unix_millis_from_serial(serial as f64).ok()
+}
+
+struct YearFracProbe {
+    end_serial: i64,
+    basis: i64,
+    rate: Option<f64>,
+    stored: f64,
+}
+
+fn implied_year_fraction(probe: &YearFracProbe) -> Option<f64> {
+    match probe.rate {
+        Some(rate) => {
+            let base = 1.0 + rate;
+            if probe.stored <= 0.0 || base <= 0.0 || base == 1.0 {
+                return None;
+            }
+            Some(-probe.stored.ln() / base.ln())
+        }
+        None => Some(probe.stored),
+    }
+}
+
+fn yearfrac_probe_error(serial: i64, probes: &[YearFracProbe]) -> Option<f64> {
+    let mut error = 0.0;
+    for probe in probes {
+        let fraction =
+            omasheets_calc::serial_date::year_fraction(serial, probe.end_serial, probe.basis)
+                .ok()?;
+        let predicted = match probe.rate {
+            Some(rate) => (1.0 + rate).powf(-fraction),
+            None => fraction,
+        };
+        error += (predicted - probe.stored).abs();
+    }
+    Some(error)
+}
+
+fn yearfrac_probe(
+    cell: &ImportedCell,
+    numbers: &HashMap<(u32, u32, u32), f64>,
+) -> Option<YearFracProbe> {
+    let Value::Number(stored) = cell.stored else {
+        return None;
+    };
+    let formula = cell.formula.as_deref()?;
+    let mut text = formula.trim();
+    if let Some(rest) = text.strip_prefix('=') {
+        text = rest.trim_start();
+    }
+    let mut compact: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '$')
+        .collect();
+    while compact.starts_with('(') && compact.ends_with(')') && compact.len() > 1 {
+        compact.remove(0);
+        compact.pop();
+    }
+    let upper = compact.to_ascii_uppercase();
+    let (rate_ref, body) = if let Some(rest) = upper.strip_prefix("1/(1+") {
+        let (rate, after) = rest.split_once(")^")?;
+        (Some(rate.to_string()), after.to_string())
+    } else {
+        (None, upper.clone())
+    };
+    let args = body.strip_prefix("YEARFRAC(")?.strip_suffix(')')?;
+    let parts: Vec<&str> = args.split(',').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let basis = parts[2].parse::<i64>().ok()?;
+    let end_ref = if parts[0] == "TODAY()" {
+        parts[1]
+    } else if parts[1] == "TODAY()" {
+        parts[0]
+    } else {
+        return None;
+    };
+    let (end_row, end_column) = parse_cell_reference(end_ref)?;
+    let end = numbers.get(&(cell.cell.sheet, end_row, end_column))?;
+    let end_serial = omasheets_calc::serial_date::serial_from_number(*end).ok()?;
+    let rate = match rate_ref {
+        Some(reference) => {
+            let (row, column) = parse_cell_reference(&reference)?;
+            Some(*numbers.get(&(cell.cell.sheet, row, column))?)
+        }
+        None => None,
+    };
+    Some(YearFracProbe {
+        end_serial,
+        basis,
+        rate,
+        stored,
     })
 }
 
@@ -1812,7 +2736,7 @@ mod tests {
         let bytes = package(
             &[],
             "",
-            r#"<c r="B1"><f>SUM(1:2)</f><v>0</v></c><c r="C1"><f>SUM(Data!A:A)</f><v>0</v></c><c r="D1"><f>SUM(A1:SUM(A1:A2))</f><v>0</v></c><c r="E1"><f>1+1</f><v>9</v></c>"#,
+            r#"<c r="B1"><f>SUM(A1:2)</f><v>0</v></c><c r="C1"><f>SUM(Data!A)</f><v>0</v></c><c r="D1"><f>SUM(A1:SUM(A1:A2))</f><v>0</v></c><c r="E1"><f>1+1</f><v>9</v></c>"#,
             "",
         );
         let path = temporary_xlsx(&bytes);
@@ -2105,19 +3029,12 @@ mod tests {
         assert_eq!(report.engine, ENGINE_NAME);
         assert_eq!(report.date_system, "1900");
         assert_eq!(report.formula_cells_observed, 6);
-        assert_eq!(report.formula_cells_loaded, 1);
-        assert_eq!(report.unsupported_formulas, 5);
-        assert_eq!(
-            report.unsupported_functions,
-            BTreeMap::from([("TODAY".to_string(), 2), ("OFFSET".to_string(), 1)])
-        );
+        assert_eq!(report.formula_cells_loaded, 4);
+        assert_eq!(report.unsupported_formulas, 2);
+        assert!(report.unsupported_functions.is_empty());
         assert_eq!(
             report.unsupported_reasons,
-            BTreeMap::from([
-                ("unsupported_function".to_string(), 3),
-                ("syntax".to_string(), 1),
-                ("unknown_sheet".to_string(), 1),
-            ])
+            BTreeMap::from([("syntax".to_string(), 1), ("unknown_sheet".to_string(), 1),])
         );
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.starts_with("{\"schema\":2,\"engine\":\"omasheets-owned-m0\""));
@@ -2317,8 +3234,11 @@ mod tests {
                 workbook_name("Rates", "Data!$A$1:$A$2"),
                 workbook_name("Broken", "[2]External!A1"),
             ],
+            &[],
             Vec::new(),
             Vec::new(),
+            &HashMap::new(),
+            PivotLoad::default(),
             "j".repeat(64),
             ImportLimits::default(),
         )
@@ -2736,6 +3656,176 @@ mod tests {
     }
 
     #[test]
+    fn this_row_reads_the_table_loaded_from_the_package() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("omasheets-table-{}-{nonce}", std::process::id()));
+        let _cleanup = TempCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("Table.xlsx");
+        let table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Lines" displayName="Lines" ref="A1:B3" totalsRowCount="1"><autoFilter ref="A1:B2"/><tableColumns count="2"><tableColumn id="1" name="Amount"/><tableColumn id="2" name="Twice"/></tableColumns></table>"#;
+        write_owned(
+            &source,
+            &[
+                (
+                    "[Content_Types].xml",
+                    content_types(
+                        r#"<Override PartName="/xl/tables/table1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>"#,
+                    ),
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_string(),
+                ),
+                (
+                    "xl/workbook.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#.to_string(),
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_string(),
+                ),
+                (
+                    "xl/worksheets/_rels/sheet1.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/tables/table1.xml", table.to_string()),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    worksheet_xml(
+                        r#"<c r="A2"><v>2</v></c><c r="B2"><f>Lines[[#This Row],[Amount]]*2</f><v>0</v></c><c r="A3"><f>SUM(Lines[Amount])</f><v>0</v></c>"#,
+                    ),
+                ),
+            ],
+        );
+        let imported = import_xlsx(&source, ImportLimits::default()).unwrap();
+        assert!(
+            imported.unsupported.is_empty(),
+            "{:?}",
+            imported.unsupported
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 1, 1)),
+            Value::Number(4.0)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 2, 0)),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn yearfrac_of_today_replays_from_the_stored_result() {
+        let mut workbook = Workbook::default();
+        workbook.set_number(CellId::new(0, 5, 0), 36982.0);
+        workbook.set_number(CellId::new(0, 5, 8), 0.05);
+        let at = omasheets_calc::serial_date::unix_millis_from_serial(41885.0).unwrap();
+        workbook.set_tick(at);
+        workbook
+            .set_formula(CellId::new(0, 5, 9), "1/(1+I6)^YEARFRAC(TODAY(),A6,1)")
+            .unwrap();
+        let Value::Number(expected) = workbook.value(CellId::new(0, 5, 9)) else {
+            panic!("yearfrac did not return a number");
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("omasheets-yearfrac-{}-{nonce}", std::process::id()));
+        let _cleanup = TempCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("Year.xlsx");
+        write_plain_workbook(
+            &source,
+            "S",
+            &format!(
+                r#"<c r="A6"><v>36982</v></c><c r="I6"><v>0.05</v></c><c r="J6"><f>1/(1+I6)^YEARFRAC(TODAY(),A6,1)</f><v>{expected}</v></c>"#
+            ),
+        );
+        let imported = import_xlsx(&source, ImportLimits::default()).unwrap();
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 5, 9)),
+            Value::Number(expected)
+        );
+    }
+
+    #[test]
+    fn external_cache_keeps_text_spaces_and_refuses_a_failed_refresh() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omasheets-external-space-{}-{nonce}",
+            std::process::id()
+        ));
+        let _cleanup = TempCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("Source.xlsx");
+        let link = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><externalLink xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><externalBook r:id="rId1"><sheetNames><sheetName val="Headers"/><sheetName val="Broken"/></sheetNames><sheetDataSet><sheetData sheetId="0"><row r="1"><cell r="A1" t="str"><v>other</v></cell><cell r="B1" t="str"><v xml:space="preserve">   CGPR-STN2   </v></cell><cell r="C1" t="str"><v/></cell></row></sheetData><sheetData sheetId="1" refreshError="1"><row r="1"><cell r="A1"><v>9</v></cell></row></sheetData></sheetDataSet></externalBook></externalLink>"#;
+        write_owned(
+            &source,
+            &[
+                (
+                    "[Content_Types].xml",
+                    content_types(
+                        r#"<Override PartName="/xl/externalLinks/externalLink1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml"/>"#,
+                    ),
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_string(),
+                ),
+                (
+                    "xl/workbook.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Report" sheetId="1" r:id="rId1"/></sheets><externalReferences><externalReference r:id="rId2"/></externalReferences></workbook>"#.to_string(),
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink" Target="externalLinks/externalLink1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/externalLinks/externalLink1.xml", link.to_string()),
+                (
+                    "xl/externalLinks/_rels/externalLink1.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" Target="missing.xls" TargetMode="External"/></Relationships>"#.to_string(),
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    worksheet_xml(
+                        r#"<c r="A1" t="inlineStr"><is><t xml:space="preserve">   CGPR-STN2   </t></is></c><c r="B1"><f>MATCH(A1,[1]Headers!$A$1:$B$1,0)</f><v>0</v></c><c r="C1"><f>[1]Broken!A1</f><v>9</v></c><c r="D1"><f>[1]Broken!B1</f><v>0</v></c><c r="E1"><f>[1]Headers!C1</f><v></v></c>"#,
+                    ),
+                ),
+            ],
+        );
+        let imported = import_xlsx(&source, ImportLimits::default()).unwrap();
+        assert!(
+            imported.unsupported.is_empty(),
+            "{:?}",
+            imported.unsupported
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 1)),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 2)),
+            Value::Number(9.0)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 3)),
+            Value::Error(CalcError::InvalidReference)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 4)),
+            Value::Text(String::new())
+        );
+    }
+
+    #[test]
     fn enron_mismatch_real_enron_files_replay_33926_and_today_serial() {
         let root = Path::new("/Users/markwatts/omasheets-corpus/enron-figshare/enron-figshare");
         let external = root.join("paul_lucci__28399__Enron Daily Email Nov '01.xlsx");
@@ -2762,6 +3852,226 @@ mod tests {
         assert_eq!(
             crude.workbook.value(CellId::new(main.index, 30, 6)),
             Value::Number(41885.0)
+        );
+    }
+
+    #[test]
+    fn enron_ref_cluster_reads_failed_refresh_cache_and_built_indirect() {
+        let root = Path::new("/Users/markwatts/omasheets-corpus/enron-figshare/enron-figshare");
+        let pnl = root.join("stacey_white__38996__Pwr west P&L.xlsx");
+        let radar = root.join("jeffrey_a_shankman__13936__RADAR Screens-4Q 1116.xlsx");
+        let parks = root.join("joe_parks__14513__P&L_JUN01.xlsx");
+        if !pnl.is_file() || !radar.is_file() || !parks.is_file() {
+            return;
+        }
+        assert_eq!(
+            import_xlsx(&pnl, ImportLimits::default())
+                .unwrap()
+                .parity()
+                .stored_values_mismatched,
+            0
+        );
+        let radar = import_xlsx(&radar, ImportLimits::default()).unwrap();
+        assert_eq!(
+            radar.workbook.value(CellId::new(0, 15, 11)),
+            Value::Number(32.5)
+        );
+        // CELL("filename") now calculates. The cached text is the Windows path
+        // from the machine that last saved the file, so these two cells stay
+        // mismatches. Every other formula on the sheet matches.
+        let filename_mismatches = radar
+            .mismatched_cells()
+            .filter(|(_, _, calculated)| calculated == &Value::Text(String::new()))
+            .count();
+        assert_eq!(radar.parity().stored_values_mismatched, filename_mismatches);
+        assert_eq!(filename_mismatches, 2);
+        assert_eq!(
+            import_xlsx(&parks, ImportLimits::default())
+                .unwrap()
+                .parity()
+                .stored_values_mismatched,
+            0
+        );
+    }
+
+    #[test]
+    fn operating_model_offset_reads_the_shifted_row() {
+        let path = Path::new(
+            "/Users/markwatts/omasheets-corpus/spreadsheet-rl-2026/sample/spreadsheetbench_2__Debugging__08_07__input.xlsx",
+        );
+        if !path.is_file() {
+            return;
+        }
+        let imported = import_xlsx(path, ImportLimits::default()).unwrap();
+        assert_eq!(imported.parity().stored_values_mismatched, 0);
+        assert_eq!(
+            imported
+                .unsupported_reasons()
+                .get("cycle")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    fn assert_close_number(value: Value, expected: f64) {
+        match value {
+            Value::Number(number) => {
+                assert!((number - expected).abs() <= 1e-4, "{number} != {expected}")
+            }
+            other => panic!("expected {expected}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn getpivotdata_imports_a_date_filter_and_field_items() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omasheets-getpivotdata-{}-{nonce}",
+            std::process::id()
+        ));
+        let _cleanup = TempCleanup(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("Pivot.xlsx");
+        let sheet = r#"<c r="A1"><v>1</v></c><c r="B1"><f>GETPIVOTDATA("Amount",$A$1)</f><v>20</v></c><c r="C1"><f>GETPIVOTDATA("Amount",$A$1,"Region","East")</f><v>20</v></c><c r="D1"><f>GETPIVOTDATA("Amount",$A$1,"Region","North")</f></c><c r="E1"><f>GETPIVOTDATA("Amount",$A$1,"When",44927)</f><v>7</v></c><c r="F1"><f>GETPIVOTDATA("Amount",$A$1,"Region")</f></c><c r="G1"><f>GETPIVOTDATA("Amount",$Z$1)</f></c><c r="H1"><f>GETPIVOTDATA("Bonus",$A$1)</f><v>0</v></c><c r="I1"><f>GETPIVOTDATA("Rows",$A$1)</f></c><c r="J1"><f>_xlfn.GETPIVOTDATA("Amount",$A$1,"Region","East")</f><v>20</v></c><c r="K1"><f>GETPIVOTDATA("Amount",$A$1,"Region","West")</f></c>"#;
+        let pivot = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="P" cacheId="1"><location ref="A1" firstHeaderRow="0" firstDataRow="0" firstDataCol="0"/><pivotFields count="4"><pivotField axis="axisRow"><items count="2"><item x="0"/><item x="1"/></items></pivotField><pivotField dataField="1"/><pivotField axis="axisRow"><items count="1"><item x="0"/></items></pivotField><pivotField dataField="1"/></pivotFields><rowFields count="2"><field x="0"/><field x="2"/></rowFields><dataFields count="3"><dataField name="Amount" fld="1"/><dataField name="Bonus" fld="3"/><dataField name="Rows" fld="0" subtotal="count"/></dataFields><filters count="1"><filter fld="2" type="dateBetween" id="1" evalOrder="0"><autoFilter><filterColumn colId="0"><customFilters and="1"><customFilter operator="greaterThanOrEqual" val="44927"/><customFilter operator="lessThanOrEqual" val="44957"/></customFilters></filterColumn></autoFilter></filter></filters></pivotTableDefinition>"#;
+        let definition = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1" recordCount="6"><cacheSource type="worksheet"><worksheetSource ref="A1:D6" sheet="Data"/></cacheSource><cacheFields count="4"><cacheField name="Region"><sharedItems count="2"><s v="East"/><s v="West"/></sharedItems></cacheField><cacheField name="Amount"><sharedItems containsNumber="1"/></cacheField><cacheField name="When"><sharedItems containsDate="1"/></cacheField><cacheField name="Bonus"><sharedItems containsBlank="1" containsNumber="1"/></cacheField></cacheFields></pivotCacheDefinition>"#;
+        let records = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotCacheRecords xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="6"><r><x v="0"/><n v="10"/><d v="2023-01-15T00:00:00"/><m/></r><r><x v="1"/><n v="25"/><d v="2023-02-15T00:00:00"/><n v="5"/></r><r><x v="0"/><m/><d v="2023-01-20T00:00:00"/><m/></r><r><x v="0"/><n v="7"/><d v="2023-01-01T00:00:00"/><n v="0"/></r><r><x v="0"/><n v="3"/><d v="2023-01-31T00:00:00"/><m/></r><r><x v="0"/><n v="100"/><d v="2023-02-01T00:00:00"/><m/></r></pivotCacheRecords>"#;
+        write_owned(
+            &source,
+            &[
+                ("[Content_Types].xml", content_types("")),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_string(),
+                ),
+                (
+                    "xl/workbook.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#.to_string(),
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/worksheets/sheet1.xml", worksheet_xml(sheet)),
+                (
+                    "xl/worksheets/_rels/sheet1.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/pivotTables/pivotTable1.xml", pivot.to_string()),
+                (
+                    "xl/pivotTables/_rels/pivotTable1.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/pivotCache/pivotCacheDefinition1.xml", definition.to_string()),
+                (
+                    "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" Target="pivotCacheRecords1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/pivotCache/pivotCacheRecords1.xml", records.to_string()),
+            ],
+        );
+        let imported = import_xlsx(&source, ImportLimits::default()).unwrap();
+        let ref_error = Value::Error(CalcError::InvalidReference);
+        let cases = [
+            (1, Value::Number(20.0)),
+            (2, Value::Number(20.0)),
+            (3, ref_error.clone()),
+            (4, Value::Number(7.0)),
+            (5, ref_error.clone()),
+            (6, ref_error.clone()),
+            (7, Value::Number(0.0)),
+            (8, Value::Error(CalcError::InvalidValue)),
+            (9, Value::Number(20.0)),
+            (10, ref_error),
+        ];
+        for (column, expected) in cases {
+            let cell = CellId::new(0, 0, column);
+            assert!(
+                imported.unsupported.iter().all(|item| item.cell != cell),
+                "{:?}",
+                imported.unsupported
+            );
+            assert_eq!(imported.workbook.value(cell), expected, "column {column}");
+        }
+    }
+
+    #[test]
+    fn getpivotdata_sample_matches_stored_totals() {
+        let path = Path::new(
+            "/Users/markwatts/omasheets-corpus/spreadsheet-rl-2026/sample/excelforum__excel-formulas-and-functions__task-job-47b8ffb242e1996d__input.xlsx",
+        );
+        if !path.is_file() {
+            return;
+        }
+        let imported = import_xlsx(path, ImportLimits::default()).unwrap();
+        let sheet = imported
+            .sheets
+            .iter()
+            .find(|sheet| sheet.name == "PTHeadline")
+            .expect("PTHeadline");
+        let expected = [3_321_428.62, -62_132.69, 119_081.74, 0.0];
+        for (offset, expected) in expected.into_iter().enumerate() {
+            let cell = CellId::new(sheet.index, 5 + offset as u32, 10);
+            assert!(
+                imported.unsupported.iter().all(|item| item.cell != cell),
+                "{cell:?} {:?}",
+                imported.unsupported.iter().find(|item| item.cell == cell)
+            );
+            assert_close_number(imported.workbook.value(cell), expected);
+        }
+    }
+
+    #[test]
+    fn datevalue_external_text_linest_and_yearfrac_match_stored_values() {
+        let root = Path::new("/Users/markwatts/omasheets-corpus/enron-figshare/enron-figshare");
+        let files = [
+            "andy_zipper__123__Broker & Exchange Detail 6-7-01.xlsx",
+            "cooper_richey__4122__enron.xlsx",
+            "john_griffith__15855__Vol Move.xlsx",
+            "frank_ermis__11027__AEC Volumes 021301.xlsx",
+        ];
+        if files.iter().any(|name| !root.join(name).is_file()) {
+            return;
+        }
+        for name in files {
+            let imported = import_xlsx(&root.join(name), ImportLimits::default()).unwrap();
+            let misses: Vec<_> = imported
+                .mismatched_cells()
+                .map(|(cell, stored, calculated)| format!("{cell:?} {stored:?} {calculated:?}"))
+                .take(3)
+                .collect();
+            assert_eq!(
+                imported.parity().stored_values_mismatched,
+                0,
+                "{name} {misses:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dcf_model_offset_drivers_match_stored_values() {
+        let path = Path::new("/Users/markwatts/omasheets-corpus/spreadsheet-rl-2026/sample/spreadsheetbench_2__Financial_Model__08_04__input.xlsx");
+        if !path.is_file() {
+            return;
+        }
+        let imported = import_xlsx(path, ImportLimits::default()).unwrap();
+        let report = imported.report();
+        // The opening balance matches until the schedule switches to the
+        // constant payment. PMT is high by about 1.29e-8, and that excess
+        // compounds to about 1.3e-6 by the last draw. The seven cycles are an
+        // annual total that sums the months which are fractions of that total.
+        assert_eq!(
+            (
+                report.stored_values_mismatched,
+                report.unsupported_reasons.get("cycle").copied()
+            ),
+            (5, Some(7)),
+            "{:?}",
+            report.mismatch_value_kinds
         );
     }
 }

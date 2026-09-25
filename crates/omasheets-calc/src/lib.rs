@@ -8,8 +8,10 @@
 //! boundary rules and the deliberately unsupported cases.
 
 mod database;
+mod dynamic;
 mod hard;
 mod matrix;
+pub mod pivot;
 mod reference;
 pub mod serial_date;
 
@@ -24,6 +26,13 @@ const MAX_COLUMNS: u32 = 16_384;
 const MAX_ROWS: u32 = 1_048_576;
 
 const MAX_RANGE_CELLS: usize = 1_000_000;
+/// A span Excel accepts (`A:XFD`, `1:1048576`) is stored as a rectangle and
+/// summed by visiting occupied cells. Copying one value per grid position
+/// stops here so a whole-sheet reference cannot allocate the grid. Functions
+/// that need that copy (`COUNTIF`, `SUMPRODUCT`, elementwise arrays) return
+/// `#VALUE!` above the limit. Lookups scan occupied cells and keep the real
+/// row or column index.
+const DENSE_RANGE_CELLS: usize = 5_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CellId {
@@ -56,6 +65,8 @@ pub struct StructuredTable {
     pub name: String,
     pub sheet: u32,
     pub header_row: Option<u32>,
+    /// Data rows only. `#Totals` selects `totals_row` when the table has one.
+    pub totals_row: Option<u32>,
     pub rows: Vec<u32>,
     pub columns: Vec<StructuredColumn>,
 }
@@ -98,6 +109,8 @@ pub enum CalcError {
     NullIntersection,
     /// Excel `#SPILL!`: a dynamic array could not write its rectangle.
     Spill,
+    /// Excel `#CALC!`: a dynamic array has an empty result and no `if_empty`.
+    Calculation,
     /// Wrong argument count or shape for the function.
     InvalidArguments,
 }
@@ -114,6 +127,7 @@ impl CalcError {
             Self::InvalidName => "#NAME?",
             Self::NullIntersection => "#NULL!",
             Self::Spill => "#SPILL!",
+            Self::Calculation => "#CALC!",
             Self::InvalidArguments => "#ARGS!",
         }
     }
@@ -128,6 +142,7 @@ impl CalcError {
             "#NAME?" => Self::InvalidName,
             "#NULL!" => Self::NullIntersection,
             "#SPILL!" => Self::Spill,
+            "#CALC!" => Self::Calculation,
             _ => return None,
         })
     }
@@ -275,6 +290,23 @@ enum RangeKey {
         rows: usize,
         columns: usize,
     },
+}
+
+fn range_key_covers(key: &RangeKey, cell: CellId) -> bool {
+    match key {
+        RangeKey::Rectangle {
+            anchor,
+            rows,
+            columns,
+        } => {
+            cell.sheet == anchor.sheet
+                && cell.row >= anchor.row
+                && cell.column >= anchor.column
+                && (cell.row - anchor.row) < *rows as u32
+                && (cell.column - anchor.column) < *columns as u32
+        }
+        RangeKey::Members { members, .. } => members.contains(&cell),
+    }
 }
 
 fn range_key(
@@ -430,6 +462,14 @@ enum Function {
     RandBetween,
     Offset,
     Indirect,
+    DateValue,
+    Rows,
+    Cell,
+    Linest,
+    Filter,
+    Unique,
+    Sort,
+    GetPivotData,
 }
 
 /// A parsed formula whose cell references can be enumerated and rebound
@@ -735,6 +775,9 @@ pub struct Workbook {
     defined_names: DefinedNames,
     /// Cached cells from external link parts. Read when a formula is compiled.
     external: ExternalCache,
+    /// Pivot caches and tables. `GETPIVOTDATA` reads them at evaluation.
+    pivot_caches: Vec<pivot::PivotCache>,
+    pivot_tables: Vec<pivot::PivotTable>,
     /// Shared range nodes by identity, so every formula over the same cells
     /// shares one node and one set of member edges.
     ranges: HashMap<RangeKey, usize>,
@@ -758,6 +801,11 @@ pub struct Workbook {
     /// Set by `set_parsed_formula` for the `commit` that installs it.
     pending_dynamic: Option<Vec<usize>>,
     eval_marks: Vec<u64>,
+    /// Range barriers created while a pass is already running. They are not
+    /// in that pass's dirty list, but they still step once their cells do.
+    late_range_barriers: usize,
+    /// Legacy CSE array formulas: the entered rectangle, in cells, for the anchor.
+    array_formulas: HashMap<CellId, (usize, usize)>,
 }
 
 impl Default for Workbook {
@@ -772,6 +820,8 @@ impl Default for Workbook {
             sheet_names: HashMap::new(),
             defined_names: DefinedNames::default(),
             external: ExternalCache::default(),
+            pivot_caches: Vec::new(),
+            pivot_tables: Vec::new(),
             ranges: HashMap::new(),
             free_ranges: Vec::new(),
             generation: 1,
@@ -785,6 +835,8 @@ impl Default for Workbook {
             dynamic_errors: HashMap::new(),
             pending_dynamic: None,
             eval_marks: Vec::new(),
+            late_range_barriers: 0,
+            array_formulas: HashMap::new(),
         }
     }
 }
@@ -850,6 +902,27 @@ impl Workbook {
         self.external.note_sheet(link_index, book_file, sheet);
     }
 
+    /// The link lists this sheet, but refreshing it failed. Cached cells on
+    /// the sheet are still read. A cell the cache does not list is `#REF!`.
+    /// A formula entered over a fixed rectangle (Excel `t="array"`). The
+    /// result is written into that rectangle instead of being intersected
+    /// down to one cell. Call this before [`Self::set_formula`].
+    pub fn note_array_formula(&mut self, cell: CellId, rows: usize, columns: usize) {
+        if rows > 0 && columns > 0 {
+            self.array_formulas.insert(cell, (rows, columns));
+        }
+    }
+
+    pub fn note_broken_external_sheet(
+        &mut self,
+        link_index: u32,
+        book_file: Option<&str>,
+        sheet: &str,
+    ) {
+        self.external
+            .note_broken_sheet(link_index, book_file, sheet);
+    }
+
     pub fn set_error(&mut self, cell: CellId, error: CalcError) -> RecalcReport {
         self.commit(cell, Input::Literal(Value::Error(error)), Vec::new())
     }
@@ -899,6 +972,42 @@ impl Workbook {
         )
     }
 
+    /// Like [`Workbook::set_formula`], with Excel tables in scope. A formula
+    /// on a table row resolves `[#This Row]` and `[@Column]` against that row.
+    pub fn set_formula_with_tables(
+        &mut self,
+        cell: CellId,
+        formula: &str,
+        tables: &[StructuredTable],
+    ) -> Result<RecalcReport, FormulaError> {
+        let current = tables.iter().find(|table| {
+            table.sheet == cell.sheet
+                && (table.rows.contains(&cell.row)
+                    || table.header_row == Some(cell.row)
+                    || table.totals_row == Some(cell.row))
+        });
+        let expression = Parser::new_structured(
+            formula,
+            cell.sheet,
+            &self.sheet_names,
+            &self.defined_names,
+            &self.external,
+            StructuredContext {
+                tables,
+                current_table: current.map(|table| table.name.as_str()),
+                current_row: Some(cell.row),
+            },
+        )
+        .parse()?;
+        self.set_parsed_formula(
+            cell,
+            ParsedFormula {
+                expression,
+                structured_tables: Vec::new(),
+            },
+        )
+    }
+
     /// Installs an already parsed (and possibly rebound) formula with the same
     /// transactional cycle rejection as [`Workbook::set_formula`].
     pub fn set_parsed_formula(
@@ -910,6 +1019,16 @@ impl Workbook {
         let mut structural_cells = BTreeSet::new();
         let mut structural_ranges = Vec::new();
         collect_dependencies(&parsed, &mut structural_cells, &mut structural_ranges);
+        let mut envelopes = Vec::new();
+        collect_span_envelopes(&parsed, &mut envelopes);
+        let mut compile_only_ranges = Vec::new();
+        for key in envelopes {
+            if range_key_covers(&key, cell) {
+                compile_only_ranges.push(key);
+            } else {
+                structural_ranges.push(key);
+            }
+        }
         let (dynamic_cells, dynamic_ranges) = self.preview_dynamic_binding(cell.sheet, &parsed);
         let mut cells = structural_cells.clone();
         cells.extend(dynamic_cells.iter().copied());
@@ -925,6 +1044,12 @@ impl Workbook {
                 self.retire_range(*node);
             }
             return Err(FormulaError::Cycle(path));
+        }
+        // An envelope that contains the formula cell is only a compile-time
+        // coordinate space. The calculated rectangle is the value dependency.
+        for key in compile_only_ranges {
+            let node = self.ensure_range(&key);
+            range_nodes.entry(key).or_insert(node);
         }
         let structural_indices: HashSet<usize> = structural_cells
             .iter()
@@ -942,13 +1067,21 @@ impl Workbook {
         let mut dependencies: Vec<usize> = cells
             .into_iter()
             .map(|dependency| self.ensure_cell(dependency))
+            .chain(structural_ranges.iter().map(|key| range_nodes[key]))
+            .chain(dynamic_ranges.iter().map(|key| range_nodes[key]))
             .collect();
-        dependencies.extend(range_nodes.values().copied());
         if hard::expression_is_volatile(&parsed) {
             dependencies.push(self.ensure_tick_node());
         }
         dependencies.sort_unstable();
         dependencies.dedup();
+        // OFFSET's starting address is compiled as a reference but is not a
+        // value dependency, so the cell still has to exist in the index.
+        let mut anchors = BTreeSet::new();
+        collect_offset_anchors(&parsed, &mut anchors);
+        for anchor in anchors {
+            self.ensure_cell(anchor);
+        }
         let expression = compile_expression(parsed, &self.indices, &range_nodes);
         self.pending_dynamic = Some(dynamic_indices);
         Ok(self.commit(cell, Input::Formula(expression), dependencies))
@@ -1244,6 +1377,9 @@ impl Workbook {
                 rows,
                 columns,
             } => {
+                if rows.saturating_mul(columns) > DENSE_RANGE_CELLS {
+                    return vec![Value::Error(CalcError::InvalidValue)];
+                }
                 let mut output = vec![Value::Blank; rows * columns];
                 self.for_each_rectangle_cell(anchor, rows, columns, |position, index| {
                     output[position] = self.cells[index].value.clone();
@@ -1359,9 +1495,10 @@ impl Workbook {
             return Some(vec![changed, changed]);
         }
         let range_nodes: Vec<usize> = range_nodes.collect();
-        // A formula inside one of its own rectangles is a cycle even when
-        // the cell does not exist yet, since a rectangle has no member edges
-        // to walk.
+        // Excel treats a formula inside a span it reads as a circular
+        // reference. Iteration is not implemented, so the formula is rejected.
+        // A rectangle has no member edges to walk, including before the cell
+        // exists.
         if range_nodes
             .iter()
             .any(|node| self.rectangle_covers(*node, changed))
@@ -1451,6 +1588,7 @@ impl Workbook {
             self.generation = 1;
         }
         let generation = self.generation;
+        self.late_range_barriers = 0;
         let mut dirty = Vec::with_capacity(seeds.len());
         for seed in seeds {
             if self.dirty_marks[*seed] != generation {
@@ -1541,10 +1679,36 @@ impl Workbook {
         }
         debug_assert_eq!(
             evaluated.len() + range_nodes_passed,
-            dirty.len(),
+            dirty.len() + self.late_range_barriers,
             "cycles are rejected before commit"
         );
         RecalcReport { evaluated }
+    }
+
+    /// The value a formula stores. Excel's final addition or subtraction
+    /// stores 0 when the two sides agree at 15 significant digits
+    /// (`=N8-SUM(N11,N14)` is 0). The same subtraction nested under another
+    /// operator keeps the residual, so `=(0.1+0.2)-0.3=0` is FALSE.
+    fn evaluate_stored(&self, expression: &Expr<usize>) -> Value {
+        let Expr::Binary(operator, left, right) = expression else {
+            return self.evaluate(expression);
+        };
+        if !matches!(operator, BinaryOp::Add | BinaryOp::Subtract) {
+            return self.evaluate(expression);
+        }
+        let left_value = self.evaluate(left);
+        let right_value = self.evaluate(right);
+        let value = apply_binary(*operator, left_value.clone(), right_value.clone());
+        let cancelled = match (operator, &left_value, &right_value) {
+            (BinaryOp::Subtract, Value::Number(left), Value::Number(right)) => {
+                compare_numbers(*left, *right) == std::cmp::Ordering::Equal
+            }
+            (BinaryOp::Add, Value::Number(left), Value::Number(right)) => {
+                compare_numbers(*left, -*right) == std::cmp::Ordering::Equal
+            }
+            _ => false,
+        };
+        if cancelled { number_value(0.0) } else { value }
     }
 
     fn evaluate(&self, expression: &Expr<usize>) -> Value {
@@ -1556,14 +1720,12 @@ impl Workbook {
             Expr::Empty => Value::Blank,
             Expr::Array(array) => array.values[0].clone(),
             Expr::Reference(index) => self.cells[*index].value.clone(),
-            Expr::UnaryMinus(inner) => match self.evaluate(inner) {
-                Value::Number(value) => number_value(-value),
-                Value::Blank => Value::Number(0.0),
-                Value::Boolean(value) => Value::Number(if value { -1.0 } else { 0.0 }),
-                Value::Text(_) => Value::Error(CalcError::InvalidValue),
-                other => other,
+            Expr::UnaryMinus(inner) => match excel_number(self.evaluate(inner)) {
+                Ok(value) => number_value(-value),
+                Err(CalcError::InvalidValue) => Value::Error(CalcError::InvalidValue),
+                Err(error) => Value::Error(error),
             },
-            Expr::Percent(inner) => match number(self.evaluate(inner)) {
+            Expr::Percent(inner) => match excel_number(self.evaluate(inner)) {
                 Ok(value) => Value::Number(value / 100.0),
                 Err(error) => Value::Error(error),
             },
@@ -1630,8 +1792,16 @@ impl Workbook {
     }
 
     fn evaluate_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
-        if matches!(function, Function::Transpose | Function::MMult) {
-            return match self.matrix_array(function, arguments) {
+        if matches!(
+            function,
+            Function::Transpose
+                | Function::MMult
+                | Function::Filter
+                | Function::Unique
+                | Function::Sort
+                | Function::Linest
+        ) {
+            return match self.array_result(function, arguments) {
                 Ok(array) => array.values.into_iter().next().unwrap_or(Value::Blank),
                 Err(error) => Value::Error(error),
             };
@@ -1720,6 +1890,15 @@ impl Workbook {
         if matches!(function, Function::Row | Function::Column) {
             return self.evaluate_position_function(function, arguments);
         }
+        if function == Function::Rows {
+            return self.rows_value(arguments);
+        }
+        if function == Function::Cell {
+            return self.cell_info(arguments);
+        }
+        if function == Function::GetPivotData {
+            return self.get_pivot_data(arguments);
+        }
         if function == Function::IfError {
             if arguments.len() != 2 {
                 return Value::Error(CalcError::InvalidArguments);
@@ -1789,7 +1968,11 @@ impl Workbook {
         }
         if matches!(
             function,
-            Function::YearFrac | Function::Days360 | Function::NetworkDays | Function::WorkDay
+            Function::YearFrac
+                | Function::Days360
+                | Function::NetworkDays
+                | Function::WorkDay
+                | Function::DateValue
         ) {
             return self.evaluate_calendar_function(function, arguments);
         }
@@ -2034,7 +2217,15 @@ impl Workbook {
             | Function::Rand
             | Function::RandBetween
             | Function::Offset
-            | Function::Indirect => Value::Error(CalcError::InvalidArguments),
+            | Function::Indirect
+            | Function::DateValue
+            | Function::Rows
+            | Function::Cell
+            | Function::Linest
+            | Function::Filter
+            | Function::Unique
+            | Function::Sort
+            | Function::GetPivotData => Value::Error(CalcError::InvalidArguments),
         }
     }
 
@@ -2382,6 +2573,20 @@ impl Workbook {
     /// `YEARFRAC`, `DAYS360`, `NETWORKDAYS` and `WORKDAY`: day-count and
     /// working-day arithmetic on the 1900 serial system.
     fn evaluate_calendar_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
+        if function == Function::DateValue {
+            if arguments.len() != 1 {
+                return Value::Error(CalcError::InvalidArguments);
+            }
+            let text = match self.evaluate(&arguments[0]) {
+                Value::Text(text) => text,
+                Value::Error(error) => return Value::Error(error),
+                _ => return Value::Error(CalcError::InvalidValue),
+            };
+            return match serial_date::date_value(&text) {
+                Ok(serial) => Value::Number(serial as f64),
+                Err(error) => Value::Error(error),
+            };
+        }
         let expected_arity: &[usize] = match function {
             Function::YearFrac | Function::Days360 | Function::NetworkDays | Function::WorkDay => {
                 &[2, 3]
@@ -2744,9 +2949,15 @@ impl Workbook {
     fn evaluate_array(&self, expression: &Expr<usize>) -> Result<ArrayValue, CalcError> {
         match expression {
             Expr::Array(array) => Ok(array.clone()),
-            Expr::Function(function @ (Function::Transpose | Function::MMult), arguments) => {
-                self.matrix_array(*function, arguments)
-            }
+            Expr::Function(
+                function @ (Function::Transpose
+                | Function::MMult
+                | Function::Filter
+                | Function::Unique
+                | Function::Sort
+                | Function::Linest),
+                arguments,
+            ) => self.array_result(*function, arguments),
             Expr::Function(Function::Offset | Function::Indirect, _) => self
                 .reference_view(expression)
                 .map(|reference| reference.array(self)),
@@ -2920,6 +3131,51 @@ impl Workbook {
         }
     }
 
+    /// Occupied, non-blank, non-error cells of the lookup lane, with their
+    /// real row or column index. Whole-column `VLOOKUP`/`MATCH` must not
+    /// allocate a slot per grid row. Blank and error cells never match.
+    fn indexed_lookup_lane(&self, input: &ArrayInput<'_>, vertical: bool) -> Vec<(usize, Value)> {
+        let (rows, columns) = input.shape();
+        if let ArrayInput::Range { node, .. } = input {
+            if let RangeShape::Rectangle {
+                anchor,
+                rows,
+                columns,
+            } = self.range_shape(*node)
+            {
+                let mut found = Vec::new();
+                self.for_each_rectangle_cell(anchor, rows, columns, |position, index| {
+                    let (lane, across) = if vertical {
+                        (position / columns, position % columns)
+                    } else {
+                        (position % columns, position / columns)
+                    };
+                    if across != 0 {
+                        return;
+                    }
+                    match &self.cells[index].value {
+                        Value::Blank | Value::Error(_) => {}
+                        value => found.push((lane, value.clone())),
+                    }
+                });
+                return found;
+            }
+        }
+        let lanes = if vertical { rows } else { columns };
+        let mut found = Vec::new();
+        for lane in 0..lanes {
+            let value = if vertical {
+                input.value(self, lane * columns)
+            } else {
+                input.value(self, lane)
+            };
+            if !matches!(value, Value::Blank | Value::Error(_)) {
+                found.push((lane, value));
+            }
+        }
+        found
+    }
+
     fn evaluate_lookup_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
         match function {
             Function::Index if matches!(arguments.len(), 2 | 3) => {
@@ -2955,6 +3211,13 @@ impl Workbook {
                 let (rows, columns) = input.shape();
                 if rows != 1 && columns != 1 {
                     return Value::Error(CalcError::InvalidArguments);
+                }
+                if rows.max(columns) > 4_096 {
+                    let indexed = self.indexed_lookup_lane(&input, columns == 1);
+                    return match match_indexed(&lookup, &indexed, mode) {
+                        Ok(position) => Value::Number((position + 1) as f64),
+                        Err(error) => Value::Error(error),
+                    };
                 }
                 let candidates = input.values(self);
                 match match_position(&lookup, &candidates, mode) {
@@ -3007,6 +3270,13 @@ impl Workbook {
                         input.value(self, position * columns + lane)
                     }
                 };
+                if lanes > 4_096 {
+                    let indexed = self.indexed_lookup_lane(&input, vertical);
+                    return match match_indexed(&lookup, &indexed, mode) {
+                        Ok(lane) => at(lane, offset - 1),
+                        Err(error) => Value::Error(error),
+                    };
+                }
                 let candidates: Vec<Value> = (0..lanes).map(|lane| at(lane, 0)).collect();
                 match match_position(&lookup, &candidates, mode) {
                     Ok(lane) => at(lane, offset - 1),
@@ -3077,6 +3347,63 @@ enum MatchMode {
 /// non-blank candidates by Excel's typed order (numbers before text before
 /// booleans) and return `#N/A` when nothing qualifies, which is the documented
 /// contract for sorted inputs; unsorted inputs are undefined in Excel too.
+fn match_indexed(
+    lookup: &Value,
+    indexed: &[(usize, Value)],
+    mode: MatchMode,
+) -> Result<usize, CalcError> {
+    if let Value::Error(error) = lookup {
+        return Err(error.clone());
+    }
+    if mode == MatchMode::Exact {
+        for (index, candidate) in indexed {
+            if lookup_equal(lookup, candidate) {
+                return Ok(*index);
+            }
+        }
+        return Err(CalcError::NotAvailable);
+    }
+    let populated: Vec<(usize, &Value)> = indexed
+        .iter()
+        .filter(|(_, candidate)| !matches!(candidate, Value::Blank | Value::Error(_)))
+        .map(|(index, candidate)| (*index, candidate))
+        .collect();
+    approximate_match(lookup, &populated, mode)
+}
+
+fn approximate_match(
+    lookup: &Value,
+    populated: &[(usize, &Value)],
+    mode: MatchMode,
+) -> Result<usize, CalcError> {
+    if populated.is_empty() {
+        return Err(CalcError::NotAvailable);
+    }
+    let same_type =
+        |candidate: &Value| std::mem::discriminant(candidate) == std::mem::discriminant(lookup);
+    let (mut low, mut high) = (0_usize, populated.len());
+    while low < high {
+        let middle = (low + high) / 2;
+        let candidate = populated[middle].1;
+        let ordering = typed_compare(candidate, lookup)?;
+        let goes_right = match mode {
+            MatchMode::Ascending => ordering != std::cmp::Ordering::Greater,
+            MatchMode::Descending => ordering != std::cmp::Ordering::Less,
+            MatchMode::Exact => unreachable!("handled above"),
+        };
+        if goes_right {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let chosen = low.checked_sub(1).map(|index| populated[index]);
+    match chosen {
+        Some((position, candidate)) if same_type(candidate) => Ok(position),
+        _ => Err(CalcError::NotAvailable),
+    }
+}
+
 fn match_position(
     lookup: &Value,
     candidates: &[Value],
@@ -3100,33 +3427,7 @@ fn match_position(
         .enumerate()
         .filter(|(_, candidate)| !matches!(candidate, Value::Blank | Value::Error(_)))
         .collect();
-    if populated.is_empty() {
-        return Err(CalcError::NotAvailable);
-    }
-    let same_type =
-        |candidate: &Value| std::mem::discriminant(candidate) == std::mem::discriminant(lookup);
-    // Binary search for the boundary, then require a same-typed neighbour.
-    let (mut low, mut high) = (0_usize, populated.len());
-    while low < high {
-        let middle = (low + high) / 2;
-        let candidate = populated[middle].1;
-        let ordering = typed_compare(candidate, lookup)?;
-        let goes_right = match mode {
-            MatchMode::Ascending => ordering != std::cmp::Ordering::Greater,
-            MatchMode::Descending => ordering != std::cmp::Ordering::Less,
-            MatchMode::Exact => unreachable!("handled above"),
-        };
-        if goes_right {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    let chosen = low.checked_sub(1).map(|index| populated[index]);
-    match chosen {
-        Some((position, candidate)) if same_type(candidate) => Ok(position),
-        _ => Err(CalcError::NotAvailable),
-    }
+    approximate_match(lookup, &populated, mode)
 }
 
 /// Excel's comparison order for `<`, `>` and approximate lookups: numbers
@@ -3294,6 +3595,10 @@ fn contains_array_operand(expression: &Expr<usize>) -> bool {
             | Function::ReferenceSpan
             | Function::Transpose
             | Function::MMult
+            | Function::Filter
+            | Function::Unique
+            | Function::Sort
+            | Function::Linest
             | Function::Offset
             | Function::Indirect,
             _,
@@ -3474,6 +3779,30 @@ fn number(value: Value) -> Result<f64, CalcError> {
     }
 }
 
+/// Arithmetic coerces numeric text the way Excel does: `"5"-16` is `-11`.
+/// Text that is not a number stays `#VALUE!`. A trailing `%` is a percent.
+fn excel_number(value: Value) -> Result<f64, CalcError> {
+    match value {
+        Value::Text(text) => parse_numeric_text(&text).ok_or(CalcError::InvalidValue),
+        other => number(other),
+    }
+}
+
+fn parse_numeric_text(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(percent) = text.strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| value / 100.0);
+    }
+    text.parse().ok()
+}
+
 fn truthy(value: Value) -> Result<bool, CalcError> {
     match value {
         Value::Boolean(value) => Ok(value),
@@ -3507,8 +3836,9 @@ fn apply_binary(operator: BinaryOp, left: Value, right: Value) -> Value {
             | BinaryOp::GreaterOrEqual
     ) {
         use std::cmp::Ordering;
-        // Equality never crosses types (a number is never equal to text),
-        // except that a blank takes the other side's type.
+        // Comparisons do not coerce numeric text. `=1="1"` is FALSE, and
+        // text sorts after every number, so `="5"<10` is FALSE. A blank
+        // takes the other side's type.
         let comparable = matches!(
             (&left, &right),
             (Value::Number(_), Value::Number(_))
@@ -3531,7 +3861,7 @@ fn apply_binary(operator: BinaryOp, left: Value, right: Value) -> Value {
             _ => unreachable!("matched above"),
         });
     }
-    let (left, right) = match (number(left), number(right)) {
+    let (left, right) = match (excel_number(left), excel_number(right)) {
         (Ok(left), Ok(right)) => (left, right),
         (Err(error), _) | (_, Err(error)) => return Value::Error(error),
     };
@@ -4202,6 +4532,7 @@ enum TextFormat {
     Percent { decimals: u8 },
     DateIso,
     DateUs,
+    DateUsShort,
 }
 
 /// Locale-free `TEXT` codes. `#` is the optional integer digit the sample
@@ -4234,6 +4565,7 @@ fn text_format(code: &str) -> Option<TextFormat> {
         "0.00%" => Some(TextFormat::Percent { decimals: 2 }),
         "yyyy-mm-dd" => Some(TextFormat::DateIso),
         "mm/dd/yyyy" => Some(TextFormat::DateUs),
+        "mm/dd/yy" => Some(TextFormat::DateUsShort),
         _ => None,
     }
 }
@@ -4260,7 +4592,9 @@ fn format_text_value(value: &Value, format: &str) -> Result<String, CalcError> {
         TextFormat::Percent { decimals } => {
             format_scaled(number * 100.0, i32::from(decimals), false, false, "%")
         }
-        TextFormat::DateIso | TextFormat::DateUs => format_text_date(number, format),
+        TextFormat::DateIso | TextFormat::DateUs | TextFormat::DateUsShort => {
+            format_text_date(number, format)
+        }
     }
 }
 
@@ -4269,6 +4603,12 @@ fn format_text_date(number: f64, format: TextFormat) -> Result<String, CalcError
     let date = serial_date::civil_from_serial(serial)?;
     Ok(match format {
         TextFormat::DateIso => format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
+        TextFormat::DateUsShort => format!(
+            "{:02}/{:02}/{:02}",
+            date.month,
+            date.day,
+            date.year.rem_euclid(100)
+        ),
         _ => format!("{:02}/{:02}/{:04}", date.month, date.day, date.year),
     })
 }
@@ -4655,6 +4995,65 @@ fn count_nodes<R>(expression: &Expr<R>) -> usize {
     }
 }
 
+/// Cells named only as an `OFFSET` starting address. They are not values the
+/// formula reads (`OFFSET(N41,2,0)` reads N43), but the compiled reference
+/// still needs an index entry.
+fn collect_offset_anchors(expression: &Expr, anchors: &mut BTreeSet<CellId>) {
+    match expression {
+        Expr::Function(Function::Offset, arguments) => {
+            if let Some(Expr::Reference(cell)) = arguments.first() {
+                anchors.insert(*cell);
+            } else if let Some(origin) = arguments.first() {
+                collect_offset_anchors(origin, anchors);
+            }
+            for argument in arguments.iter().skip(1) {
+                collect_offset_anchors(argument, anchors);
+            }
+        }
+        Expr::UnaryMinus(inner) | Expr::Percent(inner) => collect_offset_anchors(inner, anchors),
+        Expr::Binary(_, left, right) => {
+            collect_offset_anchors(left, anchors);
+            collect_offset_anchors(right, anchors);
+        }
+        Expr::Function(_, arguments) => {
+            for argument in arguments {
+                collect_offset_anchors(argument, anchors);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_span_envelopes(expression: &Expr, ranges: &mut Vec<RangeKey>) {
+    match expression {
+        Expr::Function(Function::ReferenceSpan, arguments) => {
+            if let Some(Expr::Range {
+                anchor,
+                members,
+                rows,
+                columns,
+            }) = arguments.get(2)
+            {
+                ranges.push(range_key(*anchor, members.clone(), *rows, *columns));
+            }
+            for argument in arguments.iter().take(2) {
+                collect_span_envelopes(argument, ranges);
+            }
+        }
+        Expr::UnaryMinus(inner) | Expr::Percent(inner) => collect_span_envelopes(inner, ranges),
+        Expr::Binary(_, left, right) => {
+            collect_span_envelopes(left, ranges);
+            collect_span_envelopes(right, ranges);
+        }
+        Expr::Function(_, arguments) => {
+            for argument in arguments {
+                collect_span_envelopes(argument, ranges);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_dependencies(
     expression: &Expr,
     cells: &mut BTreeSet<CellId>,
@@ -4677,6 +5076,30 @@ fn collect_dependencies(
             rows,
             columns,
         } => ranges.push(range_key(*anchor, members.clone(), *rows, *columns)),
+        Expr::Function(Function::Offset, arguments) => {
+            // The starting address is not a value. A reference there is
+            // recorded by `collect_offset_anchors` so it can be compiled.
+            // A range address still contributes its rectangle: the shifted
+            // result is what evaluation reads, and a literal shift has
+            // already been lowered to that rectangle.
+            if let Some(origin) = arguments.first()
+                && !matches!(origin, Expr::Reference(_))
+            {
+                collect_dependencies(origin, cells, ranges);
+            }
+            for argument in arguments.iter().skip(1) {
+                collect_dependencies(argument, cells, ranges);
+            }
+        }
+        Expr::Function(Function::ReferenceSpan, arguments) => {
+            // The third argument is the compile-time envelope, often a whole
+            // column. The formula reads the rectangle between the endpoints.
+            // Depending on that column makes a LINEST sitting above the data
+            // look circular.
+            for argument in arguments.iter().take(2) {
+                collect_dependencies(argument, cells, ranges);
+            }
+        }
         Expr::Function(_, arguments) => {
             for argument in arguments {
                 collect_dependencies(argument, cells, ranges);
@@ -4692,6 +5115,13 @@ fn collect_dependencies(
         | Expr::External(_)
         | Expr::ExternalRange { .. } => {}
     }
+}
+
+enum ExternalEndpoint {
+    Deleted,
+    Cell(CellId),
+    Columns { start: u32, end: u32 },
+    Rows { start: u32, end: u32 },
 }
 
 /// One external cell addressed by link index or workbook file name.
@@ -4721,6 +5151,10 @@ struct ExternalCache {
     /// A missing cell on one of these sheets is blank; an unknown sheet is `#REF!`.
     sheets_by_index: HashSet<(u32, String)>,
     sheets_by_file: HashSet<(String, String)>,
+    /// A refresh of this sheet failed. Cached cells are still used. A cell the
+    /// part does not list is `#REF!`, not a blank.
+    broken_by_index: HashSet<(u32, String)>,
+    broken_by_file: HashSet<(String, String)>,
 }
 
 impl ExternalCache {
@@ -4759,6 +5193,29 @@ impl ExternalCache {
         }
     }
 
+    fn note_broken_sheet(&mut self, link_index: u32, book_file: Option<&str>, sheet: &str) {
+        self.note_sheet(link_index, book_file, sheet);
+        let sheet = sheet.trim().to_lowercase();
+        if sheet.is_empty() {
+            return;
+        }
+        self.broken_by_index.insert((link_index, sheet.clone()));
+        if let Some(file) = book_file {
+            let file = external_file_key(file);
+            if !file.is_empty() {
+                self.broken_by_file.insert((file, sheet));
+            }
+        }
+    }
+
+    fn refresh_failed(&self, book: &ExternalBook, sheet: &str) -> bool {
+        let sheet = sheet.trim().to_lowercase();
+        match book {
+            ExternalBook::Index(index) => self.broken_by_index.contains(&(*index, sheet)),
+            ExternalBook::File(file) => self.broken_by_file.contains(&(file.clone(), sheet)),
+        }
+    }
+
     fn knows_sheet(&self, book: &ExternalBook, sheet: &str) -> bool {
         let sheet = sheet.trim().to_lowercase();
         match book {
@@ -4772,6 +5229,31 @@ impl ExternalCache {
         match book {
             ExternalBook::Index(index) => self.by_index.get(&(*index, sheet, row, column)),
             ExternalBook::File(file) => self.by_file.get(&(file.clone(), sheet, row, column)),
+        }
+    }
+
+    fn for_each_cell(
+        &self,
+        book: &ExternalBook,
+        sheet: &str,
+        mut visit: impl FnMut(u32, u32, &Value),
+    ) {
+        let sheet = sheet.trim().to_lowercase();
+        match book {
+            ExternalBook::Index(index) => {
+                for ((link, name, row, column), value) in &self.by_index {
+                    if link == index && name == &sheet {
+                        visit(*row, *column, value);
+                    }
+                }
+            }
+            ExternalBook::File(file) => {
+                for ((name_file, name, row, column), value) in &self.by_file {
+                    if name_file == file && name == &sheet {
+                        visit(*row, *column, value);
+                    }
+                }
+            }
         }
     }
 }
@@ -4863,10 +5345,7 @@ fn external_rectangle(
     let column_end = first.column.max(second.column);
     let rows = (row_end - row_start + 1) as usize;
     let columns = (column_end - column_start + 1) as usize;
-    let count = rows
-        .checked_mul(columns)
-        .ok_or(FormulaError::RangeTooLarge)?;
-    if count > MAX_RANGE_CELLS {
+    if rows.checked_mul(columns).is_none() {
         return Err(FormulaError::RangeTooLarge);
     }
     if rows == 1 && columns == 1 {
@@ -4889,11 +5368,28 @@ fn external_rectangle(
     })
 }
 
+fn cached_external_value(
+    cache: &ExternalCache,
+    book: &ExternalBook,
+    sheet: &str,
+    row: u32,
+    column: u32,
+) -> Value {
+    match cache.get(book, sheet, row, column) {
+        Some(value) => value.clone(),
+        None if cache.refresh_failed(book, sheet) => Value::Error(CalcError::InvalidReference),
+        None => Value::Blank,
+    }
+}
+
 fn lower_external_scalar(cache: &ExternalCache, address: &ExternalAddress) -> Expr {
     match cache.get(&address.book, &address.sheet, address.row, address.column) {
         Some(value) => value_to_expr(value.clone()),
         // The sheet is real and this cell was simply empty. A formula that
         // returns that blank shows 0, matching Excel. An unknown sheet is `#REF!`.
+        None if cache.refresh_failed(&address.book, &address.sheet) => {
+            Expr::Error(CalcError::InvalidReference)
+        }
         None if cache.knows_sheet(&address.book, &address.sheet) => Expr::Empty,
         None => Expr::Error(CalcError::InvalidReference),
     }
@@ -4904,27 +5400,70 @@ fn lower_external_range(
     anchor: &ExternalAddress,
     rows: usize,
     columns: usize,
-) -> Expr {
-    let mut values = Vec::with_capacity(rows * columns);
-    for row in 0..rows {
-        for column in 0..columns {
-            let value = cache
-                .get(
+) -> Result<Expr, FormulaError> {
+    let count = rows.saturating_mul(columns);
+    if count <= DENSE_RANGE_CELLS {
+        let mut values = Vec::with_capacity(count);
+        for row in 0..rows {
+            for column in 0..columns {
+                let value = cached_external_value(
+                    cache,
                     &anchor.book,
                     &anchor.sheet,
                     anchor.row + row as u32,
                     anchor.column + column as u32,
-                )
-                .cloned()
-                .unwrap_or(Value::Blank);
-            values.push(value);
+                );
+                values.push(value);
+            }
         }
+        return Ok(Expr::Array(ArrayValue {
+            rows,
+            columns,
+            values,
+        }));
     }
-    Expr::Array(ArrayValue {
-        rows,
+    // A whole column or row. Keep Excel's row and column indexes when the
+    // cached cells fit in a rectangle from the anchor through the last
+    // occupied row. A sheet the link does not know is `#REF!`. A box that
+    // still does not fit stays uncompiled rather than a wrong index.
+    if !cache.knows_sheet(&anchor.book, &anchor.sheet) {
+        return Ok(Expr::Error(CalcError::InvalidReference));
+    }
+    let last_row = anchor.row + rows as u32 - 1;
+    let last_column = anchor.column + columns as u32 - 1;
+    let mut occupied = Vec::new();
+    cache.for_each_cell(&anchor.book, &anchor.sheet, |row, column, value| {
+        if row >= anchor.row && row <= last_row && column >= anchor.column && column <= last_column
+        {
+            occupied.push((row, column, value.clone()));
+        }
+    });
+    if occupied.is_empty() {
+        return Ok(Expr::Array(ArrayValue {
+            rows: 1,
+            columns: 1,
+            values: vec![Value::Blank],
+        }));
+    }
+    let max_row = occupied
+        .iter()
+        .map(|(row, _, _)| *row)
+        .max()
+        .unwrap_or(anchor.row);
+    let height = (max_row - anchor.row + 1) as usize;
+    if height.saturating_mul(columns) > DENSE_RANGE_CELLS {
+        return Err(FormulaError::RangeTooLarge);
+    }
+    let mut values = vec![Value::Blank; height * columns];
+    for (row, column, value) in occupied {
+        let index = (row - anchor.row) as usize * columns + (column - anchor.column) as usize;
+        values[index] = value;
+    }
+    Ok(Expr::Array(ArrayValue {
+        rows: height,
         columns,
         values,
-    })
+    }))
 }
 
 fn lower_external_expressions(
@@ -4937,7 +5476,7 @@ fn lower_external_expressions(
             anchor,
             rows,
             columns,
-        } => lower_external_range(cache, &anchor, rows, columns),
+        } => return lower_external_range(cache, &anchor, rows, columns),
         Expr::UnaryMinus(inner) => {
             Expr::UnaryMinus(Box::new(lower_external_expressions(*inner, cache)?))
         }
@@ -5197,14 +5736,13 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             Some(b'{') => self.parse_array_constant(),
             Some(b'\'') => self.parse_quoted_sheet_reference(),
             Some(b'#') => self.parse_error_literal(),
-            Some(b'[')
-                if self.structured.current_table.is_some()
-                    && (self.remaining().starts_with("[@")
-                        || self.remaining().starts_with("[[")) =>
-            {
+            Some(b'[') if self.looks_like_structured_reference() => {
                 self.parse_structured_reference(None)
             }
             Some(b'[') => self.parse_external_reference(),
+            Some(byte) if byte.is_ascii_digit() && self.starts_row_range() => {
+                self.parse_row_range()
+            }
             Some(byte) if byte.is_ascii_digit() || byte == b'.' => self.parse_number(),
             Some(byte) if byte.is_ascii_alphabetic() || byte == b'$' || byte == b'_' => {
                 self.parse_reference_or_function()
@@ -5359,6 +5897,15 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         }
         let token = &self.source[start..self.offset];
         self.skip_space();
+        if self.peek() == Some(b':')
+            && (column_number(token).is_some() || row_number(token).is_some())
+            && self
+                .defined_names
+                .resolve(self.sheet, &token.trim_start_matches('$').to_lowercase())
+                .is_none()
+        {
+            return self.parse_whole_axis(token, self.sheet);
+        }
         if self.peek() == Some(b'!') {
             let sheet = self.resolve_sheet(token)?;
             self.offset += 1;
@@ -5413,6 +5960,50 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         inner
             .parse()
             .map_err(|_| FormulaError::UnsupportedName(name.into()))
+    }
+
+    /// Inside a table, `[Amount]`, `[@Amount]` and `[[#This Row],[Amount]]`
+    /// are structured references. `[1]Sheet!A1` stays an external reference.
+    fn looks_like_structured_reference(&self) -> bool {
+        if self.structured.current_table.is_none() {
+            return false;
+        }
+        let text = self.remaining();
+        let mut depth = 0_i32;
+        let mut end = None;
+        for (index, byte) in text.bytes().enumerate() {
+            match byte {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            return false;
+        };
+        let after = text[end + 1..].trim_start();
+        if after.starts_with('!') {
+            return false;
+        }
+        let head_end = after
+            .find([
+                '!', '(', ')', ',', ';', '+', '-', '*', '/', '^', '&', '%', '=', '<', '>', ' ',
+            ])
+            .unwrap_or(after.len());
+        let head = &after[..head_end];
+        if !head.is_empty() && after[..head_end].contains('!') {
+            return false;
+        }
+        if !head.is_empty() && after[head_end..].starts_with('!') {
+            return false;
+        }
+        true
     }
 
     fn parse_structured_reference(
@@ -5498,21 +6089,112 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
     /// `[n]Sheet!A1`, `[Book.xlsx]Sheet!A1`, and the same forms with a range
     /// endpoint. The cached value is copied now; a missing single cell is
     /// `#REF!` and a missing cell inside a range is blank.
+    /// `A:A` and `$A:$C` cover every row. `1:1` is parsed from `parse_primary`.
+    /// Any in-grid width is legal; the rectangle is not copied cell by cell.
+    fn parse_whole_axis(&mut self, first: &str, sheet: u32) -> Result<Expr, FormulaError> {
+        self.offset += 1;
+        self.skip_space();
+        let start = self.offset;
+        if self.peek() == Some(b'$') {
+            self.offset += 1;
+        }
+        let body = self.offset;
+        let column = column_number(first).is_some();
+        while self.peek().is_some_and(|byte| {
+            if column {
+                byte.is_ascii_alphabetic()
+            } else {
+                byte.is_ascii_digit()
+            }
+        }) {
+            self.offset += 1;
+        }
+        if self.offset == body {
+            return Err(FormulaError::InvalidReference(
+                self.source[start..].chars().take(32).collect(),
+            ));
+        }
+        let second = &self.source[body..self.offset];
+        if column {
+            let left =
+                column_number(first).ok_or_else(|| FormulaError::InvalidReference(first.into()))?;
+            let right = column_number(second)
+                .ok_or_else(|| FormulaError::InvalidReference(second.into()))?;
+            let start_column = left.min(right);
+            let columns = (left.max(right) - start_column + 1) as usize;
+            expand_range(
+                CellId::new(sheet, 0, start_column),
+                CellId::new(sheet, MAX_ROWS - 1, start_column + columns as u32 - 1),
+            )
+        } else {
+            let top =
+                row_number(first).ok_or_else(|| FormulaError::InvalidReference(first.into()))?;
+            let bottom =
+                row_number(second).ok_or_else(|| FormulaError::InvalidReference(second.into()))?;
+            expand_range(
+                CellId::new(sheet, top.min(bottom), 0),
+                CellId::new(sheet, top.max(bottom), MAX_COLUMNS - 1),
+            )
+        }
+    }
+
+    fn starts_row_range(&self) -> bool {
+        let bytes = self.remaining().as_bytes();
+        let mut index = 0;
+        if bytes.first() == Some(&b'$') {
+            index = 1;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == start || index >= bytes.len() || bytes[index] != b':' {
+            return false;
+        }
+        index += 1;
+        if index < bytes.len() && bytes[index] == b'$' {
+            index += 1;
+        }
+        let row = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        index > row
+    }
+
+    fn parse_row_range(&mut self) -> Result<Expr, FormulaError> {
+        let start = self.offset;
+        if self.peek() == Some(b'$') {
+            self.offset += 1;
+        }
+        let first = self.offset;
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.offset += 1;
+        }
+        let top = row_number(&self.source[first..self.offset]).ok_or_else(|| {
+            FormulaError::InvalidReference(self.source[start..].chars().take(32).collect())
+        })?;
+        self.offset += 1;
+        if self.peek() == Some(b'$') {
+            self.offset += 1;
+        }
+        let second = self.offset;
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.offset += 1;
+        }
+        let bottom = row_number(&self.source[second..self.offset]).ok_or_else(|| {
+            FormulaError::InvalidReference(self.source[start..].chars().take(32).collect())
+        })?;
+        expand_range(
+            CellId::new(self.sheet, top.min(bottom), 0),
+            CellId::new(self.sheet, top.max(bottom), MAX_COLUMNS - 1),
+        )
+    }
+
     fn parse_external_reference(&mut self) -> Result<Expr, FormulaError> {
         let start = self.offset;
-        let (book, sheet, cell) = self.parse_bare_external_address(start)?;
-        let Some(cell) = cell else {
-            return Ok(Expr::Error(CalcError::InvalidReference));
-        };
-        self.finish_external_span(
-            ExternalAddress {
-                book,
-                sheet,
-                row: cell.row,
-                column: cell.column,
-            },
-            start,
-        )
+        let (book, sheet, endpoint) = self.parse_bare_external_address(start)?;
+        self.external_from_endpoint(book, sheet, endpoint, start)
     }
 
     fn parse_external_cell_and_span(
@@ -5521,24 +6203,63 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         sheet: String,
         start: usize,
     ) -> Result<Expr, FormulaError> {
-        let Some(cell) = self.parse_external_a1()? else {
-            return Ok(Expr::Error(CalcError::InvalidReference));
-        };
-        self.finish_external_span(
-            ExternalAddress {
-                book,
-                sheet,
-                row: cell.row,
-                column: cell.column,
-            },
-            start,
-        )
+        let endpoint = self.parse_external_endpoint()?;
+        self.external_from_endpoint(book, sheet, endpoint, start)
+    }
+
+    fn external_from_endpoint(
+        &mut self,
+        book: ExternalBook,
+        sheet: String,
+        endpoint: ExternalEndpoint,
+        start: usize,
+    ) -> Result<Expr, FormulaError> {
+        match endpoint {
+            ExternalEndpoint::Deleted => Ok(Expr::Error(CalcError::InvalidReference)),
+            ExternalEndpoint::Cell(cell) => self.finish_external_span(
+                ExternalAddress {
+                    book,
+                    sheet,
+                    row: cell.row,
+                    column: cell.column,
+                },
+                start,
+            ),
+            ExternalEndpoint::Columns { start: first, end } => external_rectangle(
+                &ExternalAddress {
+                    book: book.clone(),
+                    sheet: sheet.clone(),
+                    row: 0,
+                    column: first.min(end),
+                },
+                &ExternalAddress {
+                    book,
+                    sheet,
+                    row: MAX_ROWS - 1,
+                    column: first.max(end),
+                },
+            ),
+            ExternalEndpoint::Rows { start: first, end } => external_rectangle(
+                &ExternalAddress {
+                    book: book.clone(),
+                    sheet: sheet.clone(),
+                    row: first.min(end),
+                    column: 0,
+                },
+                &ExternalAddress {
+                    book,
+                    sheet,
+                    row: first.max(end),
+                    column: MAX_COLUMNS - 1,
+                },
+            ),
+        }
     }
 
     fn parse_bare_external_address(
         &mut self,
         start: usize,
-    ) -> Result<(ExternalBook, String, Option<CellId>), FormulaError> {
+    ) -> Result<(ExternalBook, String, ExternalEndpoint), FormulaError> {
         if self.peek() != Some(b'[') {
             return Err(self.external_error_at(start));
         }
@@ -5575,14 +6296,14 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             return Err(self.external_error_at(start));
         }
         self.offset += 1;
-        let cell = self.parse_external_a1()?;
-        Ok((book, sheet, cell))
+        let endpoint = self.parse_external_endpoint()?;
+        Ok((book, sheet, endpoint))
     }
 
     fn parse_quoted_external_address(
         &mut self,
         start: usize,
-    ) -> Result<(ExternalBook, String, Option<CellId>), FormulaError> {
+    ) -> Result<(ExternalBook, String, ExternalEndpoint), FormulaError> {
         if self.peek() != Some(b'\'') {
             return Err(self.external_error_at(start));
         }
@@ -5598,18 +6319,18 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             Some(Ok(pair)) => pair,
             _ => return Err(self.external_error_at(start)),
         };
-        let cell = self.parse_external_a1()?;
-        Ok((book, sheet, cell))
+        let endpoint = self.parse_external_endpoint()?;
+        Ok((book, sheet, endpoint))
     }
 
-    /// `None` is a deleted `#REF!` endpoint. Anything that is not an A1 cell
-    /// (an external defined name, a whole column) stays a parse error.
-    fn parse_external_a1(&mut self) -> Result<Option<CellId>, FormulaError> {
+    /// A deleted `#REF!` endpoint, an A1 cell, or a whole column or row
+    /// (`$A:$IV`, `1:12`). An external defined name stays a parse error.
+    fn parse_external_endpoint(&mut self) -> Result<ExternalEndpoint, FormulaError> {
         self.skip_space();
         let start = self.offset;
         if self.remaining().starts_with("#REF!") {
             self.offset += "#REF!".len();
-            return Ok(None);
+            return Ok(ExternalEndpoint::Deleted);
         }
         while matches!(self.peek(), Some(byte) if byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'_' | b'.'))
         {
@@ -5619,8 +6340,47 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             return Err(self.external_error_at(start));
         }
         let token = &self.source[start..self.offset];
+        self.skip_space();
+        if self.peek() == Some(b':')
+            && (column_number(token).is_some() || row_number(token).is_some())
+        {
+            self.offset += 1;
+            self.skip_space();
+            if self.peek() == Some(b'$') {
+                self.offset += 1;
+            }
+            let second_start = self.offset;
+            let column = column_number(token).is_some();
+            while self.peek().is_some_and(|byte| {
+                if column {
+                    byte.is_ascii_alphabetic()
+                } else {
+                    byte.is_ascii_digit()
+                }
+            }) {
+                self.offset += 1;
+            }
+            if self.offset == second_start {
+                return Err(self.external_error_at(start));
+            }
+            let second = &self.source[second_start..self.offset];
+            if column {
+                let left = column_number(token).ok_or_else(|| self.external_error_at(start))?;
+                let right = column_number(second).ok_or_else(|| self.external_error_at(start))?;
+                return Ok(ExternalEndpoint::Columns {
+                    start: left,
+                    end: right,
+                });
+            }
+            let top = row_number(token).ok_or_else(|| self.external_error_at(start))?;
+            let bottom = row_number(second).ok_or_else(|| self.external_error_at(start))?;
+            return Ok(ExternalEndpoint::Rows {
+                start: top,
+                end: bottom,
+            });
+        }
         match parse_a1(token, 0) {
-            Ok(cell) => Ok(Some(cell)),
+            Ok(cell) => Ok(ExternalEndpoint::Cell(cell)),
             Err(_) => Err(FormulaError::ExternalReference(
                 token.chars().take(64).collect(),
             )),
@@ -5643,8 +6403,8 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             return Ok(Expr::Error(CalcError::InvalidReference));
         }
         let second = if self.peek() == Some(b'[') {
-            let (book, sheet, cell) = self.parse_bare_external_address(start)?;
-            let Some(cell) = cell else {
+            let (book, sheet, endpoint) = self.parse_bare_external_address(start)?;
+            let ExternalEndpoint::Cell(cell) = endpoint else {
                 return Ok(Expr::Error(CalcError::InvalidReference));
             };
             ExternalAddress {
@@ -5654,8 +6414,8 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
                 column: cell.column,
             }
         } else if self.peek() == Some(b'\'') {
-            let (book, sheet, cell) = self.parse_quoted_external_address(start)?;
-            let Some(cell) = cell else {
+            let (book, sheet, endpoint) = self.parse_quoted_external_address(start)?;
+            let ExternalEndpoint::Cell(cell) = endpoint else {
                 return Ok(Expr::Error(CalcError::InvalidReference));
             };
             ExternalAddress {
@@ -5667,7 +6427,7 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         } else if matches!(self.peek(), Some(b'$'))
             || self.peek().is_some_and(|byte| byte.is_ascii_alphabetic())
         {
-            let Some(cell) = self.parse_external_a1()? else {
+            let ExternalEndpoint::Cell(cell) = self.parse_external_endpoint()? else {
                 return Ok(Expr::Error(CalcError::InvalidReference));
             };
             ExternalAddress {
@@ -5703,6 +6463,16 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             self.offset += 1;
         }
         let token = &self.source[start..self.offset];
+        self.skip_space();
+        if self.peek() == Some(b':')
+            && (column_number(token).is_some() || row_number(token).is_some())
+            && self
+                .defined_names
+                .resolve(sheet, &token.trim_start_matches('$').to_lowercase())
+                .is_none()
+        {
+            return self.parse_whole_axis(token, sheet);
+        }
         match parse_a1(token, sheet) {
             Ok(first) => Ok(Expr::Reference(first)),
             Err(_)
@@ -5762,23 +6532,18 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         }
     }
 
-    /// A string literal becomes the reference it names. A single cell stays
-    /// dynamic so editing its text rebinds. Anything else is `#REF!`.
+    /// A string literal becomes the reference it names. Any other argument
+    /// stays dynamic: Excel evaluates it and resolves the text, including
+    /// `INDIRECT(CONCATENATE(...))`. R1C1 and 3D text are still `#REF!`.
     fn lower_indirect(&self, arguments: Vec<Expr>) -> Expr {
         if arguments.len() != 1 {
             return Expr::Function(Function::Indirect, arguments);
         }
-        let kind = match &arguments[0] {
-            Expr::Text(text) => Some(Err(text.clone())),
-            Expr::Reference(_) => None,
-            Expr::Error(error) => Some(Ok(error.clone())),
-            _ => Some(Ok(CalcError::InvalidReference)),
-        };
-        match kind {
-            Some(Err(text)) => hard::resolve_a1_reference(&text, self.sheet, self.sheet_names)
+        match &arguments[0] {
+            Expr::Text(text) => hard::resolve_a1_reference(text, self.sheet, self.sheet_names)
                 .unwrap_or(Expr::Error(CalcError::InvalidReference)),
-            None => Expr::Function(Function::Indirect, arguments),
-            Some(Ok(error)) => Expr::Error(error),
+            Expr::Error(error) => Expr::Error(error.clone()),
+            _ => Expr::Function(Function::Indirect, arguments),
         }
     }
 
@@ -5982,6 +6747,14 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("RANDBETWEEN", Function::RandBetween),
     ("OFFSET", Function::Offset),
     ("INDIRECT", Function::Indirect),
+    ("DATEVALUE", Function::DateValue),
+    ("ROWS", Function::Rows),
+    ("CELL", Function::Cell),
+    ("LINEST", Function::Linest),
+    ("FILTER", Function::Filter),
+    ("UNIQUE", Function::Unique),
+    ("SORT", Function::Sort),
+    ("GETPIVOTDATA", Function::GetPivotData),
 ];
 
 /// The supported function names in registry order.
@@ -6000,86 +6773,58 @@ fn parse_function_name(name: &str) -> Result<Function, FormulaError> {
         .ok_or(FormulaError::UnsupportedFunction(upper))
 }
 
+#[derive(Clone, Copy, Default)]
+struct RowSpec {
+    all: bool,
+    headers: bool,
+    data: bool,
+    totals: bool,
+    this_row: bool,
+}
+
+enum ColumnSpec {
+    All,
+    One(String),
+    Span(String, String),
+}
+
 fn structured_expression(
     table: &StructuredTable,
     selector: &str,
     current_row: Option<u32>,
 ) -> Result<Expr, FormulaError> {
-    #[derive(Clone, Copy)]
-    enum Rows {
-        Data,
-        Headers,
-        All,
-        Current,
-    }
-
     let invalid = || FormulaError::InvalidStructuredReference(selector.into());
-    let inner = selector
-        .strip_prefix('[')
-        .and_then(|text| text.strip_suffix(']'))
-        .ok_or_else(invalid)?;
-    let (rows, first_name, last_name) = if let Some(current) = inner.strip_prefix('@') {
-        (Rows::Current, current, current)
-    } else if let Some(compound) = inner
-        .strip_prefix('[')
-        .and_then(|text| text.strip_suffix(']'))
-    {
-        if let Some((kind, columns)) = compound.split_once("],[") {
-            let rows = match kind.to_ascii_lowercase().as_str() {
-                "#headers" => Rows::Headers,
-                "#data" => Rows::Data,
-                "#all" => Rows::All,
-                _ => return Err(invalid()),
-            };
-            let (first, last) = columns
-                .split_once("]:[")
-                .map_or((columns, columns), |(first, last)| (first, last));
-            (rows, first, last)
-        } else {
-            let (first, last) = compound.split_once("]:[").ok_or_else(invalid)?;
-            (Rows::Data, first, last)
-        }
-    } else {
-        (Rows::Data, inner, inner)
+    let spec = parse_structured_selector(selector).map_err(|_| invalid())?;
+    let columns = resolve_structured_columns(table, &spec.columns)?;
+    let selected_rows = match structured_rows(table, spec.rows, current_row) {
+        Ok(rows) => rows,
+        Err(StructuredRows::Invalid) => return Err(invalid()),
+        // Microsoft: #This Row on a header or totals row is #VALUE!.
+        Err(StructuredRows::Value) => return Ok(Expr::Error(CalcError::InvalidValue)),
+        // Microsoft: #Totals or #Headers when that row does not exist is null.
+        Err(StructuredRows::Null) => return Ok(Expr::Error(CalcError::NullIntersection)),
     };
-
-    if first_name.is_empty() || last_name.is_empty() {
-        return Err(invalid());
-    }
-    let find_column = |name: &str| {
-        table
-            .columns
-            .iter()
-            .position(|column| column.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| FormulaError::UnknownTableColumn {
-                table: table.name.clone(),
-                column: name.into(),
-            })
-    };
-    let first = find_column(first_name)?;
-    let last = find_column(last_name)?;
-    if first > last {
-        return Err(invalid());
-    }
-    let columns = &table.columns[first..=last];
-    let selected_rows: Vec<u32> = match rows {
-        Rows::Data => table.rows.clone(),
-        Rows::Headers => vec![table.header_row.ok_or_else(invalid)?],
-        Rows::All => table
-            .header_row
-            .into_iter()
-            .chain(table.rows.iter().copied())
-            .collect(),
-        Rows::Current => {
-            let row = current_row.ok_or_else(invalid)?;
-            if !table.rows.contains(&row) {
-                return Err(invalid());
-            }
-            vec![row]
-        }
-    };
-    if selected_rows.is_empty() {
+    if selected_rows.is_empty() || columns.is_empty() {
         return Ok(Expr::Empty);
+    }
+    let rows_contiguous = selected_rows.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    let columns_contiguous = columns
+        .windows(2)
+        .all(|pair| pair[1].column == pair[0].column + 1);
+    if selected_rows.len() == 1 && columns.len() == 1 {
+        return Ok(Expr::Reference(CellId::new(
+            table.sheet,
+            selected_rows[0],
+            columns[0].column,
+        )));
+    }
+    if rows_contiguous && columns_contiguous {
+        return Ok(Expr::Range {
+            anchor: CellId::new(table.sheet, selected_rows[0], columns[0].column),
+            members: None,
+            rows: selected_rows.len(),
+            columns: columns.len(),
+        });
     }
     let members: Vec<CellId> = selected_rows
         .iter()
@@ -6089,9 +6834,6 @@ fn structured_expression(
                 .map(move |column| CellId::new(table.sheet, *row, column.column))
         })
         .collect();
-    if members.len() == 1 {
-        return Ok(Expr::Reference(members[0]));
-    }
     if members.len() > MAX_RANGE_CELLS {
         return Err(FormulaError::RangeTooLarge);
     }
@@ -6101,6 +6843,266 @@ fn structured_expression(
         rows: selected_rows.len(),
         columns: columns.len(),
     })
+}
+
+struct StructuredSelector {
+    rows: RowSpec,
+    columns: ColumnSpec,
+}
+
+fn parse_structured_selector(selector: &str) -> Result<StructuredSelector, ()> {
+    let inner = selector
+        .strip_prefix('[')
+        .and_then(|text| text.strip_suffix(']'))
+        .ok_or(())?;
+    let inner = inner.trim();
+    if let Some(rest) = inner.strip_prefix('@') {
+        return Ok(StructuredSelector {
+            rows: RowSpec {
+                this_row: true,
+                ..RowSpec::default()
+            },
+            columns: parse_column_spec(rest.trim())?,
+        });
+    }
+    if !inner.starts_with('[') {
+        if let Some(rows) = row_keyword(inner) {
+            return Ok(StructuredSelector {
+                rows,
+                columns: ColumnSpec::All,
+            });
+        }
+        return Ok(StructuredSelector {
+            rows: RowSpec {
+                data: true,
+                ..RowSpec::default()
+            },
+            columns: ColumnSpec::One(unescape_column(inner)),
+        });
+    }
+    let mut rows = RowSpec::default();
+    let mut columns = None;
+    for part in split_structured_parts(inner)? {
+        let part = part.trim();
+        if let Some(keyword) = row_keyword_token(part) {
+            merge_row_spec(&mut rows, keyword);
+            continue;
+        }
+        if columns.is_some() {
+            return Err(());
+        }
+        columns = Some(parse_column_spec(part)?);
+    }
+    if !rows.all && !rows.headers && !rows.data && !rows.totals && !rows.this_row {
+        rows.data = true;
+    }
+    Ok(StructuredSelector {
+        rows,
+        columns: columns.unwrap_or(ColumnSpec::All),
+    })
+}
+
+fn merge_row_spec(rows: &mut RowSpec, keyword: RowSpec) {
+    rows.all |= keyword.all;
+    rows.headers |= keyword.headers;
+    rows.data |= keyword.data;
+    rows.totals |= keyword.totals;
+    rows.this_row |= keyword.this_row;
+}
+
+fn row_keyword(text: &str) -> Option<RowSpec> {
+    let mut spec = RowSpec::default();
+    match text.trim().to_ascii_lowercase().as_str() {
+        "#all" => spec.all = true,
+        "#data" => spec.data = true,
+        "#headers" => spec.headers = true,
+        "#totals" => spec.totals = true,
+        "#this row" => spec.this_row = true,
+        _ => return None,
+    }
+    Some(spec)
+}
+
+fn row_keyword_token(text: &str) -> Option<RowSpec> {
+    let text = text.trim();
+    let bare = text
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(text);
+    row_keyword(bare)
+}
+
+fn split_structured_parts(inner: &str) -> Result<Vec<&str>, ()> {
+    let mut parts = Vec::new();
+    let mut depth = 0_i32;
+    let mut start = 0;
+    for (index, character) in inner.char_indices() {
+        match character {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(());
+                }
+            }
+            ',' if depth == 0 => {
+                parts.push(&inner[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(());
+    }
+    parts.push(&inner[start..]);
+    if parts.iter().any(|part| part.trim().is_empty()) {
+        return Err(());
+    }
+    Ok(parts)
+}
+
+fn parse_column_spec(text: &str) -> Result<ColumnSpec, ()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(());
+    }
+    if let Some((left, right)) = text.split_once("]:[") {
+        let left = left.strip_prefix('[').ok_or(())?;
+        let right = right.strip_suffix(']').ok_or(())?;
+        if left.is_empty() || right.is_empty() {
+            return Err(());
+        }
+        return Ok(ColumnSpec::Span(
+            unescape_column(left),
+            unescape_column(right),
+        ));
+    }
+    Ok(ColumnSpec::One(unescape_column(text)))
+}
+
+/// Excel escapes `#`, `'`, `[`, `]` and `@` in a column name with a leading
+/// apostrophe. A surrounding pair of brackets is the specifier, not the name.
+fn unescape_column(name: &str) -> String {
+    let name = name.trim();
+    let name = name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(name);
+    let mut output = String::with_capacity(name.len());
+    let mut chars = name.chars();
+    while let Some(character) = chars.next() {
+        if character == '\'' {
+            if let Some(escaped) = chars.next() {
+                output.push(escaped);
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn resolve_structured_columns<'a>(
+    table: &'a StructuredTable,
+    spec: &ColumnSpec,
+) -> Result<Vec<&'a StructuredColumn>, FormulaError> {
+    let find = |name: &str| {
+        table
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| FormulaError::UnknownTableColumn {
+                table: table.name.clone(),
+                column: name.into(),
+            })
+    };
+    match spec {
+        ColumnSpec::All => Ok(table.columns.iter().collect()),
+        ColumnSpec::One(name) => Ok(vec![&table.columns[find(name)?]]),
+        ColumnSpec::Span(first, last) => {
+            let start = find(first)?;
+            let end = find(last)?;
+            if start > end {
+                return Err(FormulaError::InvalidStructuredReference(format!(
+                    "[{first}]:[{last}]"
+                )));
+            }
+            Ok(table.columns[start..=end].iter().collect())
+        }
+    }
+}
+
+enum StructuredRows {
+    Invalid,
+    Value,
+    Null,
+}
+
+fn structured_rows(
+    table: &StructuredTable,
+    spec: RowSpec,
+    current_row: Option<u32>,
+) -> Result<Vec<u32>, StructuredRows> {
+    // Microsoft: #This Row and @ cannot be combined with other item specifiers.
+    if spec.this_row && (spec.all || spec.headers || spec.data || spec.totals) {
+        return Err(StructuredRows::Invalid);
+    }
+    let mut rows = Vec::new();
+    if spec.all || spec.headers {
+        rows.extend(table.header_row);
+    }
+    if spec.all || spec.data {
+        rows.extend(table.rows.iter().copied());
+    }
+    if spec.all || spec.totals {
+        rows.extend(table.totals_row);
+    }
+    if spec.this_row {
+        let row = current_row.ok_or(StructuredRows::Invalid)?;
+        if table.header_row == Some(row) || table.totals_row == Some(row) {
+            return Err(StructuredRows::Value);
+        }
+        if !table.rows.contains(&row) {
+            return Err(StructuredRows::Invalid);
+        }
+        rows.push(row);
+    }
+    if !spec.all && !spec.headers && !spec.data && !spec.totals && !spec.this_row {
+        return Err(StructuredRows::Invalid);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.is_empty() && (spec.headers || spec.totals) {
+        return Err(StructuredRows::Null);
+    }
+    Ok(rows)
+}
+
+fn column_number(token: &str) -> Option<u32> {
+    let token = token.trim().trim_start_matches('$');
+    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut column = 0_u32;
+    for byte in token.bytes() {
+        column = column
+            .checked_mul(26)?
+            .checked_add(u32::from(byte.to_ascii_uppercase() - b'A') + 1)?;
+    }
+    if column == 0 || column > MAX_COLUMNS {
+        return None;
+    }
+    Some(column - 1)
+}
+
+fn row_number(token: &str) -> Option<u32> {
+    let token = token.trim().trim_start_matches('$');
+    let row: u32 = token.parse().ok()?;
+    if row == 0 || row > MAX_ROWS {
+        return None;
+    }
+    Some(row - 1)
 }
 
 fn parse_a1(reference: &str, sheet: u32) -> Result<CellId, FormulaError> {
@@ -6143,10 +7145,10 @@ fn expand_range(first: CellId, second: CellId) -> Result<Expr, FormulaError> {
         usize::try_from(last_row - first_row + 1).map_err(|_| FormulaError::RangeTooLarge)?;
     let columns =
         usize::try_from(last_column - first_column + 1).map_err(|_| FormulaError::RangeTooLarge)?;
-    let count = rows
-        .checked_mul(columns)
-        .ok_or(FormulaError::RangeTooLarge)?;
-    if count > MAX_RANGE_CELLS {
+    // The rectangle is stored as an anchor plus a size. Evaluation visits
+    // occupied cells, so a whole column or `A:XFD` does not allocate a cell
+    // per grid position. `rows * columns` may exceed `MAX_RANGE_CELLS`.
+    if rows.checked_mul(columns).is_none() {
         return Err(FormulaError::RangeTooLarge);
     }
     Ok(Expr::Range {
@@ -6155,6 +7157,104 @@ fn expand_range(first: CellId, second: CellId) -> Result<Expr, FormulaError> {
         rows,
         columns,
     })
+}
+
+fn reference_expression(expression: &Expr) -> bool {
+    match expression {
+        Expr::Reference(_) | Expr::Range { .. } => true,
+        Expr::Function(function, _) => matches!(
+            function,
+            Function::Offset | Function::Indirect | Function::Index | Function::ReferenceSpan
+        ),
+        Expr::UnaryMinus(inner) | Expr::Percent(inner) => reference_expression(inner),
+        _ => false,
+    }
+}
+
+fn literal_zero(expression: &Expr) -> bool {
+    matches!(expression, Expr::Number(value) if *value == 0.0) || matches!(expression, Expr::Empty)
+}
+
+fn stays_in_column(expression: &Expr) -> bool {
+    match expression {
+        Expr::Reference(_) | Expr::Range { columns: 1, .. } => true,
+        Expr::Function(Function::Offset, arguments) => arguments.get(2).is_none_or(literal_zero),
+        _ => false,
+    }
+}
+
+fn stays_in_row(expression: &Expr) -> bool {
+    match expression {
+        Expr::Reference(_) | Expr::Range { rows: 1, .. } => true,
+        Expr::Function(Function::Offset, arguments) => arguments.get(1).is_none_or(literal_zero),
+        _ => false,
+    }
+}
+
+/// The coordinate space for `Name:OFFSET(Name, rows, 0)`. A full column or
+/// row is enough when the shift cannot leave that line, and it does not make
+/// a formula in another column look circular.
+/// Column or row an endpoint stays on. `OFFSET(AA$5, n, 0)` stays on column
+/// AA; `reference_bounds` of the call itself does not see that origin.
+fn span_line_anchor(expression: &Expr) -> Option<CellId> {
+    match expression {
+        Expr::Function(Function::Offset, arguments) => {
+            arguments.first().and_then(span_line_anchor)
+        }
+        other => reference_bounds(other).map(|(start, _)| start),
+    }
+}
+
+fn dynamic_span_envelope(sheet: u32, left: &Expr, right: &Expr) -> Result<Expr, FormulaError> {
+    let left_at = span_line_anchor(left);
+    let right_at = span_line_anchor(right);
+    let anchor = left_at
+        .or(right_at)
+        .unwrap_or(CellId::new(sheet, 0, 0));
+    if stays_in_column(left) && stays_in_column(right) {
+        let (first, last) = match (left_at, right_at) {
+            (Some(left_at), Some(right_at)) => (
+                left_at.column.min(right_at.column),
+                left_at.column.max(right_at.column),
+            ),
+            _ => (anchor.column, anchor.column),
+        };
+        return expand_range(
+            CellId::new(sheet, 0, first),
+            CellId::new(sheet, MAX_ROWS - 1, last),
+        );
+    }
+    if stays_in_row(left) && stays_in_row(right) {
+        let (first, last) = match (left_at, right_at) {
+            (Some(left_at), Some(right_at)) => {
+                (left_at.row.min(right_at.row), left_at.row.max(right_at.row))
+            }
+            _ => (anchor.row, anchor.row),
+        };
+        return expand_range(
+            CellId::new(sheet, first, 0),
+            CellId::new(sheet, last, MAX_COLUMNS - 1),
+        );
+    }
+    expand_range(
+        CellId::new(sheet, 0, 0),
+        CellId::new(sheet, MAX_ROWS - 1, MAX_COLUMNS - 1),
+    )
+}
+
+fn expression_sheet(expression: &Expr) -> Option<u32> {
+    match expression {
+        Expr::Reference(cell)
+        | Expr::Range {
+            anchor: cell,
+            members: None,
+            ..
+        } => Some(cell.sheet),
+        Expr::Function(_, arguments) => arguments.iter().find_map(expression_sheet),
+        Expr::UnaryMinus(inner) | Expr::Percent(inner) => expression_sheet(inner),
+        Expr::Binary(_, left, right) => expression_sheet(left).or_else(|| expression_sheet(right)),
+        _ => None,
+    }
 }
 
 fn reference_bounds(expression: &Expr) -> Option<(CellId, CellId)> {
@@ -6192,6 +7292,32 @@ fn join_reference_range(left: Expr, right: Expr) -> Result<Expr, FormulaError> {
         return Ok(Expr::Error(CalcError::InvalidReference));
     }
     let (Some((first, first_end)), Some((second, second_end))) = (left_bounds, right_bounds) else {
+        // `Top:OFFSET(Top,N,0)` is a defined-name range. The shift is not
+        // known until calculation, so the span keeps both endpoints and uses
+        // the sheet as its envelope.
+        if reference_expression(&left) && reference_expression(&right) {
+            let left_sheet = expression_sheet(&left);
+            let right_sheet = expression_sheet(&right);
+            let sheet = match (left_sheet, right_sheet) {
+                (Some(left_sheet), Some(right_sheet)) if left_sheet == right_sheet => left_sheet,
+                (Some(sheet), None) | (None, Some(sheet)) => sheet,
+                (None, None) => {
+                    return Err(FormulaError::InvalidReference(
+                        "range endpoints must be references".into(),
+                    ));
+                }
+                _ => {
+                    return Err(FormulaError::InvalidReference(
+                        "range endpoints cross sheets".into(),
+                    ));
+                }
+            };
+            let envelope = dynamic_span_envelope(sheet, &left, &right)?;
+            return Ok(Expr::Function(
+                Function::ReferenceSpan,
+                vec![left, right, envelope],
+            ));
+        }
         let kind = if matches!(left, Expr::Number(_)) || matches!(right, Expr::Number(_)) {
             "range endpoint is number"
         } else if matches!(left, Expr::Function(_, _)) || matches!(right, Expr::Function(_, _)) {
@@ -8418,11 +9544,75 @@ mod tests {
     }
 
     #[test]
+    fn whole_column_row_and_datevalue() {
+        let mut workbook = Workbook::default();
+        workbook.define_sheet(0, "Data");
+        workbook.define_sheet(1, "Report");
+        workbook.set_number(cell(0, 0), 2.0);
+        workbook.set_number(cell(2, 0), 5.0);
+        workbook.set_number(cell(0, 1), 4.0);
+        workbook.set_number(cell(1, 25), 9.0);
+        workbook.set_number(cell(10, 0), 1.0);
+        // The totals sit outside both spans. Excel treats a formula inside
+        // the span it sums as a circular reference.
+        let columns = CellId::new(1, 0, 0);
+        let rows = CellId::new(1, 1, 0);
+        let full = CellId::new(1, 2, 0);
+        let narrow = CellId::new(1, 3, 0);
+        let lookup = CellId::new(1, 4, 0);
+        workbook.set_formula(columns, "=SUM(Data!A:Z)").unwrap();
+        workbook.set_formula(rows, "=SUM(Data!1:12)").unwrap();
+        workbook.set_formula(full, "=SUM(Data!A:XFD)").unwrap();
+        workbook.set_formula(narrow, "=SUM(Data!$A:$C)").unwrap();
+        workbook
+            .set_formula(lookup, "=VLOOKUP(2,Data!A:B,2,FALSE)")
+            .unwrap();
+        let iso = CellId::new(1, 10, 0);
+        let us = CellId::new(1, 11, 0);
+        let round_trip = CellId::new(1, 12, 0);
+        workbook
+            .set_formula(iso, "=DATEVALUE(\"2020-01-31\")")
+            .unwrap();
+        workbook.set_formula(us, "=DATEVALUE(\"1/31/20\")").unwrap();
+        assert_eq!(workbook.value(columns), Value::Number(21.0));
+        assert_eq!(workbook.value(rows), Value::Number(21.0));
+        assert_eq!(workbook.value(full), Value::Number(21.0));
+        assert_eq!(workbook.value(narrow), Value::Number(12.0));
+        assert_eq!(workbook.value(lookup), Value::Number(4.0));
+        assert!(matches!(
+            workbook.set_formula(cell(0, 0), "=SUM(A:A)"),
+            Err(FormulaError::Cycle(_))
+        ));
+        assert_eq!(workbook.value(iso), workbook.value(us));
+        let serial = match workbook.value(iso) {
+            Value::Number(value) => value,
+            other => panic!("datevalue {other:?}"),
+        };
+        assert!(serial > 40_000.0, "{serial}");
+        workbook
+            .set_formula(round_trip, "=DATEVALUE(TEXT(A11,\"mm/dd/yy\"))")
+            .unwrap();
+        assert_eq!(workbook.value(round_trip), Value::Number(serial));
+        // TEXT of a blank is "01/00/00". Day 0 is not a DATEVALUE date.
+        workbook
+            .set_formula(
+                CellId::new(1, 13, 0),
+                "=DATEVALUE(TEXT(B20,\"mm/dd/yy\"))",
+            )
+            .unwrap();
+        assert_eq!(
+            workbook.value(CellId::new(1, 13, 0)),
+            Value::Error(CalcError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn structured_references_lower_to_ranges_and_this_row_cells() {
         let table = StructuredTable {
             name: "Lines".into(),
             sheet: 0,
             header_row: Some(0),
+            totals_row: Some(3),
             rows: vec![1, 2],
             columns: vec![
                 StructuredColumn {
@@ -8472,7 +9662,63 @@ mod tests {
         );
         assert_eq!(
             parse("=SUM(Lines[[#All],[Total]])", None).references(),
-            vec![cell(0, 2), cell(1, 2), cell(2, 2)]
+            vec![cell(0, 2), cell(1, 2), cell(2, 2), cell(3, 2)]
+        );
+        assert_eq!(
+            parse("=SUM(Lines[#Data])", None).references(),
+            vec![
+                cell(1, 0),
+                cell(1, 1),
+                cell(1, 2),
+                cell(2, 0),
+                cell(2, 1),
+                cell(2, 2)
+            ]
+        );
+        assert_eq!(
+            parse("=SUM(Lines[[#Headers],[#Data],[Price]])", None).references(),
+            vec![cell(0, 1), cell(1, 1), cell(2, 1)]
+        );
+        assert_eq!(
+            parse("=Lines[[#This Row],[Quantity]:[Price]]", Some(2)).references(),
+            vec![cell(2, 0), cell(2, 1)]
+        );
+        let context = StructuredContext {
+            tables: std::slice::from_ref(&table),
+            current_table: Some("Lines"),
+            current_row: Some(2),
+        };
+        assert!(matches!(
+            ParsedFormula::parse_with_structured_references(
+                "=Lines[[#This Row],[#Data],[Price]]",
+                0,
+                &names,
+                context,
+            ),
+            Err(FormulaError::InvalidStructuredReference(_))
+        ));
+        assert!(matches!(
+            ParsedFormula::parse_with_structured_references(
+                "=Lines[[#Totals],[Missing]]",
+                0,
+                &names,
+                context,
+            ),
+            Err(FormulaError::UnknownTableColumn { .. })
+        ));
+        assert_eq!(
+            ParsedFormula::parse_with_structured_references("=[Price]", 0, &names, context)
+                .unwrap()
+                .references(),
+            vec![cell(1, 1), cell(2, 1)]
+        );
+        assert_eq!(
+            parse("=Lines[[#This Row],[Price]]", Some(2)).references(),
+            vec![cell(2, 1)]
+        );
+        assert_eq!(
+            parse("=Lines[[#Totals],[Total]]", None).references(),
+            vec![cell(3, 2)]
         );
 
         let mut workbook = Workbook::default();
@@ -8492,6 +9738,16 @@ mod tests {
         assert_eq!(workbook.value(cell(1, 2)), Value::Number(8.0));
         assert_eq!(workbook.value(cell(2, 2)), Value::Number(15.0));
         assert_eq!(workbook.value(cell(3, 2)), Value::Number(23.0));
+        // Unqualified [Price] is the data column. A scalar use intersects
+        // the formula row, which is Excel's calculated-column behavior.
+        workbook
+            .set_parsed_formula(cell(2, 3), parse("=[Price]", Some(2)))
+            .unwrap();
+        assert_eq!(workbook.value(cell(2, 3)), Value::Number(5.0));
+        workbook
+            .set_parsed_formula(cell(4, 3), parse("=SUM([Price])", Some(1)))
+            .unwrap();
+        assert_eq!(workbook.value(cell(4, 3)), Value::Number(9.0));
     }
 
     #[test]
@@ -8500,6 +9756,7 @@ mod tests {
             name: "Lines".into(),
             sheet: 0,
             header_row: None,
+            totals_row: None,
             rows: vec![1],
             columns: vec![StructuredColumn {
                 name: "Price".into(),
@@ -8541,9 +9798,7 @@ mod tests {
             workbook.set_formula(cell(0, 0), "=CUBEVALUE(A1:A2)"),
             Err(FormulaError::UnsupportedFunction("CUBEVALUE".into()))
         );
-        assert_eq!(
-            workbook.set_formula(cell(0, 0), "=SUM(A1:XFD999999)"),
-            Err(FormulaError::RangeTooLarge)
-        );
+        workbook.set_formula(cell(0, 0), "=SUM(B:XFD)").unwrap();
+        assert_eq!(workbook.value(cell(0, 0)), Value::Number(0.0));
     }
 }

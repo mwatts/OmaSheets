@@ -138,6 +138,69 @@ pub fn civil_from_serial(serial: i64) -> Result<CivilDate, CalcError> {
 /// backward by plain serial arithmetic (so day `0` is the previous month's last
 /// day). The year is used as given; see [`date_serial`] for `DATE`'s
 /// two-digit-year adjustment.
+/// `DATEVALUE` for an unlocalized date string. Accepts `yyyy-mm-dd`,
+/// `yyyy/mm/dd`, `m/d/yyyy`, `m/d/yy`, and the same shapes with `-`. A
+/// trailing time is ignored. Two-digit years `00`–`29` are 2000–2029 and
+/// `30`–`99` are 1930–1999. A number or an unrecognized string is `#VALUE!`.
+pub fn date_value(text: &str) -> Result<i64, CalcError> {
+    let text = text.trim();
+    let date = text.split_whitespace().next().unwrap_or(text);
+    let invalid = || CalcError::InvalidValue;
+    if let Some((year, month, day)) = split_iso(date) {
+        return calendar_date_value(year, month, day);
+    }
+    let parts: Vec<&str> = if date.contains('/') {
+        date.split('/').collect()
+    } else if date.contains('-') {
+        date.split('-').collect()
+    } else {
+        return Err(invalid());
+    };
+    if parts.len() != 3 {
+        return Err(invalid());
+    }
+    let month: i64 = parts[0].parse().map_err(|_| invalid())?;
+    let day: i64 = parts[1].parse().map_err(|_| invalid())?;
+    let year = expand_year(parts[2]).ok_or_else(invalid)?;
+    calendar_date_value(year, month, day)
+}
+
+/// `DATEVALUE` rejects a day or month that is not on the calendar.
+/// `DATE(2000,1,0)` rolls back to 1999-12-31; `DATEVALUE("1/0/00")` is
+/// `#VALUE!`, which is why `DATEVALUE(TEXT(blank,"mm/dd/yy"))` is `#VALUE!`.
+fn calendar_date_value(year: i64, month: i64, day: i64) -> Result<i64, CalcError> {
+    if !(1..=12).contains(&month) {
+        return Err(CalcError::InvalidValue);
+    }
+    let last = i64::from(days_in_month(year, month));
+    if !(1..=last).contains(&day) {
+        return Err(CalcError::InvalidValue);
+    }
+    serial_from_civil(year, month, day)
+}
+
+fn split_iso(text: &str) -> Option<(i64, i64, i64)> {
+    let mut parts = text.split(['-', '/']);
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let month = parts.next()?.parse::<i64>().ok()?;
+    let day = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || year < 100 {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+fn expand_year(text: &str) -> Option<i64> {
+    let year: i64 = text.parse().ok()?;
+    if text.len() == 4 {
+        Some(year)
+    } else if text.len() <= 2 {
+        Some(if year <= 29 { 2000 + year } else { 1900 + year })
+    } else {
+        None
+    }
+}
+
 pub fn serial_from_civil(year: i64, month: i64, day: i64) -> Result<i64, CalcError> {
     for component in [year, month, day] {
         if component.unsigned_abs() > MAX_COMPONENT as u64 {
@@ -266,7 +329,14 @@ pub fn year_fraction(start: i64, end: i64, basis: i64) -> Result<f64, CalcError>
                     365.0
                 }
             } else {
-                let years = (first.year..=last.year).map(days_in_year).sum::<f64>();
+                // The numerator is the serial difference, so it counts the
+                // phantom 1900-02-29. The denominator uses the Gregorian
+                // length, where 1900 has 365 days. Excel's YEARFRAC basis 1
+                // does the same, which is why a span that starts at serial 0
+                // is one day longer than a 366-day 1900.
+                let years = (first.year..=last.year)
+                    .map(gregorian_days_in_year)
+                    .sum::<f64>();
                 years / (last.year - first.year + 1) as f64
             };
             Ok(actual / year_length)
@@ -339,6 +409,12 @@ fn days_in_year(year: i64) -> f64 {
     } else {
         365.0
     }
+}
+
+/// Gregorian year length. 1900 is not a leap year here, unlike the serial
+/// calendar's 366-day 1900.
+fn gregorian_days_in_year(year: i64) -> f64 {
+    if is_leap_year(year) { 366.0 } else { 365.0 }
 }
 
 fn is_weekend(serial: i64) -> bool {
@@ -466,6 +542,19 @@ mod tests {
 
     fn civil(year: i64, month: u32, day: u32) -> CivilDate {
         CivilDate { year, month, day }
+    }
+
+    #[test]
+    fn yearfrac_basis_one_counts_1900_as_365_days() {
+        // Serial 0 is 1900-01-00 and 41885 is 2014-09-03. Excel's basis 1
+        // denominator uses a 365-day 1900, so the fraction is the serial
+        // span divided by the Gregorian average, not a 366-day 1900.
+        let fraction = year_fraction(41_885, 0, 1).unwrap();
+        let expected = 41_885.0 / (42_003.0 / 115.0);
+        assert!((fraction - expected).abs() < 1e-12, "{fraction} {expected}");
+        assert!(date_value("1/0/00").is_err());
+        assert!(date_value("2/31/2020").is_err());
+        assert_eq!(date_value("2/29/2000").unwrap(), serial_from_civil(2000, 2, 29).unwrap());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-120 function names listed below, grouped for reading.
+128 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -9,7 +9,7 @@ regenerate this list.
 Operators: `+ - * / ^ & %`, unary `+`/`-`, comparisons `= <> < <= > >=`,
 error literals (`#REF!`, `#N/A`, `#DIV/0!`, `#VALUE!`, `#NUM!`, `#NAME?`,
 `#NULL!`, and `Sheet!#REF!` for a deleted cell on another sheet), omitted arguments,
-bounded rectangular ranges (including qualified endpoints and deleted endpoints
+rectangular ranges of any size inside the Excel grid, including whole columns and rows such as `A:A`, `A:XFD`, `1:1` and `1:1048576` (including qualified endpoints and deleted endpoints
 such as `A1:#REF!`, which evaluate to `#REF!`), absolute markers,
 cross-sheet references, workbook and sheet-scoped defined names (including
 `Sheet!LocalName`; tokens past
@@ -50,11 +50,13 @@ stored external-link cache is used when the file is absent. A same-named
 file reached only as the base name of an absolute or `file://` target does
 not replace a populated cache. A cell on a sheet that cache or target
 workbook knows, with no stored value, is blank, and a formula that returns
-that blank shows 0. An unknown sheet or link is `#REF!`. A missing cell
-inside a cached external range is blank.
-Deliberately unsupported: 3D references, `CELL`, `FILTER`, `UNIQUE`, `SORT`,
-add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`,
-and the 1904 date system. `TEXT` accepts only the locale-free codes listed
+that blank shows 0. A sheet whose refresh failed still returns the cells
+the cache lists; a cell that sheet does not list is `#REF!`. An unknown
+sheet or link is `#REF!`. A missing cell inside a cached external range
+on a sheet that refreshed is blank.
+Deliberately unsupported: 3D references, add-in (`_xll.`) calls, and the
+1904 date system. VBA and other workbook-defined procedures are not
+Excel functions and are not implemented. `TEXT` accepts only the locale-free codes listed
 with the text functions below.
 
 Approximate lookups (`VLOOKUP`/`HLOOKUP` without `FALSE`, `MATCH` types 1 and
@@ -67,6 +69,7 @@ unsorted keys are undefined in Excel and are not promised here.
 
 - `TRANSPOSE`
 - `MMULT`
+- `LINEST`
 - `DAVERAGE`
 - `DMAX`
 - `DMIN`
@@ -192,9 +195,15 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `HLOOKUP`
 - `ROW`
 - `COLUMN`
+- `ROWS`
+- `FILTER`
+- `UNIQUE`
+- `SORT`
 - `LOOKUP`
 - `OFFSET`
 - `INDIRECT`
+- `CELL`
+- `GETPIVOTDATA`
 
 ### Dates (1900 serial system)
 
@@ -206,6 +215,7 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `EOMONTH`
 - `WEEKDAY`
 - `YEARFRAC`
+- `DATEVALUE`
 - `DAYS360`
 - `NETWORKDAYS`
 - `WORKDAY`
@@ -225,19 +235,33 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 
 `TODAY` is the 1900 serial of the tick instant's UTC date. `NOW` adds the
 time-of-day fraction. Import replays a cached `TODAY()` or `NOW()` serial
-as that instant and does not read a clock; `RAND` still will not match
+as that instant and does not read a clock. A workbook whose stored
+`YEARFRAC(TODAY(), …)` results all agree on one serial uses that Excel
+calculation date instead. `RAND` still will not match
 Excel's generator. `RAND` and `RANDBETWEEN` are deterministic in the tick
 number and the calling cell: the same tick replays the same value, and a new
 tick changes it. `OFFSET` refuses a result outside the grid with `#REF!` and
-a height or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of anything
-other than A1 text (`#REF!`, R1C1, 3D or an external workbook) is `#REF!`.
+a height or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of A1 text, including text a formula produces and a whole
+column or row, is that reference. R1C1, 3D references and an external
+workbook are `#REF!`.
+
+`GETPIVOTDATA(data_field, pivot_cell, [field, item], ...)` returns the sum
+of that data field over the pivot cache. The pivot cell must lie inside a
+pivot table, or the result is `#REF!`. Field and item arguments are pairs;
+a leftover argument is `#REF!`. Names match without regard to case, and one
+surrounding space on a name is ignored only when the exact text does not
+match. An unknown field or item is `#REF!`. A page-field selection still
+applies when the formula does not name it. A date-between filter applies
+when its field is on the row, column, or page axis, inclusive of the bounds
+stored with the filter. Missing numeric cache values are not added. A visible
+total with no numbers is 0. A data field whose subtotal is not sum is `#VALUE!`.
 
 `TEXTJOIN` joins scalar and bounded range arguments in row order, can skip blanks
 and empty strings, propagates errors, and refuses output beyond 32,767 UTF-16 units.
 
 `TEXT` formats a number with one code, compared without regard to case:
 `General`, `0`, `0.00`, `#`, `#,##0`, `#,##0.00`, `0%`, `0.00%`, `yyyy-mm-dd`,
-or `mm/dd/yyyy`. Any other code, including a literal suffix such as `0.0x`,
+or `mm/dd/yyyy`, or `mm/dd/yy`. Any other code, including a literal suffix such as `0.0x`,
 is `#VALUE!`. `#` rounds half away from zero to an integer and shows nothing
 for zero. Date codes use the 1900 serial, including the fictitious 1900-02-29.
 `HYPERLINK` returns its friendly name, or the link when the name is omitted,

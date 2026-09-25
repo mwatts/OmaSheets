@@ -5,8 +5,9 @@ use crate::session::{SpreadsheetSession, VISIBLE_COLUMNS, VISIBLE_ROWS, VisibleC
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    Context, Entity, EventEmitter, IntoElement, MouseButton, ParentElement, Render, SharedString,
-    Styled, Subscription, Window, div, px, rgb,
+    Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription,
+    Window, div, px, rgb,
 };
 use omasheets_core::{ApplyError, Command};
 use std::path::Path;
@@ -32,6 +33,10 @@ pub enum SpreadsheetUiEvent {
 pub struct SpreadsheetView {
     session: SpreadsheetSession,
     formula: Entity<InputState>,
+    grid_focus: FocusHandle,
+    scroll_rows: f32,
+    scroll_cols: f32,
+    chrome_epoch: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -59,15 +64,41 @@ impl SpreadsheetView {
                 InputEvent::Focus | InputEvent::Blur => {}
             },
         )];
-        Self {
+        let view = Self {
             session,
             formula,
+            grid_focus: cx.focus_handle(),
+            scroll_rows: 0.0,
+            scroll_cols: 0.0,
+            chrome_epoch: 0,
             _subscriptions: subscriptions,
-        }
+        };
+        cx.defer_in(window, |this, window, cx| {
+            this.grid_focus.focus(window, cx);
+        });
+        view
     }
 
     pub fn session(&self) -> &SpreadsheetSession {
         &self.session
+    }
+
+    /// Replaces the document the grid is showing and focuses the grid.
+    pub fn show_session(
+        &mut self,
+        session: SpreadsheetSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session = session;
+        self.scroll_rows = 0.0;
+        self.scroll_cols = 0.0;
+        self.sync_formula(window, cx);
+        self.request_chrome(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.grid_focus.focus(window, cx);
+        });
+        cx.notify();
     }
 
     /// Applies one document command and notifies. A rejection emits [`SpreadsheetUiEvent::CommandFailed`].
@@ -98,6 +129,9 @@ impl SpreadsheetView {
     }
 
     fn commit_formula(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.is_browsing() {
+            return;
+        }
         match self.session.commit_edit() {
             Ok((address, source)) => {
                 let sheet = self
@@ -147,9 +181,129 @@ impl SpreadsheetView {
 
     fn activate_sheet(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.session.activate_sheet(index) {
+            self.scroll_rows = 0.0;
+            self.scroll_cols = 0.0;
             self.sync_formula(window, cx);
+            self.request_chrome(window, cx);
+            self.grid_focus.focus(window, cx);
             cx.notify();
         }
+    }
+
+    fn navigate(
+        &mut self,
+        row_delta: i32,
+        column_delta: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.session.move_selection(row_delta, column_delta) {
+            Ok(address) => {
+                self.session.retile();
+                let sheet = self
+                    .session
+                    .active_sheet_name()
+                    .unwrap_or("Sheet")
+                    .to_string();
+                let a1 = format!(
+                    "{}{}",
+                    omasheets_core::column_letters(address.column),
+                    address.row + 1
+                );
+                self.sync_formula(window, cx);
+                cx.emit(SpreadsheetUiEvent::SelectionChanged { sheet, a1 });
+                cx.notify();
+            }
+            Err(error) => self.fail(error, cx),
+        }
+    }
+
+    fn on_grid_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.grid_focus.is_focused(window) || event.keystroke.modifiers.alt {
+            return false;
+        }
+        let jump = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+        let far_back = i32::MIN;
+        let far_forward = i32::MAX;
+        let (rows, columns) = match event.keystroke.key.as_str() {
+            "up" => (if jump { far_back } else { -1 }, 0),
+            "down" => (if jump { far_forward } else { 1 }, 0),
+            "left" => (0, if jump { far_back } else { -1 }),
+            "right" => (0, if jump { far_forward } else { 1 }),
+            "pageup" => (-(VISIBLE_ROWS as i32), 0),
+            "pagedown" => (VISIBLE_ROWS as i32, 0),
+            "home" => {
+                if jump {
+                    (far_back, far_back)
+                } else {
+                    (0, far_back)
+                }
+            }
+            "end" => {
+                if jump {
+                    (far_forward, far_forward)
+                } else {
+                    (0, far_forward)
+                }
+            }
+            _ => return false,
+        };
+        self.navigate(rows, columns, window, cx);
+        true
+    }
+
+    fn on_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let (mut rows, mut columns) = match event.delta {
+            ScrollDelta::Lines(point) => (-point.y, -point.x),
+            ScrollDelta::Pixels(point) => (-(point.y / px(22.0)), -(point.x / px(72.0))),
+        };
+        if event.modifiers.shift {
+            std::mem::swap(&mut rows, &mut columns);
+        }
+        self.scroll_rows += rows;
+        self.scroll_cols += columns;
+        let row_steps = self.scroll_rows.trunc() as i32;
+        let column_steps = self.scroll_cols.trunc() as i32;
+        self.scroll_rows -= row_steps as f32;
+        self.scroll_cols -= column_steps as f32;
+        if row_steps == 0 && column_steps == 0 {
+            return;
+        }
+        self.session.scroll_by(row_steps, column_steps);
+        self.session.retile();
+        cx.notify();
+    }
+
+    fn request_chrome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.session.workbook_path().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        let Some(name) = self.session.chrome_sheet_name().map(str::to_string) else {
+            return;
+        };
+        let index = self.session.active_index();
+        self.chrome_epoch = self.chrome_epoch.wrapping_add(1);
+        let epoch = self.chrome_epoch;
+        cx.spawn_in(window, async move |this, cx| {
+            let chrome = cx
+                .background_spawn(
+                    async move { crate::appearance::load_sheet_chrome(&path, &name).ok() },
+                )
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.chrome_epoch != epoch {
+                    return;
+                }
+                view.session.install_chrome(index, chrome);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn sync_formula(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -191,11 +345,14 @@ impl SpreadsheetView {
         let active = self.session.active_sheet_name().unwrap_or("").to_string();
         let names = self.session.sheet_names();
         div()
+            .id("omasheets-sheet-tabs")
             .h(px(28.))
             .w_full()
             .flex()
             .flex_row()
+            .flex_nowrap()
             .items_center()
+            .overflow_x_scroll()
             .bg(rgb(0xeeeeee))
             .border_t_1()
             .border_color(rgb(0xd0d0d0))
@@ -205,6 +362,7 @@ impl SpreadsheetView {
                 let id = SharedString::from(format!("sheet-tab-{index}"));
                 div()
                     .id(id)
+                    .flex_shrink_0()
                     .h_full()
                     .px_2()
                     .flex()
@@ -222,7 +380,7 @@ impl EventEmitter<SpreadsheetUiEvent> for SpreadsheetView {}
 
 impl Render for SpreadsheetView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let grid = SheetGrid::from_session(&self.session, cx.entity());
+        let grid = SheetGrid::from_session(&self.session, cx.entity(), self.grid_focus.clone());
         div()
             .id("omasheets-spreadsheet")
             .size_full()
@@ -239,6 +397,7 @@ impl Render for SpreadsheetView {
 /// Custom grid. It builds only the visible window, not a DataTable.
 struct SheetGrid {
     view: Entity<SpreadsheetView>,
+    focus: FocusHandle,
     column_labels: Vec<String>,
     row_labels: Vec<String>,
     cells: Vec<VisibleCell>,
@@ -246,13 +405,18 @@ struct SheetGrid {
 }
 
 impl SheetGrid {
-    fn from_session(session: &SpreadsheetSession, view: Entity<SpreadsheetView>) -> Self {
+    fn from_session(
+        session: &SpreadsheetSession,
+        view: Entity<SpreadsheetView>,
+        focus: FocusHandle,
+    ) -> Self {
         let origin_column = session.visible_window().origin_column as usize;
         let column_widths = (0..VISIBLE_COLUMNS)
             .map(|offset| session.column_width_px(origin_column + offset as usize))
             .collect();
         Self {
             view,
+            focus,
             column_labels: session.column_labels(),
             row_labels: session.row_labels(),
             cells: session.visible_cells(),
@@ -352,6 +516,7 @@ impl RenderOnce for SheetGrid {
                         .child(cell.text.clone())
                         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                             view.update(cx, |this, cx| {
+                                this.grid_focus.focus(window, cx);
                                 this.select_cell(row_index, column_index, window, cx);
                             });
                         }),
@@ -360,10 +525,29 @@ impl RenderOnce for SheetGrid {
             rows.push(row);
         }
 
+        let view = self.view.clone();
+        let focus = self.focus.clone();
         div()
             .id("omasheets-grid")
             .flex_1()
             .overflow_hidden()
+            .track_focus(&self.focus)
+            .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                let handled = view.update(cx, |this, cx| this.on_grid_key(event, window, cx));
+                if handled {
+                    cx.stop_propagation();
+                }
+            })
+            .on_scroll_wheel({
+                let view = self.view.clone();
+                move |event: &ScrollWheelEvent, _window, cx| {
+                    view.update(cx, |this, cx| this.on_wheel(event, cx));
+                    cx.stop_propagation();
+                }
+            })
+            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                focus.focus(window, cx);
+            })
             .child(header)
             .children(rows)
     }
