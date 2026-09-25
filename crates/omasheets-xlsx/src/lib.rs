@@ -4,7 +4,7 @@
 //! matching `omasheets_calc::serial_date`; workbooks that declare the 1904 date
 //! system are rejected rather than silently offset by 1462 days.
 
-use calamine::{Cell, CellErrorType, Data, Range, Reader, Xlsx, XlsxFormulaMetadata};
+use calamine::{Cell, CellErrorType, Data, DataType, Range, Reader, Xlsx, XlsxFormulaMetadata};
 use omasheets_calc::pivot::{
     PivotAggregate, PivotCache, PivotCacheField, PivotDataField, PivotDateFilter, PivotDateGroup,
     PivotGroupBy, PivotScalar, PivotTable, cache_datetime_serial,
@@ -331,7 +331,7 @@ impl fmt::Display for ImportError {
             Self::TooManyCells { observed, maximum } => {
                 write!(
                     formatter,
-                    "workbook spans {observed} cells; limit is {maximum}"
+                    "workbook has {observed} occupied cells; limit is {maximum}"
                 )
             }
             Self::TooManyFormulas { observed, maximum } => {
@@ -408,38 +408,20 @@ fn import_xlsx_body(
     let external = external_cells_for_import(path, limits, opening);
     let array_formulas = read_array_formulas(path).unwrap_or_default();
     let pivots = read_pivots(path, limits);
-    let mut ranges = Vec::with_capacity(sheet_names.len());
+    let mut sheets = Vec::with_capacity(sheet_names.len());
     let mut observed_cells = 0_usize;
     let mut observed_formulas = 0_usize;
     for name in &sheet_names {
-        let values = source
-            .worksheet_range(name)
-            .map_err(|error| ImportError::Read(error.to_string()))?;
-        observed_cells =
-            observed_cells.saturating_add(values.width().saturating_mul(values.height()));
-        if observed_cells > limits.max_cells {
-            return Err(ImportError::TooManyCells {
-                observed: observed_cells,
-                maximum: limits.max_cells,
-            });
-        }
-        let formulas = read_formulas(&mut source, name)?;
-        observed_formulas = observed_formulas.saturating_add(
-            formulas
-                .used_cells()
-                .filter(|(_, _, formula)| !formula.is_empty())
-                .count(),
-        );
-        if observed_formulas > limits.max_formulas {
-            return Err(ImportError::TooManyFormulas {
-                observed: observed_formulas,
-                maximum: limits.max_formulas,
-            });
-        }
-        ranges.push((name.clone(), values, formulas));
+        sheets.push(read_occupied_sheet(
+            &mut source,
+            name,
+            limits,
+            &mut observed_cells,
+            &mut observed_formulas,
+        )?);
     }
     let mut imported = import_ranges_with_names(
-        ranges,
+        sheets,
         defined_names,
         &tables,
         external.cells,
@@ -453,35 +435,70 @@ fn import_xlsx_body(
     Ok(imported)
 }
 
-/// Reads a sheet's formulas, expanding shared formulas from their anchor
-/// cell. Calamine's `worksheet_formula` shifts a derived cell from the
-/// top-left of the shared `ref` range instead; Excel anchors a group at its
-/// first cell, which need not be that corner (a corner cell can carry its own
-/// formula), and the corpus has sheets whose derived cells came out shifted
-/// by a column as a result. A derived cell whose anchor appears later in the
-/// stream is resolved at the end; one whose anchor never appears is skipped.
-fn read_formulas<RS: Read + Seek>(
+/// Occupied cells of one sheet, in absolute worksheet coordinates.
+///
+/// The bounding box is not allocated. A value and a formula on the same cell
+/// are one occupied cell.
+struct OccupiedSheet {
+    name: String,
+    values: Vec<Cell<Data>>,
+    formulas: Vec<Cell<String>>,
+}
+
+/// Reads values and formulas in one pass. Shared formulas expand from the
+/// anchor cell Excel stored, not from the top-left of the shared `ref`.
+/// A derived cell whose anchor never appears is skipped. Chart and dialog
+/// sheets have no cells. The occupied-cell and formula budgets are checked
+/// as cells arrive, before any bounding box is built.
+fn read_occupied_sheet<RS: Read + Seek>(
     source: &mut Xlsx<RS>,
     name: &str,
-) -> Result<Range<String>, ImportError> {
+    limits: ImportLimits,
+    observed_cells: &mut usize,
+    observed_formulas: &mut usize,
+) -> Result<OccupiedSheet, ImportError> {
     let read_error = |error: calamine::XlsxError| ImportError::Read(error.to_string());
-    // Chart and dialog sheets have no cells; Calamine's own range readers
-    // return an empty range for them and so does this one.
     let mut reader = match source.worksheet_cells_reader(name) {
         Ok(reader) => reader,
-        Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(Range::default()),
+        Err(calamine::XlsxError::NotAWorksheet(_)) => {
+            return Ok(OccupiedSheet {
+                name: name.to_string(),
+                values: Vec::new(),
+                formulas: Vec::new(),
+            });
+        }
         Err(error) => return Err(read_error(error)),
     };
     let mut anchors: HashMap<usize, ((u32, u32), String)> = HashMap::new();
-    let mut cells = Vec::new();
+    let mut values = Vec::new();
+    let mut value_positions = HashSet::new();
+    let mut formulas = Vec::new();
     let mut pending = Vec::new();
     while let Some(record) = reader
         .next_cell_with_formula_metadata()
         .map_err(read_error)?
     {
+        let has_value = !record.value.is_empty();
+        let counts_now = has_value || matches!(
+            record.formula,
+            Some(XlsxFormulaMetadata::Normal { .. } | XlsxFormulaMetadata::Shared { .. })
+        );
+        if counts_now {
+            *observed_cells = observed_cells.saturating_add(1);
+            if *observed_cells > limits.max_cells {
+                return Err(ImportError::TooManyCells {
+                    observed: *observed_cells,
+                    maximum: limits.max_cells,
+                });
+            }
+        }
+        if has_value {
+            value_positions.insert(record.pos);
+            values.push(Cell::new(record.pos, Data::from(record.value)));
+        }
         match record.formula {
             Some(XlsxFormulaMetadata::Normal { formula }) => {
-                cells.push(Cell::new(record.pos, formula));
+                formulas.push(Cell::new(record.pos, formula));
             }
             Some(XlsxFormulaMetadata::Shared {
                 shared_index,
@@ -489,22 +506,61 @@ fn read_formulas<RS: Read + Seek>(
                 ..
             }) => {
                 anchors.insert(shared_index, (record.pos, formula.clone()));
-                cells.push(Cell::new(record.pos, formula));
+                formulas.push(Cell::new(record.pos, formula));
             }
             Some(XlsxFormulaMetadata::SharedDerived { shared_index }) => {
                 pending.push((record.pos, shared_index));
             }
-            _ => {}
+            Some(_) if !has_value => {
+                *observed_cells = observed_cells.saturating_add(1);
+                if *observed_cells > limits.max_cells {
+                    return Err(ImportError::TooManyCells {
+                        observed: *observed_cells,
+                        maximum: limits.max_cells,
+                    });
+                }
+            }
+            Some(_) | None => {}
         }
     }
     for (position, shared_index) in pending {
-        if let Some((anchor, template)) = anchors.get(&shared_index) {
-            let formula =
-                calamine::expand_shared_formula(template, *anchor, position).map_err(read_error)?;
-            cells.push(Cell::new(position, formula));
+        let Some((anchor, template)) = anchors.get(&shared_index) else {
+            continue;
+        };
+        let formula =
+            calamine::expand_shared_formula(template, *anchor, position).map_err(read_error)?;
+        if formula.is_empty() {
+            continue;
         }
+        let already_counted = value_positions.contains(&position);
+        if !already_counted {
+            *observed_cells = observed_cells.saturating_add(1);
+            if *observed_cells > limits.max_cells {
+                return Err(ImportError::TooManyCells {
+                    observed: *observed_cells,
+                    maximum: limits.max_cells,
+                });
+            }
+        }
+        formulas.push(Cell::new(position, formula));
     }
-    Ok(Range::from_sparse(cells))
+    *observed_formulas = observed_formulas.saturating_add(
+        formulas
+            .iter()
+            .filter(|cell| !cell.get_value().is_empty())
+            .count(),
+    );
+    if *observed_formulas > limits.max_formulas {
+        return Err(ImportError::TooManyFormulas {
+            observed: *observed_formulas,
+            maximum: limits.max_formulas,
+        });
+    }
+    Ok(OccupiedSheet {
+        name: name.to_string(),
+        values,
+        formulas,
+    })
 }
 
 /// Opens a workbook, and when Calamine refuses it because a `<sheet>` entry
@@ -1873,7 +1929,7 @@ fn import_ranges(
     limits: ImportLimits,
 ) -> Result<ImportedWorkbook, ImportError> {
     import_ranges_with_names(
-        ranges,
+        ranges.into_iter().map(occupied_from_ranges).collect(),
         Vec::new(),
         &[],
         Vec::new(),
@@ -1886,7 +1942,7 @@ fn import_ranges(
 }
 
 fn import_ranges_with_names(
-    ranges: Vec<(String, Range<Data>, Range<String>)>,
+    ranges: Vec<OccupiedSheet>,
     defined_names: Vec<DefinedName>,
     tables: &[StructuredTable],
     external_cells: Vec<CachedExternalCell>,
@@ -1904,13 +1960,13 @@ fn import_ranges_with_names(
     }
     let mut observed_cells = 0_usize;
     let mut observed_formulas = 0_usize;
-    for (_, values, formulas) in &ranges {
-        observed_cells =
-            observed_cells.saturating_add(values.width().saturating_mul(values.height()));
+    for sheet in &ranges {
+        observed_cells = observed_cells.saturating_add(occupied_count(sheet));
         observed_formulas = observed_formulas.saturating_add(
-            formulas
-                .used_cells()
-                .filter(|(_, _, formula)| !formula.is_empty())
+            sheet
+                .formulas
+                .iter()
+                .filter(|cell| !cell.get_value().is_empty())
                 .count(),
         );
     }
@@ -1930,12 +1986,14 @@ fn import_ranges_with_names(
     let sheets: Vec<SheetInfo> = ranges
         .iter()
         .enumerate()
-        .map(|(index, (name, values, formulas))| {
-            let (value_rows, value_columns) = range_extent(values.end());
-            let (formula_rows, formula_columns) = range_extent(formulas.end());
+        .map(|(index, sheet)| {
+            let (value_rows, value_columns) =
+                range_extent(span_end(sheet.values.iter().map(|cell| cell.get_position())));
+            let (formula_rows, formula_columns) =
+                range_extent(span_end(sheet.formulas.iter().map(|cell| cell.get_position())));
             SheetInfo {
                 index: index as u32,
-                name: name.clone(),
+                name: sheet.name.clone(),
                 rows: value_rows.max(formula_rows),
                 columns: value_columns.max(formula_columns),
             }
@@ -1995,42 +2053,42 @@ fn import_ranges_with_names(
     }
     let mut source_cells = BTreeMap::new();
 
-    for (sheet, (_, values, formulas)) in ranges.into_iter().enumerate() {
-        let (value_row, value_column) = values.start().unwrap_or((0, 0));
-        for (row, column, value) in values.used_cells() {
-            let cell = CellId::new(
-                sheet as u32,
-                value_row + row as u32,
-                value_column + column as u32,
-            );
-            set_source_value(&mut workbook, cell, value);
+    for (sheet_index, sheet) in ranges.into_iter().enumerate() {
+        let mut stored_values = HashMap::new();
+        for cell in sheet.values {
+            if cell.get_value().is_empty() {
+                continue;
+            }
+            let (row, column) = cell.get_position();
+            let id = CellId::new(sheet_index as u32, row, column);
+            set_source_value(&mut workbook, id, cell.get_value());
+            stored_values.insert((row, column), source_value(cell.get_value()));
             source_cells.insert(
-                cell,
+                id,
                 ImportedCell {
-                    cell,
-                    stored: source_value(value),
+                    cell: id,
+                    stored: source_value(cell.get_value()),
                     formula: None,
                 },
             );
         }
-        let (formula_row, formula_column) = formulas.start().unwrap_or((0, 0));
-        for (row, column, formula) in formulas.used_cells() {
-            if formula.is_empty() {
+        for cell in sheet.formulas {
+            if cell.get_value().is_empty() {
                 continue;
             }
-            let absolute = (formula_row + row as u32, formula_column + column as u32);
-            let cell = CellId::new(sheet as u32, absolute.0, absolute.1);
+            let (row, column) = cell.get_position();
+            let id = CellId::new(sheet_index as u32, row, column);
             source_cells
-                .entry(cell)
+                .entry(id)
                 .or_insert_with(|| ImportedCell {
-                    cell,
-                    stored: values
-                        .get_value(absolute)
-                        .map(source_value)
+                    cell: id,
+                    stored: stored_values
+                        .get(&(row, column))
+                        .cloned()
                         .unwrap_or(Value::Blank),
                     formula: None,
                 })
-                .formula = Some(formula.clone());
+                .formula = Some(cell.get_value().clone());
         }
     }
 
@@ -2468,6 +2526,57 @@ fn cached_clock_formula(formula: &str) -> Option<bool> {
     } else {
         None
     }
+}
+
+#[cfg(test)]
+fn occupied_from_ranges(
+    (name, values, formulas): (String, Range<Data>, Range<String>),
+) -> OccupiedSheet {
+    OccupiedSheet {
+        name,
+        values: absolute_used(values),
+        formulas: absolute_used(formulas),
+    }
+}
+
+#[cfg(test)]
+fn absolute_used<T: calamine::CellType + Clone>(range: Range<T>) -> Vec<Cell<T>> {
+    let (origin_row, origin_column) = range.start().unwrap_or((0, 0));
+    range
+        .used_cells()
+        .map(|(row, column, value)| {
+            Cell::new(
+                (origin_row + row as u32, origin_column + column as u32),
+                value.clone(),
+            )
+        })
+        .collect()
+}
+
+fn occupied_count(sheet: &OccupiedSheet) -> usize {
+    let mut positions = HashSet::new();
+    for cell in &sheet.values {
+        if !cell.get_value().is_empty() {
+            positions.insert(cell.get_position());
+        }
+    }
+    for cell in &sheet.formulas {
+        if !cell.get_value().is_empty() {
+            positions.insert(cell.get_position());
+        }
+    }
+    positions.len()
+}
+
+fn span_end(positions: impl Iterator<Item = (u32, u32)>) -> Option<(u32, u32)> {
+    let mut end: Option<(u32, u32)> = None;
+    for (row, column) in positions {
+        end = Some(match end {
+            None => (row, column),
+            Some((end_row, end_column)) => (end_row.max(row), end_column.max(column)),
+        });
+    }
+    end
 }
 
 fn range_extent(end: Option<(u32, u32)>) -> (usize, usize) {
@@ -3042,29 +3151,71 @@ mod tests {
     }
 
     #[test]
-    fn rejects_large_used_ranges_before_materialising_cells() {
-        let error = import_ranges(
+    fn occupied_cell_budget_ignores_the_bounding_box() {
+        let limits = ImportLimits {
+            max_cells: 100,
+            ..ImportLimits::default()
+        };
+        let imported = import_ranges(
             ranges(
                 vec![
                     Cell::new((0, 0), Data::Int(1)),
                     Cell::new((10, 10), Data::Int(2)),
                 ],
-                vec![],
+                vec![Cell::new((0, 0), "1+1".into())],
             ),
             "c".repeat(64),
+            limits,
+        )
+        .expect("two occupied cells inside an 11 by 11 box");
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 10, 10)),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 0)),
+            Value::Number(2.0)
+        );
+        let crowded: Vec<_> = (0..101).map(|row| Cell::new((row, 0), Data::Int(1))).collect();
+        let error = import_ranges(ranges(crowded, vec![]), "c".repeat(64), limits)
+            .err()
+            .expect("101 cells exceed the budget");
+        assert_eq!(
+            error,
+            ImportError::TooManyCells {
+                observed: 101,
+                maximum: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn sparse_sheet_does_not_allocate_its_used_range_box() {
+        let path = std::env::temp_dir().join(format!(
+            "omasheets-sparse-{}-{}.xlsx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        write_dimension_workbook(&path);
+        let imported = import_xlsx(
+            &path,
             ImportLimits {
                 max_cells: 100,
                 ..ImportLimits::default()
             },
         )
-        .err()
-        .expect("range should be rejected");
+        .expect("two cells under a full-grid dimension");
+        let _ = std::fs::remove_file(&path);
         assert_eq!(
-            error,
-            ImportError::TooManyCells {
-                observed: 121,
-                maximum: 100,
-            }
+            imported.workbook.value(CellId::new(0, 0, 0)),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 1_048_575, 16_383)),
+            Value::Number(2.0)
         );
     }
 
@@ -3210,7 +3361,7 @@ mod tests {
     #[test]
     fn maps_source_errors_and_defined_names_into_the_owned_engine() {
         let imported = import_ranges_with_names(
-            vec![(
+            vec![occupied_from_ranges((
                 "Data".into(),
                 Range::from_sparse(vec![
                     Cell::new((0, 0), Data::Int(10)),
@@ -3229,7 +3380,7 @@ mod tests {
                     Cell::new((4, 2), "[1]Other!A1".into()),
                     Cell::new((5, 2), "Broken".into()),
                 ]),
-            )],
+            ))],
             vec![
                 workbook_name("Rates", "Data!$A$1:$A$2"),
                 workbook_name("Broken", "[2]External!A1"),
@@ -3365,6 +3516,31 @@ mod tests {
                     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_string(),
                 ),
                 ("xl/worksheets/sheet1.xml", worksheet_xml(cells)),
+            ],
+        );
+    }
+
+    fn write_dimension_workbook(path: &Path) {
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:XFD1048576"/><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="1048576"><c r="XFD1048576"><v>2</v></c></row></sheetData></worksheet>"#;
+        write_plain_workbook_xml(path, sheet);
+    }
+
+    fn write_plain_workbook_xml(path: &Path, sheet_xml: &str) {
+        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        write_owned(
+            path,
+            &[
+                ("[Content_Types].xml", content_types("")),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/workbook.xml", workbook.to_string()),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/worksheets/sheet1.xml", sheet_xml.to_string()),
             ],
         );
     }
