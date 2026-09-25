@@ -5,7 +5,7 @@
   "manifest_sha256": "5d16d1e75b865ab3a7b004b435b3bedb53edaffc7766f3ccb77757d72d0893c3",
   "scored": "2026-09-25",
   "command": "omasheets-corpus score spreadsheet-rl-manifest.jsonl <root> <out> --timeout-seconds 30",
-  "engine_commit": "0f169a8fd53b473fc87669bf13bf709b2eeb25aa",
+  "engine_commit": "405867ea7da9f33ccd48acb8a2512b0b5ba674d9",
   "runner": "Darwin arm64, local cargo release; probe RLIMIT_AS returns EINVAL on this host and was allowed to succeed; not a GitHub ubuntu-latest runner",
   "candidate_engine": "formualizer-calamine-0.8.4",
   "candidate_summary": {
@@ -17,7 +17,7 @@
     "formula_cells_observed": 5264,
     "formula_cells_loaded": 5264,
     "formula_parse_rate": 1.0,
-    "peak_rss_bytes_max": 68927488
+    "peak_rss_bytes_max": 70287360
   },
   "owned_engine": "omasheets-owned-m0",
   "owned_summary": {
@@ -47,7 +47,7 @@
     },
     "workbooks_with_skipped_sheets": 0,
     "skipped_sheets": 0,
-    "peak_rss_bytes_max": 85049344
+    "peak_rss_bytes_max": 84934656
   },
   "owned_unsupported_functions": {},
   "candidate_failure_kinds": {
@@ -60,10 +60,10 @@
     "Aggregate only: no workbook paths, cell contents or per-file results are recorded here.",
     "Schema 1 aggregate summary derived from one omasheets-corpus schema 2 score. The per-workbook list is not stored.",
     "Source is Hugging Face Spreadsheet-RL (2026-05-17, CC-BY-SA-4.0), a 16-workbook sample. This is not the Enron corpus and not the full 33,015-file zip. The full zip was not scored.",
-    "Rescored 2026-09-25 at 0f169a8. Formula totals are unchanged from the 2026-09-24 sample score.",
+    "Rescored 2026-09-25 at 405867e after the occupied-cell budget. Formula totals are unchanged from the 0f169a8 sample score.",
     "The scored manifest is local and not vendored. Identifiers longer than 64 characters were shortened; the 16 digests are unchanged.",
     "Candidate formula-cell totals include only workbooks that lane opened. Workbooks that failed to open stay in the file count.",
     "macOS does not implement RLIMIT_AS. The probe still ran.",
-    "The 16-file totals in this file are unchanged. Three complex SpreadsheetBench-2 workbooks were rescored the same day at 0f169a8: 285,660 formula cells, 285,604 matched, 6 mismatched, 50 not compiled. PROPER on the valuation model now matches. The write-up is in spreadsheet-rl.md. Those passes are not folded into the numbers above."
+    "The 16-file totals in this file are unchanged. Three complex SpreadsheetBench-2 workbooks were rescored the same day at 405867e and reproduced the 0f169a8 totals: 285,660 formula cells, 285,604 matched, 6 mismatched, 50 not compiled. The write-up is in spreadsheet-rl.md. Those passes are not folded into the numbers above."
   ]
 }
