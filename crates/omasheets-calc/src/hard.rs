@@ -653,6 +653,32 @@ impl Workbook {
                 .iter()
                 .filter(|index| still_due(**index))
                 .count(),
+            Input::Range {
+                shape: RangeShape::Stack {
+                    first_sheet,
+                    last_sheet,
+                    row,
+                    column,
+                    rows,
+                    columns,
+                },
+            } => {
+                let mut count = 0;
+                self.for_each_stack_cell(
+                    first_sheet,
+                    last_sheet,
+                    row,
+                    column,
+                    rows,
+                    columns,
+                    |_position, index| {
+                        if still_due(index) {
+                            count += 1;
+                        }
+                    },
+                );
+                count
+            }
             _ => 0,
         }
     }

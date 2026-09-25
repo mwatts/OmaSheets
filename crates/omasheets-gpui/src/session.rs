@@ -6,7 +6,7 @@ use omasheets_core::{
     Actor, ActorKind, ApplyError, CellInput, CellRef, CellValue, Command, Document, DocumentId,
     Literal, ObjectId, SheetId, column_letters,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub const VISIBLE_ROWS: u32 = 32;
@@ -25,6 +25,8 @@ pub struct VisibleCell {
     pub row: usize,
     pub column: usize,
     pub text: String,
+    /// A number is right-aligned. Text, booleans, and errors are left-aligned.
+    pub numeric: bool,
     pub selected: bool,
     pub fill: Option<u32>,
     pub font: Option<u32>,
@@ -44,6 +46,9 @@ pub struct SpreadsheetSession {
     appearance: Option<AppearanceTile>,
     browse: Option<BrowseBook>,
     chrome: Option<SheetChrome>,
+    /// Pixel overrides keyed by the active sheet index and the column or row.
+    column_px: HashMap<(usize, usize), f32>,
+    row_px: HashMap<(usize, usize), f32>,
 }
 
 impl SpreadsheetSession {
@@ -108,6 +113,8 @@ impl SpreadsheetSession {
             appearance: None,
             browse: None,
             chrome: None,
+            column_px: HashMap::new(),
+            row_px: HashMap::new(),
         })
     }
 
@@ -239,6 +246,8 @@ impl SpreadsheetSession {
             appearance: None,
             browse: None,
             chrome: None,
+            column_px: HashMap::new(),
+            row_px: HashMap::new(),
         })
     }
 
@@ -399,12 +408,16 @@ impl SpreadsheetSession {
                 let row = self.origin_row as usize + row_offset as usize;
                 let column = self.origin_column as usize + column_offset as usize;
                 let selected = self.selection == Some(CellAddress { row, column });
-                let text = self.display_text(row, column);
-                let (fill, font, merged) = self.paint_facts(row as u32, column as u32);
+                let (text, numeric, format_color) = self.display_cell(row, column);
+                let (fill, mut font, merged) = self.paint_facts(row as u32, column as u32);
+                if let Some(color) = format_color {
+                    font = Some(color);
+                }
                 cells.push(VisibleCell {
                     row,
                     column,
                     text,
+                    numeric,
                     selected,
                     fill,
                     font,
@@ -416,12 +429,96 @@ impl SpreadsheetSession {
     }
 
     pub fn column_width_px(&self, column: usize) -> f32 {
+        if let Some(width) = self.column_px.get(&(self.active, column)) {
+            return *width;
+        }
         let width = self
             .appearance
             .as_ref()
             .and_then(|tile| tile.width(column as u32))
             .unwrap_or(9.0);
-        (width as f32 * 8.0).clamp(28.0, 240.0)
+        (width as f32 * 8.0).clamp(24.0, 2000.0)
+    }
+
+    pub fn row_height_px(&self, row: usize) -> f32 {
+        if let Some(height) = self.row_px.get(&(self.active, row)) {
+            return *height;
+        }
+        let points = self.row_points(row).unwrap_or(15.0);
+        (points as f32 * (22.0 / 15.0)).clamp(12.0, 400.0)
+    }
+
+    pub fn set_column_width_px(&mut self, column: usize, width: f32) {
+        self.column_px
+            .insert((self.active, column), width.clamp(24.0, 2000.0));
+    }
+
+    pub fn set_row_height_px(&mut self, row: usize, height: f32) {
+        self.row_px
+            .insert((self.active, row), height.clamp(12.0, 400.0));
+    }
+
+    /// Width from the longest displayed value in the column, 8 px per character plus padding.
+    pub fn autofit_column(&mut self, column: usize) {
+        let width = self.longest_text(Some(column), None) as f32 * 8.0 + 16.0;
+        self.set_column_width_px(column, width);
+    }
+
+    /// Unwrapped cells are one line. A double-click restores that line height.
+    pub fn autofit_row(&mut self, row: usize) {
+        self.set_row_height_px(row, 22.0);
+    }
+
+    fn row_points(&self, row: usize) -> Option<f64> {
+        let book = self.browse.as_ref()?;
+        let sheet = book.sheets.get(self.active)?;
+        let row = u32::try_from(row).ok()?;
+        book.row_points.get(&(sheet.index, row)).copied()
+    }
+
+    fn longest_text(&self, column: Option<usize>, row: Option<usize>) -> usize {
+        if let Some(book) = &self.browse {
+            let Some(sheet) = book.sheets.get(self.active) else {
+                return 0;
+            };
+            return book
+                .cells
+                .iter()
+                .filter_map(|((sheet_index, cell_row, cell_column), cell)| {
+                    if *sheet_index != sheet.index {
+                        return None;
+                    }
+                    if let Some(column) = column {
+                        if *cell_column as usize != column {
+                            return None;
+                        }
+                    }
+                    if let Some(row) = row {
+                        if *cell_row as usize != row {
+                            return None;
+                        }
+                    }
+                    Some(cell.text.chars().count())
+                })
+                .max()
+                .unwrap_or(0);
+        }
+        let (rows, columns) = self.sheet_bounds();
+        let mut longest = 0_usize;
+        let row_range = match row {
+            Some(row) => row..row.saturating_add(1),
+            None => 0..rows.min(256),
+        };
+        let column_range = match column {
+            Some(column) => column..column.saturating_add(1),
+            None => 0..columns.min(64),
+        };
+        for cell_row in row_range {
+            for cell_column in column_range.clone() {
+                longest = longest.max(self.display_cell(cell_row, cell_column).0.chars().count());
+            }
+        }
+        longest
     }
 
     fn paint_facts(&self, row: u32, column: u32) -> (Option<u32>, Option<u32>, bool) {
@@ -435,17 +532,19 @@ impl SpreadsheetSession {
         )
     }
 
-    fn display_text(&self, row: usize, column: usize) -> String {
+    fn display_cell(&self, row: usize, column: usize) -> (String, bool, Option<u32>) {
         if self.browse.is_some() {
             return self
                 .browse_cell(row, column)
-                .map(|cell| cell.text.clone())
+                .map(|cell| (cell.text.clone(), cell.numeric, cell.format_color))
                 .unwrap_or_default();
         }
         let Ok(cell) = self.cell_ref(row, column) else {
-            return String::new();
+            return (String::new(), false, None);
         };
-        display_value(&self.document.value(cell))
+        let value = self.document.value(cell);
+        let numeric = matches!(value, CellValue::Number(_));
+        (display_value(&value), numeric, None)
     }
 
     fn input_text(&self, row: usize, column: usize) -> String {
@@ -724,6 +823,103 @@ mod tests {
         );
         assert!(session.sheet_names().len() > 10);
         assert!(session.summary().contains("formulas"));
+    }
+
+    #[test]
+    fn column_and_row_sizes_follow_the_session() {
+        let mut session = SpreadsheetSession::open("book").expect("session");
+        assert_eq!(session.column_width_px(0), 72.0);
+        assert_eq!(session.row_height_px(0), 22.0);
+        session.set_column_width_px(0, 180.0);
+        assert_eq!(session.column_width_px(0), 180.0);
+        session.set_column_width_px(1, 5.0);
+        assert_eq!(session.column_width_px(1), 24.0);
+        session.set_row_height_px(0, 40.0);
+        assert_eq!(session.row_height_px(0), 40.0);
+        session.set_row_height_px(1, 1.0);
+        assert_eq!(session.row_height_px(1), 12.0);
+        session.autofit_column(0);
+        assert_eq!(session.column_width_px(0), 24.0);
+        session.autofit_row(0);
+        assert_eq!(session.row_height_px(0), 22.0);
+    }
+
+    #[test]
+    fn percent_format_is_visible_on_an_opened_sheet() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "omasheets-format-{}-{nonce}.xlsx",
+            std::process::id()
+        ));
+        write_percent_workbook(&path);
+        let session = SpreadsheetSession::open_xlsx(&path).expect("open formatted workbook");
+        let _ = std::fs::remove_file(&path);
+        let cells = session.visible_cells();
+        let percent = cells
+            .iter()
+            .find(|cell| cell.row == 0 && cell.column == 0)
+            .expect("A1");
+        assert_eq!(percent.text, "6.5%");
+        assert!(percent.numeric);
+        let text = cells
+            .iter()
+            .find(|cell| cell.row == 0 && cell.column == 1)
+            .expect("B1");
+        assert_eq!(text.text, "Hello");
+        assert!(!text.numeric);
+        let height = session.row_height_px(0);
+        assert!(
+            (height - 44.0).abs() < 0.05,
+            "row height {height} should follow the 30-point row"
+        );
+        assert_eq!(session.row_height_px(1), 22.0);
+        let scientific = cells
+            .iter()
+            .find(|cell| cell.row == 0 && cell.column == 2)
+            .expect("C1");
+        assert_eq!(scientific.text, "1.23E+03");
+        assert_eq!(scientific.font, Some(0xFF0000));
+    }
+
+    fn write_percent_workbook(path: &std::path::Path) {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let parts = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/styles.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="0.0%"/><numFmt numFmtId="165" formatCode="[Red]0.00E+00"/></numFmts><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="165"/></cellXfs></styleSheet>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" ht="30" customHeight="1"><c r="A1" s="1"><v>0.065</v></c><c r="B1" t="inlineStr"><is><t>Hello</t></is></c><c r="C1" s="2"><v>1234</v></c></row></sheetData></worksheet>"#,
+            ),
+        ];
+        for (name, body) in parts {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
     }
 }
 

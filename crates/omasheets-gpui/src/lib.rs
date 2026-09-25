@@ -8,6 +8,7 @@
 
 mod appearance;
 mod browse;
+mod format;
 mod session;
 mod view;
 

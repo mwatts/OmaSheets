@@ -5,6 +5,7 @@
 //! a document command. A formula the owned engine compiled shows that result.
 //! A formula it refused keeps the stored cache.
 
+use crate::format::{self, paint_number};
 use omasheets_calc::{CellId, Value};
 use omasheets_core::ApplyError;
 use omasheets_xlsx::{ImportError, ImportLimits, import_xlsx};
@@ -35,6 +36,10 @@ impl std::error::Error for LoadError {}
 pub(crate) struct BrowseCell {
     pub(crate) text: String,
     pub(crate) input: String,
+    /// True when the cell value is a number, so the grid right-aligns it.
+    pub(crate) numeric: bool,
+    /// `0xRRGGBB` from the number format, such as `[Red]`.
+    pub(crate) format_color: Option<u32>,
 }
 
 pub(crate) struct BrowseSheet {
@@ -49,6 +54,8 @@ pub(crate) struct BrowseBook {
     pub(crate) path: PathBuf,
     pub(crate) sheets: Vec<BrowseSheet>,
     pub(crate) cells: HashMap<(u32, u32, u32), BrowseCell>,
+    /// Custom row heights in points, keyed by engine sheet index and 0-based row.
+    pub(crate) row_points: HashMap<(u32, u32), f64>,
     pub(crate) occupied: usize,
     pub(crate) formulas: usize,
     /// Index into `sheets` of the first worksheet that has a cell.
@@ -62,6 +69,12 @@ pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
         return Err(LoadError::NoSheets);
     }
     let stored_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let look = format::read_workbook_look(path);
+    let names: HashMap<u32, String> = imported
+        .sheets
+        .iter()
+        .map(|sheet| (sheet.index, sheet.name.clone()))
+        .collect();
     let refused: HashSet<CellId> = imported.unsupported.iter().map(|item| item.cell).collect();
     let mut cells = HashMap::with_capacity(imported.source_cells().len());
     let mut formulas = 0_usize;
@@ -71,7 +84,16 @@ pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
         } else {
             source.stored.clone()
         };
-        let text = display_value(&value);
+        let sheet_name = names
+            .get(&source.cell.sheet)
+            .map(String::as_str)
+            .unwrap_or("");
+        let code = look
+            .formats
+            .get(&(sheet_name.to_string(), source.cell.row, source.cell.column))
+            .map(String::as_str)
+            .unwrap_or("");
+        let (text, numeric, format_color) = display_value(&value, code);
         let input = match &source.formula {
             Some(formula) => {
                 formulas += 1;
@@ -81,8 +103,25 @@ pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
         };
         cells.insert(
             (source.cell.sheet, source.cell.row, source.cell.column),
-            BrowseCell { text, input },
+            BrowseCell {
+                text,
+                input,
+                numeric,
+                format_color,
+            },
         );
+    }
+    let mut row_points = HashMap::new();
+    for ((name, row), points) in look.row_points {
+        let Some(index) = imported
+            .sheets
+            .iter()
+            .find(|sheet| sheet.name == name)
+            .map(|sheet| sheet.index)
+        else {
+            continue;
+        };
+        row_points.insert((index, row), points);
     }
     let occupied = cells.len();
     let first_sheet = imported
@@ -108,6 +147,7 @@ pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
         path: stored_path,
         sheets,
         cells,
+        row_points,
         occupied,
         formulas,
         first_occupied,
@@ -123,21 +163,16 @@ fn formula_source(formula: &str) -> String {
     }
 }
 
-fn display_value(value: &Value) -> String {
+fn display_value(value: &Value, code: &str) -> (String, bool, Option<u32>) {
     match value {
-        Value::Blank => String::new(),
-        Value::Number(number) => format_number(*number),
-        Value::Text(text) => text.clone(),
-        Value::Boolean(true) => "TRUE".to_string(),
-        Value::Boolean(false) => "FALSE".to_string(),
-        Value::Error(error) => error.label().to_string(),
-    }
-}
-
-fn format_number(number: f64) -> String {
-    if number.fract() == 0.0 && number.abs() < 1e15 {
-        format!("{}", number as i64)
-    } else {
-        format!("{number}")
+        Value::Blank => (String::new(), false, None),
+        Value::Number(number) => {
+            let painted = paint_number(*number, code);
+            (painted.text, true, painted.color)
+        }
+        Value::Text(text) => (text.clone(), false, None),
+        Value::Boolean(true) => ("TRUE".to_string(), false, None),
+        Value::Boolean(false) => ("FALSE".to_string(), false, None),
+        Value::Error(error) => (error.label().to_string(), false, None),
     }
 }

@@ -6,8 +6,8 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription,
-    Window, div, px, rgb,
+    MouseMoveEvent, ParentElement, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
+    Subscription, Window, div, px, rgb,
 };
 use omasheets_core::{ApplyError, Command};
 use std::path::Path;
@@ -29,6 +29,20 @@ pub enum SpreadsheetUiEvent {
     },
 }
 
+/// A header-edge drag. The view keeps it so a redraw does not drop the gesture.
+#[derive(Clone, Copy)]
+struct SizeDrag {
+    axis: ResizeAxis,
+    origin: f32,
+    start: f32,
+}
+
+#[derive(Clone, Copy)]
+enum ResizeAxis {
+    Column(usize),
+    Row(usize),
+}
+
 /// Embeddable spreadsheet. Hosts parent this view and subscribe to [`SpreadsheetUiEvent`].
 pub struct SpreadsheetView {
     session: SpreadsheetSession,
@@ -37,6 +51,7 @@ pub struct SpreadsheetView {
     scroll_rows: f32,
     scroll_cols: f32,
     chrome_epoch: u64,
+    resize: Option<SizeDrag>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -71,6 +86,7 @@ impl SpreadsheetView {
             scroll_rows: 0.0,
             scroll_cols: 0.0,
             chrome_epoch: 0,
+            resize: None,
             _subscriptions: subscriptions,
         };
         cx.defer_in(window, |this, window, cx| {
@@ -91,6 +107,7 @@ impl SpreadsheetView {
         cx: &mut Context<Self>,
     ) {
         self.session = session;
+        self.resize = None;
         self.scroll_rows = 0.0;
         self.scroll_cols = 0.0;
         self.sync_formula(window, cx);
@@ -150,6 +167,26 @@ impl SpreadsheetView {
             }
             Err(error) => self.fail(error, cx),
         }
+    }
+
+    fn drag_resize(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            self.resize = None;
+            return;
+        }
+        let Some(drag) = self.resize else {
+            return;
+        };
+        let current = match drag.axis {
+            ResizeAxis::Column(_) => event.position.x.as_f32(),
+            ResizeAxis::Row(_) => event.position.y.as_f32(),
+        };
+        let next = drag.start + (current - drag.origin);
+        match drag.axis {
+            ResizeAxis::Column(column) => self.session.set_column_width_px(column, next),
+            ResizeAxis::Row(row) => self.session.set_row_height_px(row, next),
+        }
+        cx.notify();
     }
 
     fn select_cell(
@@ -402,6 +439,7 @@ struct SheetGrid {
     row_labels: Vec<String>,
     cells: Vec<VisibleCell>,
     column_widths: Vec<f32>,
+    row_heights: Vec<f32>,
 }
 
 impl SheetGrid {
@@ -410,9 +448,14 @@ impl SheetGrid {
         view: Entity<SpreadsheetView>,
         focus: FocusHandle,
     ) -> Self {
-        let origin_column = session.visible_window().origin_column as usize;
+        let origin = session.visible_window();
+        let origin_column = origin.origin_column as usize;
+        let origin_row = origin.origin_row as usize;
         let column_widths = (0..VISIBLE_COLUMNS)
             .map(|offset| session.column_width_px(origin_column + offset as usize))
+            .collect();
+        let row_heights = (0..VISIBLE_ROWS)
+            .map(|offset| session.row_height_px(origin_row + offset as usize))
             .collect();
         Self {
             view,
@@ -421,6 +464,7 @@ impl SheetGrid {
             row_labels: session.row_labels(),
             cells: session.visible_cells(),
             column_widths,
+            row_heights,
         }
     }
 }
@@ -446,16 +490,35 @@ impl RenderOnce for SheetGrid {
             ];
             headers.extend(self.column_labels.iter().enumerate().map(|(index, label)| {
                 let width = self.column_widths.get(index).copied().unwrap_or(72.0);
+                let column = self
+                    .cells
+                    .get(index)
+                    .map(|cell| cell.column)
+                    .unwrap_or(index);
                 div()
                     .w(px(width))
                     .h(px(22.))
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_center()
                     .bg(rgb(0xf3f3f3))
                     .border_1()
                     .border_color(rgb(0xd0d0d0))
-                    .child(label.clone())
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .child(label.clone()),
+                    )
+                    .child(edge_handle(
+                        self.view.clone(),
+                        ResizeAxis::Column(column),
+                        6.0,
+                        22.0,
+                    ))
             }));
             headers
         });
@@ -463,17 +526,36 @@ impl RenderOnce for SheetGrid {
         let mut rows = Vec::with_capacity(VISIBLE_ROWS as usize);
         for row_offset in 0..VISIBLE_ROWS as usize {
             let label = self.row_labels.get(row_offset).cloned().unwrap_or_default();
+            let height = self.row_heights.get(row_offset).copied().unwrap_or(22.0);
+            let row_index = self
+                .cells
+                .get(row_offset * VISIBLE_COLUMNS as usize)
+                .map(|cell| cell.row)
+                .unwrap_or(row_offset);
             let mut row = div().flex().flex_row().child(
                 div()
                     .w(px(48.))
-                    .h(px(22.))
+                    .h(px(height))
                     .flex()
-                    .items_center()
-                    .justify_center()
+                    .flex_col()
                     .bg(rgb(0xf3f3f3))
                     .border_1()
                     .border_color(rgb(0xd0d0d0))
-                    .child(label),
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .child(label),
+                    )
+                    .child(edge_handle(
+                        self.view.clone(),
+                        ResizeAxis::Row(row_index),
+                        48.0,
+                        6.0,
+                    )),
             );
             for column_offset in 0..VISIBLE_COLUMNS as usize {
                 let index = row_offset * VISIBLE_COLUMNS as usize + column_offset;
@@ -500,11 +582,16 @@ impl RenderOnce for SheetGrid {
                 let row_index = cell.row;
                 let column_index = cell.column;
                 let id = SharedString::from(format!("cell-{row_index}-{column_index}"));
+                let align = if cell.numeric {
+                    div().justify_end()
+                } else {
+                    div().justify_start()
+                };
                 row = row.child(
-                    div()
+                    align
                         .id(id)
                         .w(px(width))
-                        .h(px(22.))
+                        .h(px(height))
                         .px_1()
                         .flex()
                         .items_center()
@@ -516,6 +603,7 @@ impl RenderOnce for SheetGrid {
                         .child(cell.text.clone())
                         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                             view.update(cx, |this, cx| {
+                                this.resize = None;
                                 this.grid_focus.focus(window, cx);
                                 this.select_cell(row_index, column_index, window, cx);
                             });
@@ -548,7 +636,58 @@ impl RenderOnce for SheetGrid {
             .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                 focus.focus(window, cx);
             })
+            .on_mouse_move({
+                let view = self.view.clone();
+                move |event: &MouseMoveEvent, _window, cx| {
+                    view.update(cx, |this, cx| this.drag_resize(event, cx));
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let view = self.view.clone();
+                move |_event, _window, cx| {
+                    view.update(cx, |this, cx| {
+                        if this.resize.take().is_some() {
+                            cx.notify();
+                        }
+                    });
+                }
+            })
             .child(header)
             .children(rows)
     }
+}
+
+/// The header border is the hit target. GPUI's mouse-down callback does not
+/// include the element bounds, so the edge is its own element.
+fn edge_handle(view: Entity<SpreadsheetView>, axis: ResizeAxis, width: f32, height: f32) -> gpui_kit::Div {
+    div()
+        .w(px(width))
+        .h(px(height))
+        .on_mouse_down(MouseButton::Left, move |event, _window, cx| {
+            cx.stop_propagation();
+            let position = match axis {
+                ResizeAxis::Column(_) => event.position.x.as_f32(),
+                ResizeAxis::Row(_) => event.position.y.as_f32(),
+            };
+            view.update(cx, |this, cx| {
+                if event.click_count >= 2 {
+                    this.resize = None;
+                    match axis {
+                        ResizeAxis::Column(column) => this.session.autofit_column(column),
+                        ResizeAxis::Row(row) => this.session.autofit_row(row),
+                    }
+                } else {
+                    let start = match axis {
+                        ResizeAxis::Column(column) => this.session.column_width_px(column),
+                        ResizeAxis::Row(row) => this.session.row_height_px(row),
+                    };
+                    this.resize = Some(SizeDrag {
+                        axis,
+                        origin: position,
+                        start,
+                    });
+                }
+                cx.notify();
+            });
+        })
 }

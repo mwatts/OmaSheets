@@ -239,6 +239,16 @@ enum Expr<R = CellId> {
         rows: usize,
         columns: usize,
     },
+    /// The same rectangle on every sheet from `first_sheet` through
+    /// `last_sheet` in workbook order. `SUM(Brownsville:Wilton!G39)`.
+    SheetSpan {
+        first_sheet: u32,
+        last_sheet: u32,
+        row: u32,
+        column: u32,
+        rows: usize,
+        columns: usize,
+    },
     /// A compiled range: one shared node in the workbook graph whose
     /// dependencies are the member cells. Every formula over the same cells
     /// points at the same node, so a range costs its members once, not once
@@ -290,6 +300,15 @@ enum RangeKey {
         rows: usize,
         columns: usize,
     },
+    /// One rectangle repeated on each sheet from `first_sheet` through `last_sheet`.
+    Stack {
+        first_sheet: u32,
+        last_sheet: u32,
+        row: u32,
+        column: u32,
+        rows: usize,
+        columns: usize,
+    },
 }
 
 fn range_key_covers(key: &RangeKey, cell: CellId) -> bool {
@@ -306,7 +325,40 @@ fn range_key_covers(key: &RangeKey, cell: CellId) -> bool {
                 && (cell.column - anchor.column) < *columns as u32
         }
         RangeKey::Members { members, .. } => members.contains(&cell),
+        RangeKey::Stack {
+            first_sheet,
+            last_sheet,
+            row,
+            column,
+            rows,
+            columns,
+        } => stack_covers(
+            *first_sheet,
+            *last_sheet,
+            *row,
+            *column,
+            *rows,
+            *columns,
+            cell,
+        ),
     }
+}
+
+fn stack_covers(
+    first_sheet: u32,
+    last_sheet: u32,
+    row: u32,
+    column: u32,
+    rows: usize,
+    columns: usize,
+    cell: CellId,
+) -> bool {
+    cell.sheet >= first_sheet
+        && cell.sheet <= last_sheet
+        && cell.row >= row
+        && cell.column >= column
+        && (cell.row - row) < rows as u32
+        && (cell.column - column) < columns as u32
 }
 
 fn range_key(
@@ -391,6 +443,7 @@ enum Function {
     Trim,
     Upper,
     Lower,
+    Proper,
     Concat,
     TextJoin,
     Value,
@@ -567,6 +620,15 @@ fn count_references(expression: &Expr<CellId>) -> usize {
     match expression {
         Expr::Reference(_) => 1,
         Expr::Range { rows, columns, .. } => rows.saturating_mul(*columns),
+        Expr::SheetSpan {
+            first_sheet,
+            last_sheet,
+            rows,
+            columns,
+            ..
+        } => (*last_sheet - *first_sheet + 1)
+            .saturating_mul(*rows as u32)
+            .saturating_mul(*columns as u32) as usize,
         Expr::UnaryMinus(inner) | Expr::Percent(inner) => count_references(inner),
         Expr::Binary(_, left, right) => {
             count_references(left).saturating_add(count_references(right))
@@ -592,6 +654,23 @@ fn visit_reference_groups(expression: &Expr<CellId>, groups: &mut Vec<ReferenceG
             rows: *rows,
             columns: *columns,
         }),
+        Expr::SheetSpan {
+            first_sheet,
+            last_sheet,
+            row,
+            column,
+            rows,
+            columns,
+        } => {
+            for sheet in *first_sheet..=*last_sheet {
+                groups.push(ReferenceGroup::Range {
+                    anchor: CellId::new(sheet, *row, *column),
+                    members: None,
+                    rows: *rows,
+                    columns: *columns,
+                });
+            }
+        }
         Expr::UnaryMinus(inner) | Expr::Percent(inner) => visit_reference_groups(inner, groups),
         Expr::Binary(_, left, right) => {
             visit_reference_groups(left, groups);
@@ -623,6 +702,18 @@ fn visit_references(expression: &Expr<CellId>, visit: &mut impl FnMut(CellId)) {
             Some(members) => members.iter().for_each(|cell| visit(*cell)),
             None => rectangle_cells(*anchor, *rows, *columns).for_each(visit),
         },
+        Expr::SheetSpan {
+            first_sheet,
+            last_sheet,
+            row,
+            column,
+            rows,
+            columns,
+        } => {
+            for sheet in *first_sheet..=*last_sheet {
+                rectangle_cells(CellId::new(sheet, *row, *column), *rows, *columns).for_each(&mut *visit);
+            }
+        }
         Expr::Function(_, items) => {
             for item in items {
                 visit_references(item, visit);
@@ -672,6 +763,28 @@ fn rebind_references(expression: &mut Expr<CellId>, map: &mut impl FnMut(CellId)
             *anchor = first;
             *members = if rectangular { None } else { Some(mapped) };
         }
+        Expr::SheetSpan {
+            first_sheet,
+            last_sheet,
+            row,
+            column,
+            rows,
+            columns,
+        } => {
+            let anchor = map(CellId::new(*first_sheet, *row, *column));
+            let end = map(CellId::new(
+                *first_sheet,
+                row.saturating_add(*rows as u32).saturating_sub(1),
+                column.saturating_add(*columns as u32).saturating_sub(1),
+            ));
+            let last = map(CellId::new(*last_sheet, *row, *column));
+            *first_sheet = anchor.sheet.min(last.sheet);
+            *last_sheet = anchor.sheet.max(last.sheet);
+            *row = anchor.row.min(end.row);
+            *column = anchor.column.min(end.column);
+            *rows = (anchor.row.max(end.row) - *row + 1) as usize;
+            *columns = (anchor.column.max(end.column) - *column + 1) as usize;
+        }
         Expr::Function(_, items) => {
             for item in items {
                 rebind_references(item, map);
@@ -720,6 +833,14 @@ enum RangeShape {
         columns: usize,
     },
     Members {
+        rows: usize,
+        columns: usize,
+    },
+    Stack {
+        first_sheet: u32,
+        last_sheet: u32,
+        row: u32,
+        column: u32,
         rows: usize,
         columns: usize,
     },
@@ -1151,6 +1272,36 @@ impl Workbook {
                     value: Value::Blank,
                 }
             }
+            RangeKey::Stack {
+                first_sheet,
+                last_sheet,
+                row,
+                column,
+                rows,
+                columns,
+            } => {
+                let anchor = CellId::new(*first_sheet, *row, *column);
+                self.register_range_bands(node, anchor, *rows);
+                for sheet in first_sheet.saturating_add(1)..=*last_sheet {
+                    self.register_range_bands(node, CellId::new(sheet, *row, *column), *rows);
+                }
+                Cell {
+                    id: anchor,
+                    input: Input::Range {
+                        shape: RangeShape::Stack {
+                            first_sheet: *first_sheet,
+                            last_sheet: *last_sheet,
+                            row: *row,
+                            column: *column,
+                            rows: *rows,
+                            columns: *columns,
+                        },
+                    },
+                    dependencies: Vec::new(),
+                    dependents: Vec::new(),
+                    value: Value::Blank,
+                }
+            }
         };
         if node == self.cells.len() {
             self.cells.push(cell);
@@ -1205,6 +1356,30 @@ impl Workbook {
                 rows,
                 columns,
             },
+            RangeShape::Stack {
+                first_sheet,
+                last_sheet,
+                row,
+                column,
+                rows,
+                columns,
+            } => {
+                for sheet in first_sheet..=last_sheet {
+                    self.unregister_range_bands(
+                        node,
+                        CellId::new(sheet, row, column),
+                        rows,
+                    );
+                }
+                RangeKey::Stack {
+                    first_sheet,
+                    last_sheet,
+                    row,
+                    column,
+                    rows,
+                    columns,
+                }
+            }
         };
         self.ranges.remove(&key);
         let dependencies = std::mem::take(&mut self.cells[node].dependencies);
@@ -1239,6 +1414,51 @@ impl Workbook {
                     && cell.column < anchor.column + columns as u32
             }
             RangeShape::Members { .. } => false,
+            RangeShape::Stack {
+                first_sheet,
+                last_sheet,
+                row,
+                column,
+                rows,
+                columns,
+            } => stack_covers(
+                first_sheet,
+                last_sheet,
+                row,
+                column,
+                rows,
+                columns,
+                cell,
+            ),
+        }
+    }
+
+    fn register_range_bands(&mut self, node: usize, anchor: CellId, rows: usize) {
+        if rows == 0 {
+            return;
+        }
+        let last_row = anchor.row + (rows as u32 - 1);
+        for band in anchor.row / RANGE_BAND_ROWS..=last_row / RANGE_BAND_ROWS {
+            self.range_bands
+                .entry((anchor.sheet, band))
+                .or_default()
+                .push(node);
+        }
+    }
+
+    fn unregister_range_bands(&mut self, node: usize, anchor: CellId, rows: usize) {
+        if rows == 0 {
+            return;
+        }
+        let last_row = anchor.row + (rows as u32 - 1);
+        for band in anchor.row / RANGE_BAND_ROWS..=last_row / RANGE_BAND_ROWS {
+            let key = (anchor.sheet, band);
+            if let Some(nodes) = self.range_bands.get_mut(&key) {
+                nodes.retain(|candidate| *candidate != node);
+                if nodes.is_empty() {
+                    self.range_bands.remove(&key);
+                }
+            }
         }
     }
 
@@ -1302,6 +1522,26 @@ impl Workbook {
                 ))
                 .copied(),
             RangeShape::Members { .. } => Some(self.cells[node].dependencies[index]),
+            RangeShape::Stack {
+                first_sheet,
+                row,
+                column,
+                rows,
+                columns,
+                ..
+            } => {
+                let per = rows.saturating_mul(columns);
+                if per == 0 {
+                    return None;
+                }
+                let sheet = first_sheet + (index / per) as u32;
+                let within = index % per;
+                self.indices.get(&CellId::new(
+                    sheet,
+                    row + (within / columns.max(1)) as u32,
+                    column + (within % columns.max(1)) as u32,
+                )).copied()
+            }
         }
     }
 
@@ -1365,6 +1605,31 @@ impl Workbook {
                 .iter()
                 .map(|member| Some(*member))
                 .collect(),
+            RangeShape::Stack {
+                first_sheet,
+                last_sheet,
+                row,
+                column,
+                rows,
+                columns,
+            } => {
+                let sheets = (last_sheet - first_sheet + 1) as usize;
+                let count = sheets.saturating_mul(rows).saturating_mul(columns);
+                if count > DENSE_RANGE_CELLS {
+                    return vec![None];
+                }
+                let mut output = vec![None; count];
+                self.for_each_stack_cell(
+                    first_sheet,
+                    last_sheet,
+                    row,
+                    column,
+                    rows,
+                    columns,
+                    |position, index| output[position] = Some(index),
+                );
+                output
+            }
         }
     }
 
@@ -1391,6 +1656,53 @@ impl Workbook {
                 .iter()
                 .map(|member| self.cells[*member].value.clone())
                 .collect(),
+            RangeShape::Stack {
+                first_sheet,
+                last_sheet,
+                row,
+                column,
+                rows,
+                columns,
+            } => {
+                let sheets = (last_sheet - first_sheet + 1) as usize;
+                let count = sheets.saturating_mul(rows).saturating_mul(columns);
+                if count > DENSE_RANGE_CELLS {
+                    return vec![Value::Error(CalcError::InvalidValue)];
+                }
+                let mut output = vec![Value::Blank; count];
+                self.for_each_stack_cell(
+                    first_sheet,
+                    last_sheet,
+                    row,
+                    column,
+                    rows,
+                    columns,
+                    |position, index| output[position] = self.cells[index].value.clone(),
+                );
+                output
+            }
+        }
+    }
+
+    fn for_each_stack_cell(
+        &self,
+        first_sheet: u32,
+        last_sheet: u32,
+        row: u32,
+        column: u32,
+        rows: usize,
+        columns: usize,
+        mut visit: impl FnMut(usize, usize),
+    ) {
+        let per = rows.saturating_mul(columns);
+        for (offset, sheet) in (first_sheet..=last_sheet).enumerate() {
+            let base = offset.saturating_mul(per);
+            self.for_each_rectangle_cell(
+                CellId::new(sheet, row, column),
+                rows,
+                columns,
+                |position, index| visit(base + position, index),
+            );
         }
     }
 
@@ -1739,7 +2051,9 @@ impl Workbook {
                 rows,
                 columns,
             } => self.implicit_intersection(*node, *rows, *columns),
-            Expr::Range { .. } => unreachable!("parsed ranges are compiled to range nodes"),
+            Expr::Range { .. } | Expr::SheetSpan { .. } => {
+                unreachable!("parsed ranges are compiled to range nodes")
+            }
             // External references are lowered to literals while parsing.
             Expr::External(_) | Expr::ExternalRange { .. } => {
                 Value::Error(CalcError::InvalidReference)
@@ -1784,6 +2098,8 @@ impl Workbook {
                 let id = self.cells[*member].id;
                 (columns == 1 || id.column == origin.column) && (rows == 1 || id.row == origin.row)
             }),
+            // A 3D reference is not a single value. Excel returns #VALUE!.
+            RangeShape::Stack { .. } => return Value::Error(CalcError::InvalidValue),
         };
         match chosen {
             Some(index) => self.range_value(node, index),
@@ -2133,6 +2449,7 @@ impl Workbook {
             }),
             Function::Upper => text_unary(&values, |value| value.to_uppercase()),
             Function::Lower => text_unary(&values, |value| value.to_lowercase()),
+            Function::Proper => text_unary(&values, proper_text),
             Function::Concat => concatenate(&values),
             Function::Value => parse_text_number(&values),
             Function::Exact => exact_text(&values),
@@ -2892,6 +3209,24 @@ impl Workbook {
                             visit(&self.cells[*index].value);
                         }
                     }
+                    RangeShape::Stack {
+                        first_sheet,
+                        last_sheet,
+                        row,
+                        column,
+                        rows,
+                        columns,
+                    } => {
+                        self.for_each_stack_cell(
+                            first_sheet,
+                            last_sheet,
+                            row,
+                            column,
+                            rows,
+                            columns,
+                            |_, index| visit(&self.cells[index].value),
+                        );
+                    }
                 },
                 Expr::Function(Function::ReferenceSpan | Function::Index, _) => {
                     match self.reference_view(argument) {
@@ -3646,6 +3981,7 @@ fn is_elementwise(function: Function) -> bool {
             | Function::Trim
             | Function::Upper
             | Function::Lower
+            | Function::Proper
             | Function::Concat
             | Function::Value
             | Function::Exact
@@ -4752,6 +5088,28 @@ fn text_unary(values: &[Value], operation: impl FnOnce(&str) -> String) -> Value
     }
 }
 
+/// Excel PROPER: a Unicode letter is capitalized when it is the first character
+/// or the previous character is not a letter. Every other letter is lowercased.
+/// An apostrophe is not a letter, so the following letter is capitalized.
+fn proper_text(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut capitalize_next = true;
+    for character in value.chars() {
+        if character.is_alphabetic() {
+            if capitalize_next {
+                result.extend(character.to_uppercase());
+            } else {
+                result.extend(character.to_lowercase());
+            }
+            capitalize_next = false;
+        } else {
+            result.push(character);
+            capitalize_next = true;
+        }
+    }
+    result
+}
+
 fn text_length(values: &[Value]) -> Value {
     if values.len() != 1 {
         return Value::Error(CalcError::InvalidArguments);
@@ -5302,6 +5660,28 @@ fn compile_expression(
             rows,
             columns,
         },
+        Expr::SheetSpan {
+            first_sheet,
+            last_sheet,
+            row,
+            column,
+            rows,
+            columns,
+        } => {
+            let sheets = (last_sheet - first_sheet + 1) as usize;
+            Expr::RangeNode {
+                node: range_nodes[&RangeKey::Stack {
+                    first_sheet,
+                    last_sheet,
+                    row,
+                    column,
+                    rows,
+                    columns,
+                }],
+                rows: sheets.saturating_mul(rows),
+                columns,
+            }
+        }
         Expr::RangeNode { .. } => unreachable!("parsed formulas never hold range nodes"),
         Expr::External(_) | Expr::ExternalRange { .. } => Expr::Error(CalcError::InvalidReference),
         Expr::Function(function, arguments) => Expr::Function(
@@ -5406,6 +5786,21 @@ fn collect_dependencies(
             rows,
             columns,
         } => ranges.push(range_key(*anchor, members.clone(), *rows, *columns)),
+        Expr::SheetSpan {
+            first_sheet,
+            last_sheet,
+            row,
+            column,
+            rows,
+            columns,
+        } => ranges.push(RangeKey::Stack {
+            first_sheet: *first_sheet,
+            last_sheet: *last_sheet,
+            row: *row,
+            column: *column,
+            rows: *rows,
+            columns: *columns,
+        }),
         Expr::Function(Function::Offset, arguments) => {
             // The starting address is not a value. A reference there is
             // recorded by `collect_offset_anchors` so it can be compiled.
@@ -6236,6 +6631,11 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         {
             return self.parse_whole_axis(token, self.sheet);
         }
+        if self.peek() == Some(b':') {
+            if let Some(span) = self.parse_sheet_span(token)? {
+                return Ok(span);
+            }
+        }
         if self.peek() == Some(b'!') {
             let sheet = self.resolve_sheet(token)?;
             self.offset += 1;
@@ -6381,6 +6781,14 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         let start = self.offset;
         let sheet_name = self.read_quoted_sheet_body()?;
         self.skip_space();
+        if let Some((left, right)) = split_sheet_span(&sheet_name) {
+            if self.resolve_sheet(left).is_ok() || self.resolve_sheet(right).is_ok() {
+                self.expect(b'!')?;
+                let first = self.resolve_sheet(left)?;
+                let second = self.resolve_sheet(right)?;
+                return self.finish_sheet_span(first, second);
+            }
+        }
         if let Some(parsed) = split_external_qualifier(&sheet_name) {
             if self.peek() != Some(b'!') {
                 return Err(self.external_error_at(start));
@@ -6493,6 +6901,10 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
     }
 
     fn parse_row_range(&mut self) -> Result<Expr, FormulaError> {
+        self.parse_row_range_on(self.sheet)
+    }
+
+    fn parse_row_range_on(&mut self, sheet: u32) -> Result<Expr, FormulaError> {
         let start = self.offset;
         if self.peek() == Some(b'$') {
             self.offset += 1;
@@ -6516,8 +6928,8 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             FormulaError::InvalidReference(self.source[start..].chars().take(32).collect())
         })?;
         expand_range(
-            CellId::new(self.sheet, top.min(bottom), 0),
-            CellId::new(self.sheet, top.max(bottom), MAX_COLUMNS - 1),
+            CellId::new(sheet, top.min(bottom), 0),
+            CellId::new(sheet, top.max(bottom), MAX_COLUMNS - 1),
         )
     }
 
@@ -6779,6 +7191,139 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         FormulaError::ExternalReference(self.source[start..].chars().take(64).collect())
     }
 
+    /// `Brownsville:Wilton!G39` and `'New Albany:Wilton'!A1:B2`. Both names are
+    /// sheets, and the span is every sheet between them in workbook order.
+    fn parse_sheet_span(&mut self, first_name: &str) -> Result<Option<Expr>, FormulaError> {
+        if self.peek() != Some(b':') {
+            return Ok(None);
+        }
+        if column_number(first_name).is_some() || row_number(first_name).is_some() {
+            return Ok(None);
+        }
+        let saved = self.offset;
+        self.offset += 1;
+        self.skip_space();
+        let second_start = self.offset;
+        while self
+            .peek()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+        {
+            self.offset += 1;
+        }
+        if self.offset == second_start {
+            self.offset = saved;
+            return Ok(None);
+        }
+        let second_name = self.source[second_start..self.offset].to_string();
+        self.skip_space();
+        if self.peek() != Some(b'!') {
+            self.offset = saved;
+            return Ok(None);
+        }
+        let Ok(first) = self.resolve_sheet(first_name) else {
+            self.offset = saved;
+            return Ok(None);
+        };
+        let Ok(second) = self.resolve_sheet(&second_name) else {
+            return Err(FormulaError::UnknownSheet(second_name));
+        };
+        self.offset += 1;
+        self.finish_sheet_span(first, second).map(Some)
+    }
+
+    fn finish_sheet_span(&mut self, first: u32, second: u32) -> Result<Expr, FormulaError> {
+        self.skip_space();
+        if self.remaining().starts_with("#REF!") {
+            self.offset += "#REF!".len();
+            return Ok(Expr::Error(CalcError::InvalidReference));
+        }
+        let low = first.min(second);
+        let high = first.max(second);
+        let area = self.parse_area_on_sheet(low)?;
+        let (row, column, rows, columns) = match area {
+            Expr::Reference(cell) => (cell.row, cell.column, 1_usize, 1_usize),
+            Expr::Range {
+                anchor,
+                rows,
+                columns,
+                members: None,
+            } => (anchor.row, anchor.column, rows, columns),
+            Expr::Error(error) => return Ok(Expr::Error(error)),
+            _ => {
+                return Err(FormulaError::InvalidReference(
+                    "3D reference".into(),
+                ))
+            }
+        };
+        if low == high {
+            return if rows == 1 && columns == 1 {
+                Ok(Expr::Reference(CellId::new(low, row, column)))
+            } else {
+                expand_range(
+                    CellId::new(low, row, column),
+                    CellId::new(
+                        low,
+                        row + rows as u32 - 1,
+                        column + columns as u32 - 1,
+                    ),
+                )
+            };
+        }
+        Ok(Expr::SheetSpan {
+            first_sheet: low,
+            last_sheet: high,
+            row,
+            column,
+            rows,
+            columns,
+        })
+    }
+
+    fn parse_area_on_sheet(&mut self, sheet: u32) -> Result<Expr, FormulaError> {
+        if self.starts_row_range() {
+            return self.parse_row_range_on(sheet);
+        }
+        let start = self.offset;
+        while self.peek().is_some_and(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'_' | b'.')
+        }) {
+            self.offset += 1;
+        }
+        if self.offset == start {
+            return Err(FormulaError::InvalidReference(
+                self.source[start..].chars().take(32).collect(),
+            ));
+        }
+        let token = &self.source[start..self.offset];
+        self.skip_space();
+        if self.peek() == Some(b':')
+            && (column_number(token).is_some() || row_number(token).is_some())
+        {
+            return self.parse_whole_axis(token, sheet);
+        }
+        let first = parse_a1(token, sheet)?;
+        self.skip_space();
+        if self.peek() != Some(b':') {
+            return Ok(Expr::Reference(first));
+        }
+        self.offset += 1;
+        self.skip_space();
+        let end_start = self.offset;
+        while self
+            .peek()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'$')
+        {
+            self.offset += 1;
+        }
+        if self.offset == end_start {
+            return Err(FormulaError::InvalidReference(
+                self.source[end_start..].chars().take(32).collect(),
+            ));
+        }
+        let second = parse_a1(&self.source[end_start..self.offset], sheet)?;
+        expand_range(first, second)
+    }
+
     fn parse_qualified_reference(&mut self, sheet: u32) -> Result<Expr, FormulaError> {
         self.skip_space();
         // A deleted cell on another sheet is stored as `Sheet!#REF!`; it is
@@ -6999,6 +7544,7 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("TRIM", Function::Trim),
     ("UPPER", Function::Upper),
     ("LOWER", Function::Lower),
+    ("PROPER", Function::Proper),
     ("CONCAT", Function::Concat),
     ("CONCATENATE", Function::Concat),
     ("TEXTJOIN", Function::TextJoin),
@@ -7424,6 +7970,17 @@ fn column_number(token: &str) -> Option<u32> {
         return None;
     }
     Some(column - 1)
+}
+
+/// `'New Albany:Wilton'` is a 3D span. A sheet name cannot contain a colon.
+fn split_sheet_span(name: &str) -> Option<(&str, &str)> {
+    let colon = name.find(':')?;
+    let left = name[..colon].trim();
+    let right = name[colon + 1..].trim();
+    if left.is_empty() || right.is_empty() || right.contains(':') {
+        return None;
+    }
+    Some((left, right))
 }
 
 fn row_number(token: &str) -> Option<u32> {
@@ -8127,6 +8684,21 @@ mod tests {
     }
 
     #[test]
+    fn proper_title_cases_words_and_capitalizes_the_letter_after_an_apostrophe() {
+        let mut workbook = Workbook::default();
+        for (column, formula, expected) in [
+            (0, "=PROPER(\"don't\")", Value::Text("Don'T".into())),
+            (1, "=PROPER(\"hello world\")", Value::Text("Hello World".into())),
+            (2, "=PROPER(\"o'reilly\")", Value::Text("O'Reilly".into())),
+            (3, "=PROPER(\"123abc\")", Value::Text("123Abc".into())),
+            (4, "=PROPER(\"hELLo wORLD\")", Value::Text("Hello World".into())),
+        ] {
+            workbook.set_formula(cell(0, column), formula).unwrap();
+            assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
+        }
+    }
+
+    #[test]
     fn evaluates_countif_and_sumif_without_losing_range_alignment() {
         let mut workbook = Workbook::default();
         for row in 0..5 {
@@ -8762,6 +9334,55 @@ mod tests {
             workbook.set_formula(cell(1, 0), "=#BOGUS!"),
             Err(FormulaError::UnexpectedToken(0))
         );
+    }
+
+    #[test]
+    fn three_dimensional_reference_sums_every_sheet_in_the_span() {
+        let mut workbook = Workbook::default();
+        workbook.define_sheet(0, "IRR");
+        workbook.define_sheet(1, "Brownsville");
+        workbook.define_sheet(2, "Caledonia");
+        workbook.define_sheet(3, "New Albany");
+        workbook.define_sheet(4, "Wilton");
+        workbook.set_number(CellId::new(1, 38, 6), 10.0);
+        workbook.set_number(CellId::new(2, 38, 6), 20.0);
+        workbook.set_number(CellId::new(3, 38, 6), 5.0);
+        workbook.set_number(CellId::new(4, 38, 6), 30.0);
+        workbook.set_number(CellId::new(1, 0, 0), 1.0);
+        workbook.set_number(CellId::new(1, 0, 1), 2.0);
+        workbook
+            .set_formula(CellId::new(0, 0, 0), "=SUM(Brownsville:Wilton!G39)")
+            .unwrap();
+        assert_eq!(workbook.value(CellId::new(0, 0, 0)), Value::Number(65.0));
+        workbook
+            .set_formula(CellId::new(0, 1, 0), "=SUM(Wilton:Brownsville!G39)")
+            .unwrap();
+        assert_eq!(workbook.value(CellId::new(0, 1, 0)), Value::Number(65.0));
+        workbook
+            .set_formula(
+                CellId::new(0, 2, 0),
+                "=SUM('Brownsville:New Albany'!A1:B1)",
+            )
+            .unwrap();
+        assert_eq!(workbook.value(CellId::new(0, 2, 0)), Value::Number(3.0));
+        workbook
+            .set_formula(CellId::new(0, 3, 0), "=Brownsville:Wilton!G39")
+            .unwrap();
+        assert_eq!(
+            workbook.value(CellId::new(0, 3, 0)),
+            Value::Error(CalcError::InvalidValue)
+        );
+        workbook.set_number(CellId::new(4, 38, 6), 40.0);
+        assert_eq!(workbook.value(CellId::new(0, 0, 0)), Value::Number(75.0));
+        let cycle = workbook.set_formula(CellId::new(2, 38, 6), "=SUM(Brownsville:Wilton!G39)");
+        assert!(
+            matches!(cycle, Err(FormulaError::Cycle(_))),
+            "{cycle:?}"
+        );
+        assert!(matches!(
+            workbook.set_formula(CellId::new(0, 4, 0), "=SUM(Brownsville:Missing!A1)"),
+            Err(FormulaError::UnknownSheet(_))
+        ));
     }
 
     #[test]
