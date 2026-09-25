@@ -2,11 +2,11 @@
 
 Source: [Spreadsheet-RL](https://huggingface.co/datasets/Spreadsheet-RL/Spreadsheet-RL) on Hugging Face, released with the Spreadsheet-RL paper and code drop dated 2026-05-17. License: CC-BY-SA-4.0.
 
-The recorded baseline is a 16-file sample of workbooks from that release (Excel-forum and SpreadsheetBench tasks). Three further SpreadsheetBench-2 workbooks were added to the local sample on 2026-09-24 and scored on their own; that pass is below and is not folded into the 16-file table. On 2026-09-25 the local sample gained the rest of the SpreadsheetBench-2 Financial_Model inputs (100 in that group) and Debugging 04_01, 05_01, and 06_01. Those additions are not in the totals below and have not been scored. Workbooks are not vendored. This sample is not the Enron corpus and not the full 33,015-file zip. The full zip was not scored.
+The recorded baseline is a 16-file sample of workbooks from that release (Excel-forum and SpreadsheetBench tasks). Three further SpreadsheetBench-2 workbooks were added to the local sample on 2026-09-24 and scored on their own; that pass is below and is not folded into the 16-file table. On 2026-09-25 the local sample gained the rest of the SpreadsheetBench-2 Financial_Model inputs and Debugging 04_01, 05_01, and 06_01. Those 99 files were scored the same day and are recorded in their own section. They are not in the 16-file totals. Workbooks are not vendored. This sample is not the Enron corpus and not the full 33,015-file zip. The full zip was not scored.
 
 ## Results
 
-[`spreadsheet-rl.score-summary.json`](spreadsheet-rl.score-summary.json) is the aggregate two-lane score of that 16-file sample. Rescored 2026-09-25 at `405867e`, after the occupied-cell budget. The formula totals are unchanged from the `0f169a8` score. The record is aggregate only: no workbook paths, cell contents, or per-file results.
+[`spreadsheet-rl.score-summary.json`](spreadsheet-rl.score-summary.json) is the aggregate two-lane score of that 16-file sample. Rescored 2026-09-25 at `504c50d`. The formula totals are unchanged from the `405867e` score. The record is aggregate only: no workbook paths, cell contents, or per-file results.
 
 The owned lane opened every workbook. The Formualizer candidate lane opened 11 of 16, so its formula-cell totals cover only those 11. The five candidate opens that failed stay in the file count (2 formula-parse errors, 1 undefined name, 2 undefined tables). None timed out.
 
@@ -30,7 +30,7 @@ The candidate lane observed 5,264 formula cells in the 11 workbooks it opened an
 
 These figures describe one 16-file sample scored once. They are not the frozen Enron 1,000-workbook score and not a measurement of the 33,015-file zip.
 
-The score ran on Darwin arm64. The probe address-space limit cannot be applied on this host (`RLIMIT_AS` returns `EINVAL`), so that call was allowed to succeed and no engine source was changed for the score itself. The occupied-cell rescore reproduced the formula totals. Lane resident-set peaks reported by the scorer on that run were 70,287,360 bytes (candidate) and 84,934,656 bytes (owned).
+The score ran on Darwin arm64. The probe address-space limit cannot be applied on this host (`RLIMIT_AS` returns `EINVAL`), so that call was allowed to succeed and no engine source was changed for the score itself. The `504c50d` rescore reproduced the formula totals. Lane resident-set peaks reported by the scorer on that run were 68,812,800 bytes (candidate) and 85,016,576 bytes (owned).
 
 ## Added complex workbooks
 
@@ -41,8 +41,20 @@ Three SpreadsheetBench-2 inputs with a reputation for structural complexity were
 | Debugging 10_01, 99-sheet operating rollup | 99 | 77,194 | 77,151 | 77,151 | 0 | 43 cycles |
 | Financial_Model 08_04, DCF and three statements | 13 | 133,888 | 133,881 | 133,881 | 0 | 7 cycles |
 | Financial_Model 04_02, valuation model | 9 | 74,578 | 74,578 | 74,572 | 6 | 0 |
-| Three-file total at `405867e` |  | 285,660 | 285,610 | 285,604 | 6 | 50 |
+| Three-file total at `504c50d` |  | 285,660 | 285,610 | 285,604 | 6 | 50 |
 
-The first score of these three, before the OFFSET wait, matched 84.10% of compared cells (45,399 mismatched, almost all in the DCF workbook). The table above was first recorded at `0f169a8` and reproduced the same day at `405867e`, with a 120-second timeout. The operating rollup matches every formula that compiled. Its 43 refusals are scenario holds that read their own cell on the inactive branch, such as `IF($C$2=3,$R31,AV20)` in `AV20`. The valuation model's six mismatches are `((later/earlier)^(1/5)-1)` on a negative ratio: the cache is a real fifth root and the engine returns `#NUM!`. Its seven `PROPER` formulas match, so that workbook has nothing left uncompiled. The DCF workbook has no stored-value mismatches, and the same seven cycles.
+The first score of these three, before the OFFSET wait, matched 84.10% of compared cells (45,399 mismatched, almost all in the DCF workbook). The table above was first recorded at `0f169a8` and reproduced at `504c50d`, with a 120-second timeout. The operating rollup matches every formula that compiled. Its 43 refusals are scenario holds that read their own cell on the inactive branch, such as `IF($C$2=3,$R31,AV20)` in `AV20`. The valuation model's six mismatches are `((later/earlier)^(1/5)-1)` on a negative ratio: the cache is a real fifth root and the engine returns `#NUM!`. Its seven `PROPER` formulas match, so that workbook has nothing left uncompiled. The DCF workbook has no stored-value mismatches, and the same seven cycles.
 
 A dynamic `OFFSET` discovered during the calculation pass now waits for the formula cells in the rectangle it resolves. `PMT` for an integer number of periods is evaluated at 16 significant digits, so `-PMT(0.06/12,84,50000000)` matches the cached payment instead of running about 1.29e-8 high. Reimporting the DCF workbook after both changes leaves no stored-value mismatches. The 7 cycles are an annual total that sums the months, where each month is a fraction of that total.
+
+## Rest of the local Financial_Model and Debugging sample
+
+The other 99 SpreadsheetBench-2 inputs in the local sample were scored once at `504c50d`, with a 120-second timeout. None timed out. This pass is not folded into the 16-file totals or the three-file total. The score took about 148 seconds. Owned peak RSS was 149,241,856 bytes.
+
+94 of 99 opened. Financial_Model family 11, five files, did not open: each `xl/workbook.xml` exceeds the workbook-part size limit. The 94 that opened hold 2,779,159 formula cells, of which 2,776,709 were compared. 2,631,914 matched (94.79% of compared), 144,795 mismatched, and 2,450 were not compiled (1,979 cycles and 471 unsupported calls).
+
+27 files matched every formula. Those are Financial_Model families 01, 12, 13, 18, and 19, plus four of the five files in family 16. The four DCF siblings of 08_04 matched every compiled formula, 535,184 cells, and each kept the same 7 annual-total cycles.
+
+Empty stored caches, calculated as a number or as text, are 128,223 of the blank-to-number mismatches plus 982 blank-to-text. That is all of families 02 and 06, Debugging 04_01, and Financial_Model 16_05. The mismatches against a stored number or text sit mainly in family 20 (about 8,800, mostly `#ARGS!`), family 07 (about 5,100, plus 1,871 not compiled), and family 17 (447). Debugging 05_01 has 578 mismatches and 5 cycles. Debugging 06_01 has 16 cycles and no value mismatches. Families 03, 04, 05, 09, 10, and 15 each have a few dozen mismatches on otherwise matching models.
+
+The unsupported calls are `IPMT` (210), `PPMT` (210), `_XLL.BDH` (30), `PERCENTILE` (11), `_XLFN.LET` (5), `_XLFN.PERCENTILE.EXC` (3), and `_XLUDF.RRI` (2).
