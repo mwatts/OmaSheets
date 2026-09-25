@@ -7,6 +7,7 @@
 //! GPUI types.
 
 mod appearance;
+mod browse;
 mod session;
 mod view;
 
@@ -14,6 +15,7 @@ pub use appearance::{
     AppearanceError, AppearanceTile, CellColor, ColumnWidth, MergeRect, RgbColor, VisibleWindow,
     project_xlsx_appearance,
 };
+pub use browse::LoadError;
 pub use session::SpreadsheetSession;
 pub use view::{SpreadsheetUiEvent, SpreadsheetView};
 

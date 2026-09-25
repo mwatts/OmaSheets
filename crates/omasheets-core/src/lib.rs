@@ -271,6 +271,7 @@ fn calc_error_label(error: &CalcError) -> &'static str {
         CalcError::InvalidName => "#NAME?",
         CalcError::NullIntersection => "#NULL!",
         CalcError::Spill => "#SPILL!",
+        CalcError::Calculation => "#CALC!",
         CalcError::InvalidArguments => "#ARGS!",
     }
 }
@@ -2310,6 +2311,7 @@ impl Document {
                     name,
                     sheet: self.sheet_ordinals[&table.sheet],
                     header_row: table.header_row.and_then(|row| row_ordinal(&row)),
+                    totals_row: None,
                     rows: table.rows.iter().filter_map(row_ordinal).collect(),
                     columns: table
                         .columns

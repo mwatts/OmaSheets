@@ -6,7 +6,8 @@ locally and are never vendored in this repository.
 
 `omasheets-corpus` separates each workbook into a bounded child process. It
 checks the file against an immutable SHA-256 manifest before opening it, applies
-a per-file timeout and a 2 GiB address-space ceiling on Unix, caps child output,
+a per-file timeout and a 2 GiB address-space ceiling where the kernel accepts
+`RLIMIT_AS`, caps child output,
 omits paths and cell contents from its report, and continues after an individual
 parse or evaluation failure.
 
