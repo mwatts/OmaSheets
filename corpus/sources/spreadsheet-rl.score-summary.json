@@ -64,6 +64,6 @@
     "The scored manifest is local and not vendored. Identifiers longer than 64 characters were shortened; the 16 digests are unchanged.",
     "Candidate formula-cell totals include only workbooks that lane opened. Workbooks that failed to open stay in the file count.",
     "macOS does not implement RLIMIT_AS. The probe still ran.",
-    "The 16-file totals in this file are unchanged. Three complex SpreadsheetBench-2 workbooks were scored separately the same day, before the dynamic OFFSET wait fix: 285,660 formula cells, 240,204 matched, 45,399 mismatched, 57 not compiled. Reimporting the DCF workbook after that fix leaves 5 mismatches and 7 cycles. The write-up is in spreadsheet-rl.md. Those passes are not folded into the numbers above."
+    "The 16-file totals in this file are unchanged. Three complex SpreadsheetBench-2 workbooks were scored separately the same day, before the dynamic OFFSET wait fix and the 16-digit PMT fix: 285,660 formula cells, 240,204 matched, 45,399 mismatched, 57 not compiled. Reimporting the DCF workbook after both fixes leaves 0 mismatches and 7 cycles. The write-up is in spreadsheet-rl.md. Those passes are not folded into the numbers above."
   ]
 }

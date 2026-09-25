@@ -4047,6 +4047,11 @@ fn square_of(value: f64) -> f64 {
     value * value
 }
 
+/// Sixteen significant digits. Excel's annuity payment matches this rounding;
+/// binary `(1 + rate) ^ periods` is high by about 1e-8 on a long monthly loan,
+/// and that excess compounds into the closing balance.
+const PAYMENT_DIGITS: u32 = 16;
+
 /// `PMT`: the constant payment of an annuity.
 fn payment(
     rate: f64,
@@ -4055,18 +4060,343 @@ fn payment(
     future: f64,
     at_start: bool,
 ) -> Result<f64, CalcError> {
-    if periods == 0.0 || !periods.is_finite() || !rate.is_finite() {
+    if periods == 0.0
+        || !periods.is_finite()
+        || !rate.is_finite()
+        || !present.is_finite()
+        || !future.is_finite()
+    {
         return Err(CalcError::InvalidNumber);
     }
     if rate == 0.0 {
         return Ok(-(present + future) / periods);
+    }
+    if let Some(result) = payment_rounded(rate, periods, present, future, at_start) {
+        return result;
     }
     let growth = (1.0 + rate).powf(periods);
     if !growth.is_finite() || growth == 1.0 {
         return Err(CalcError::InvalidNumber);
     }
     let timing = if at_start { 1.0 + rate } else { 1.0 };
-    Ok(-(present * growth + future) * rate / (timing * (growth - 1.0)))
+    let result = -(present * growth + future) * rate / (timing * (growth - 1.0));
+    if result.is_finite() {
+        Ok(result)
+    } else {
+        Err(CalcError::InvalidNumber)
+    }
+}
+
+/// Annuity payment evaluated at [`PAYMENT_DIGITS`]. `None` when the inputs
+/// are outside the decimal range and the binary formula should be used.
+fn payment_rounded(
+    rate: f64,
+    periods: f64,
+    present: f64,
+    future: f64,
+    at_start: bool,
+) -> Option<Result<f64, CalcError>> {
+    let periods = integer_periods(periods)?;
+    let rate = Digits::from_f64(rate)?;
+    let present = Digits::from_f64(present)?;
+    let future = Digits::from_f64(future)?;
+    let one = Digits::from_f64(1.0)?;
+    let base = one.add(rate)?;
+    if base.is_zero() || base.is_negative() {
+        return None;
+    }
+    let growth = base.powi(periods)?;
+    if growth.is_zero() {
+        return Some(Err(CalcError::InvalidNumber));
+    }
+    let grown = growth.sub(one)?;
+    if grown.is_zero() {
+        return Some(Err(CalcError::InvalidNumber));
+    }
+    let timing = if at_start {
+        one.add(rate)?
+    } else {
+        one
+    };
+    let result = present
+        .mul(growth)?
+        .add(future)?
+        .mul(rate)?
+        .neg()?
+        .div(timing.mul(grown)?)?
+        .to_f64()?;
+    Some(if result.is_finite() {
+        Ok(result)
+    } else {
+        Err(CalcError::InvalidNumber)
+    })
+}
+
+fn integer_periods(periods: f64) -> Option<i32> {
+    if periods.fract() == 0.0 && periods.abs() <= 1_000_000.0 {
+        Some(periods as i32)
+    } else {
+        None
+    }
+}
+
+/// A decimal kept at [`PAYMENT_DIGITS`] significant digits.
+#[derive(Clone, Copy)]
+struct Digits {
+    mantissa: i64,
+    exponent: i32,
+}
+
+impl Digits {
+    fn is_zero(self) -> bool {
+        self.mantissa == 0
+    }
+
+    fn is_negative(self) -> bool {
+        self.mantissa < 0
+    }
+
+    fn neg(self) -> Option<Self> {
+        Some(Self {
+            mantissa: self.mantissa.checked_neg()?,
+            exponent: self.exponent,
+        })
+    }
+
+    fn from_f64(value: f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        if value == 0.0 {
+            return Some(Self {
+                mantissa: 0,
+                exponent: 0,
+            });
+        }
+        let text = format!("{value:.16e}");
+        let (mantissa, exponent) = parse_scientific(&text)?;
+        pack(mantissa, exponent)
+    }
+
+    fn to_f64(self) -> Option<f64> {
+        if self.mantissa == 0 {
+            return Some(0.0);
+        }
+        let text = format!("{}e{}", self.mantissa, self.exponent);
+        text.parse().ok()
+    }
+
+    fn add(self, other: Self) -> Option<Self> {
+        combine(self, other)
+    }
+
+    fn sub(self, other: Self) -> Option<Self> {
+        self.add(other.neg()?)
+    }
+
+    fn mul(self, other: Self) -> Option<Self> {
+        self.mul_digits(other, PAYMENT_DIGITS)
+    }
+
+    /// Product kept at `digits` significant digits. Used while raising to a
+    /// power so intermediate rounding does not drift the final 16 digits.
+    fn mul_digits(self, other: Self, digits: u32) -> Option<Self> {
+        if self.mantissa == 0 || other.mantissa == 0 {
+            return Some(Self {
+                mantissa: 0,
+                exponent: 0,
+            });
+        }
+        pack_digits(
+            i128::from(self.mantissa) * i128::from(other.mantissa),
+            self.exponent.checked_add(other.exponent)?,
+            digits,
+        )
+    }
+
+    fn div(self, other: Self) -> Option<Self> {
+        if other.mantissa == 0 {
+            return None;
+        }
+        if self.mantissa == 0 {
+            return Some(Self {
+                mantissa: 0,
+                exponent: 0,
+            });
+        }
+        let scale = 20_i32;
+        let numerator = i128::from(self.mantissa).checked_mul(power_of_ten(scale)?)?;
+        let quotient = numerator / i128::from(other.mantissa);
+        let remainder = numerator % i128::from(other.mantissa);
+        let quotient = round_half_even(quotient, remainder, i128::from(other.mantissa));
+        pack(
+            quotient,
+            self.exponent
+                .checked_sub(other.exponent)?
+                .checked_sub(scale)?,
+        )
+    }
+
+    fn powi(self, mut exponent: i32) -> Option<Self> {
+        if exponent < 0 {
+            return Digits::from_f64(1.0)?.div(self.powi(exponent.checked_neg()?)?);
+        }
+        // Two guard digits make binary exponentiation agree with a 16-digit
+        // decimal power. More would overflow the 128-bit product.
+        let wide = PAYMENT_DIGITS + 2;
+        let mut result = Digits::from_f64(1.0)?.mul_digits(Digits::from_f64(1.0)?, wide)?;
+        let mut base = self.mul_digits(Digits::from_f64(1.0)?, wide)?;
+        while exponent > 0 {
+            if exponent % 2 == 1 {
+                result = result.mul_digits(base, wide)?;
+            }
+            exponent /= 2;
+            if exponent > 0 {
+                base = base.mul_digits(base, wide)?;
+            }
+        }
+        pack(i128::from(result.mantissa), result.exponent)
+    }
+}
+
+fn combine(left: Digits, right: Digits) -> Option<Digits> {
+    if left.mantissa == 0 {
+        return Some(right);
+    }
+    if right.mantissa == 0 {
+        return Some(left);
+    }
+    let (high, low) = if left.exponent >= right.exponent {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let shift = high.exponent.checked_sub(low.exponent)?;
+    if shift > 20 {
+        return Some(high);
+    }
+    // `high` is the coarser term. Shift it up so both share `low`'s exponent.
+    let high_mant = i128::from(high.mantissa).checked_mul(power_of_ten(shift)?)?;
+    pack(
+        high_mant.checked_add(i128::from(low.mantissa))?,
+        low.exponent,
+    )
+}
+
+fn pack(mantissa: i128, exponent: i32) -> Option<Digits> {
+    pack_digits(mantissa, exponent, PAYMENT_DIGITS)
+}
+
+fn pack_digits(mantissa: i128, exponent: i32, digits: u32) -> Option<Digits> {
+    let (mantissa, exponent) = round_digits(mantissa, exponent, digits)?;
+    if mantissa == 0 {
+        return Some(Digits {
+            mantissa: 0,
+            exponent: 0,
+        });
+    }
+    if !(-9_223_372_036_854_775_808..=9_223_372_036_854_775_807).contains(&mantissa) {
+        return None;
+    }
+    Some(Digits {
+        mantissa: mantissa as i64,
+        exponent,
+    })
+}
+
+fn round_digits(mantissa: i128, mut exponent: i32, digits: u32) -> Option<(i128, i32)> {
+    if mantissa == 0 {
+        return Some((0, 0));
+    }
+    let negative = mantissa < 0;
+    let mut magnitude = mantissa.unsigned_abs();
+    let mut width = decimal_width(magnitude);
+    if width > digits {
+        let drop = width - digits;
+        let divisor = power_of_ten(drop as i32)? as u128;
+        let quotient = magnitude / divisor;
+        let remainder = magnitude % divisor;
+        let quotient = round_half_even_unsigned(quotient, remainder, divisor);
+        magnitude = quotient;
+        exponent = exponent.checked_add(i32::try_from(drop).ok()?)?;
+        width = decimal_width(magnitude);
+        if width > digits {
+            magnitude /= 10;
+            exponent = exponent.checked_add(1)?;
+        }
+    }
+    while width < digits {
+        magnitude = magnitude.checked_mul(10)?;
+        exponent = exponent.checked_sub(1)?;
+        width += 1;
+    }
+    let signed = if negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    Some((signed, exponent))
+}
+
+fn decimal_width(mut magnitude: u128) -> u32 {
+    let mut width = 0;
+    while magnitude > 0 {
+        magnitude /= 10;
+        width += 1;
+    }
+    width
+}
+
+fn round_half_even(quotient: i128, remainder: i128, divisor: i128) -> i128 {
+    let negative = quotient < 0;
+    let quotient = round_half_even_unsigned(
+        quotient.unsigned_abs(),
+        remainder.unsigned_abs(),
+        divisor.unsigned_abs(),
+    );
+    if negative {
+        -(quotient as i128)
+    } else {
+        quotient as i128
+    }
+}
+
+fn round_half_even_unsigned(quotient: u128, remainder: u128, divisor: u128) -> u128 {
+    let twice = remainder.saturating_mul(2);
+    let up = if twice > divisor {
+        true
+    } else if twice < divisor {
+        false
+    } else {
+        quotient % 2 == 1
+    };
+    if up { quotient + 1 } else { quotient }
+}
+
+fn power_of_ten(exponent: i32) -> Option<i128> {
+    if !(0..=30).contains(&exponent) {
+        return None;
+    }
+    let mut value = 1_i128;
+    for _ in 0..exponent {
+        value = value.checked_mul(10)?;
+    }
+    Some(value)
+}
+
+fn parse_scientific(text: &str) -> Option<(i128, i32)> {
+    let (body, exponent) = text.split_once(['e', 'E'])?;
+    let exponent = exponent.parse::<i32>().ok()?;
+    let negative = body.starts_with('-');
+    let body = body.trim_start_matches(['+', '-']);
+    let (whole, fraction) = body.split_once('.')?;
+    let digits = format!("{whole}{fraction}");
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mantissa = digits.parse::<i128>().ok()?;
+    let exponent = exponent.checked_sub(i32::try_from(fraction.len()).ok()?)?;
+    Some((if negative { -mantissa } else { mantissa }, exponent))
 }
 
 fn present_value(
@@ -9462,6 +9792,11 @@ mod tests {
         workbook.set_boolean(cell(2, 4), true);
         for (formula, expected, tolerance) in [
             ("=PMT(0.08/12,10,10000)", -1037.0320893, 1e-9),
+            (
+                "=PMT(0.06/12,7*12,50000000)",
+                -730427.72418903944,
+                0.0,
+            ),
             (
                 "=PMT(0.08/12,10,10000,0,1)",
                 -1037.0320893 / (1.0 + 0.08 / 12.0),

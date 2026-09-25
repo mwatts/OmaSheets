@@ -39,12 +39,12 @@ Three SpreadsheetBench-2 inputs with a reputation for structural complexity were
 | Workbook | Sheets | Formulas | Compared | Matched | Mismatched | Not compiled |
 |---|---:|---:|---:|---:|---:|---:|
 | Debugging 10_01, 99-sheet operating rollup | 99 | 77,194 | 77,151 | 77,151 | 0 | 43 cycles |
-| Financial_Model 08_04, DCF and three statements | 13 | 133,888 | 133,881 | 133,876 | 5 | 7 cycles |
+| Financial_Model 08_04, DCF and three statements | 13 | 133,888 | 133,881 | 133,881 | 0 | 7 cycles |
 | Financial_Model 04_02, valuation model | 9 | 74,578 | 74,571 | 74,565 | 6 | 7 `PROPER` |
-| Three-file total after the `OFFSET` wait |  | 285,660 | 285,603 | 285,592 | 11 | 57 |
+| Three-file total after the `OFFSET` and `PMT` fixes |  | 285,660 | 285,603 | 285,597 | 6 | 57 |
 
 The first score of these three, before that wait, matched 84.10% of compared cells (45,399 mismatched, almost all in the DCF workbook). Owned peak resident set was 148,094,976 bytes. Candidate peak was 504,332,288 bytes. The DCF row above is a later reimport on the same tree. The other two rows are from the first score, and the total adds those rows to the reimport.
 
 The operating rollup matches every formula that compiled. Its 43 refusals are scenario holds that read their own cell on the inactive branch, such as `IF($C$2=3,$R31,AV20)` in `AV20`. The valuation model's six mismatches are `((later/earlier)^(1/5)-1)` on a negative ratio: the cache is a real fifth root and the engine returns `#NUM!`. Its seven refusals are `PROPER`.
 
-A dynamic `OFFSET` discovered during the calculation pass now waits for the formula cells in the rectangle it resolves. Reimporting the DCF workbook after that change leaves 5 number mismatches and the same 7 cycles. The cycles are an annual total that sums the months, where each month is a fraction of that total. The 5 mismatches are the funding-schedule close. `Capex and Debt Assumptions!D29` is `-PMT(0.06/12,84,50000000)`, and that payment is high by 1.29e-8. From Funding Schedule row 22 the draw uses it, and the excess compounds to about 1.3e-6 by row 105, so `IF(close<=0,0,close)` drops the last draw. Rows 16 through 21, the interest-only months, match.
+A dynamic `OFFSET` discovered during the calculation pass now waits for the formula cells in the rectangle it resolves. `PMT` for an integer number of periods is evaluated at 16 significant digits, so `-PMT(0.06/12,84,50000000)` matches the cached payment instead of running about 1.29e-8 high. Reimporting the DCF workbook after both changes leaves no stored-value mismatches. The 7 cycles are an annual total that sums the months, where each month is a fraction of that total.
