@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-132 function names listed below, grouped for reading.
+133 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -72,6 +72,9 @@ descending. Any other mode is `#VALUE!`. `SUMIF` and `AVERAGEIF` read a sum
 block whose top-left is the sum range's top-left and whose shape is the
 criteria range. `LOOKUP` evaluates an array expression in either vector, so
 `LOOKUP(2,1/(range<>""),range)` returns the last non-blank.
+`LET(name, value, ..., calculation)` evaluates each value once. Later
+arguments see those names. A stored name may be written `_xlpm.name`.
+A repeated or cell-like name is `#NAME?`.
 
 ## Registry
 
@@ -211,6 +214,7 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `UNIQUE`
 - `SORT`
 - `LOOKUP`
+- `LET`
 - `OFFSET`
 - `INDIRECT`
 - `CELL`

@@ -121,8 +121,8 @@ impl SpreadsheetSession {
     /// Imports `path` and shows the owned engine's results.
     ///
     /// A formula the engine refused keeps the value stored in the file.
-    /// The opened workbook is read-only: the formula bar shows the source,
-    /// and committing an edit is rejected.
+    /// Committing the formula bar writes into the calculation engine and
+    /// refreshes displayed dependents. The file on disk is left unchanged.
     pub fn open_xlsx(path: impl AsRef<Path>) -> Result<Self, crate::LoadError> {
         let path = path.as_ref();
         let book = browse::load(path)?;
@@ -349,15 +349,29 @@ impl SpreadsheetSession {
     }
 
     /// Commits the formula-bar draft into the selected cell.
+    ///
+    /// An opened workbook writes through the calculation engine and refreshes
+    /// the displayed value, including formulas that depend on the edit.
     pub fn commit_edit(&mut self) -> Result<(CellAddress, String), ApplyError> {
-        if self.browse.is_some() {
-            return Err(ApplyError::ReferenceOutOfView(
-                "opened workbooks are read-only in this view".into(),
-            ));
-        }
         let address = self
             .selection
             .ok_or(ApplyError::ReferenceOutOfView("no cell is selected".into()))?;
+        if self.browse.is_some() {
+            let sheet = self
+                .browse
+                .as_ref()
+                .and_then(|book| book.sheets.get(self.active))
+                .map(|sheet| sheet.index)
+                .ok_or_else(|| {
+                    ApplyError::ReferenceOutOfView("the opened workbook has no sheet".into())
+                })?;
+            let source = self.formula_draft.clone();
+            self.browse
+                .as_mut()
+                .expect("browse checked")
+                .apply_input(sheet, address.row as u32, address.column as u32, &source)?;
+            return Ok((address, source));
+        }
         let sheet =
             self.active_sheet()
                 .ok_or(ApplyError::UnknownSheet(SheetId(ObjectId::from_seed(
@@ -605,8 +619,14 @@ impl SpreadsheetSession {
         if let Some(book) = &self.browse {
             if let Some(sheet) = book.sheets.get(self.active) {
                 return (
-                    usize::try_from(sheet.rows).unwrap_or(usize::MAX).max(1),
-                    usize::try_from(sheet.columns).unwrap_or(usize::MAX).max(1),
+                    usize::try_from(sheet.rows)
+                        .unwrap_or(usize::MAX)
+                        .max(VISIBLE_ROWS as usize)
+                        .max(1),
+                    usize::try_from(sheet.columns)
+                        .unwrap_or(usize::MAX)
+                        .max(VISIBLE_COLUMNS as usize)
+                        .max(1),
                 );
             }
         }
@@ -911,6 +931,75 @@ mod tests {
             (
                 "xl/worksheets/sheet1.xml",
                 r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" ht="30" customHeight="1"><c r="A1" s="1"><v>0.065</v></c><c r="B1" t="inlineStr"><is><t>Hello</t></is></c><c r="C1" s="2"><v>1234</v></c></row></sheetData></worksheet>"#,
+            ),
+        ];
+        for (name, body) in parts {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn an_opened_workbook_recalculates_after_an_edit() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "omasheets-edit-{}-{nonce}.xlsx",
+            std::process::id()
+        ));
+        write_edit_workbook(&path);
+        let mut session = SpreadsheetSession::open_xlsx(&path).expect("open");
+        let _ = std::fs::remove_file(&path);
+        let text = |session: &SpreadsheetSession, column: usize| {
+            session
+                .visible_cells()
+                .into_iter()
+                .find(|cell| cell.row == 0 && cell.column == column)
+                .map(|cell| cell.text)
+                .unwrap_or_default()
+        };
+        assert_eq!(text(&session, 0), "2");
+        assert_eq!(text(&session, 1), "3");
+        session.select(0, 0).unwrap();
+        session.set_formula_draft("10".into());
+        session.commit_edit().unwrap();
+        assert_eq!(text(&session, 0), "10");
+        assert_eq!(text(&session, 1), "11");
+        session.select(0, 1).unwrap();
+        session.set_formula_draft("=A1*4".into());
+        session.commit_edit().unwrap();
+        assert_eq!(text(&session, 1), "40");
+        assert_eq!(session.formula_draft(), "=A1*4");
+    }
+
+    fn write_edit_workbook(path: &std::path::Path) {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let parts = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>2</v></c><c r="B1"><f>A1+1</f><v>3</v></c></row></sheetData></worksheet>"#,
             ),
         ];
         for (name, body) in parts {

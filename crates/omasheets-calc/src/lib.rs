@@ -215,6 +215,8 @@ enum Expr<R = CellId> {
     Error(CalcError),
     /// An omitted argument, as in `IF(x,,y)`; evaluates to blank.
     Empty,
+    /// A name bound by `LET`. The spelling is lower-cased.
+    Local(String),
     /// External cell. The parser lowers it to a literal before returning.
     External(ExternalAddress),
     /// External rectangle, top-left anchor. Lowered to an array of cached values.
@@ -470,6 +472,7 @@ enum Function {
     NetworkDays,
     WorkDay,
     Lookup,
+    Let,
     Pmt,
     Ipmt,
     Ppmt,
@@ -726,6 +729,7 @@ fn visit_references(expression: &Expr<CellId>, visit: &mut impl FnMut(CellId)) {
         | Expr::Number(_)
         | Expr::Boolean(_)
         | Expr::Text(_)
+        | Expr::Local(_)
         | Expr::Error(_)
         | Expr::Array(_)
         | Expr::Empty
@@ -797,6 +801,7 @@ fn rebind_references(expression: &mut Expr<CellId>, map: &mut impl FnMut(CellId)
         | Expr::Number(_)
         | Expr::Boolean(_)
         | Expr::Text(_)
+        | Expr::Local(_)
         | Expr::Error(_)
         | Expr::Array(_)
         | Expr::Empty
@@ -934,6 +939,9 @@ pub struct Workbook {
     date_system: serial_date::DateSystem,
     /// Saved `RAND` / `RANDBETWEEN` draws. The next tick discards them.
     rand_replay: HashMap<CellId, f64>,
+    /// `LET` bindings for the formula currently being evaluated. Each call
+    /// pushes one frame. Evaluation is sequential.
+    let_scope: std::cell::RefCell<Vec<HashMap<String, Bound>>>,
 }
 
 impl Default for Workbook {
@@ -967,7 +975,26 @@ impl Default for Workbook {
             array_formulas: HashMap::new(),
             date_system: serial_date::DateSystem::Excel1900,
             rand_replay: HashMap::new(),
+            let_scope: std::cell::RefCell::new(Vec::new()),
         }
+    }
+}
+
+/// One `LET` name. A grid is kept whole so a later `SUM` or `FILTER` sees
+/// every cell; a single value stays a scalar.
+#[derive(Clone)]
+enum Bound {
+    Scalar(Value),
+    Grid(ArrayValue),
+}
+
+struct LetFrame<'a> {
+    scope: &'a std::cell::RefCell<Vec<HashMap<String, Bound>>>,
+}
+
+impl Drop for LetFrame<'_> {
+    fn drop(&mut self) {
+        self.scope.borrow_mut().pop();
     }
 }
 
@@ -2062,6 +2089,7 @@ impl Workbook {
             Expr::Text(value) => Value::Text(value.clone()),
             Expr::Error(error) => Value::Error(error.clone()),
             Expr::Empty => Value::Blank,
+            Expr::Local(name) => self.local_scalar(name),
             Expr::Array(array) => array.values[0].clone(),
             Expr::Reference(index) => self.cells[*index].value.clone(),
             Expr::UnaryMinus(inner) => match excel_number(self.evaluate(inner)) {
@@ -2137,6 +2165,78 @@ impl Workbook {
             Some(index) => self.range_value(node, index),
             None => Value::Error(CalcError::InvalidValue),
         }
+    }
+
+    /// `LET(name, value, ..., calculation)`. Each value is evaluated once.
+    /// Later arguments see the names bound so far. A repeated name is `#NAME?`.
+    fn evaluate_let(&self, arguments: &[Expr<usize>]) -> Value {
+        if arguments.len() < 3 || arguments.len().is_multiple_of(2) {
+            return Value::Error(CalcError::InvalidArguments);
+        }
+        self.let_scope.borrow_mut().push(HashMap::new());
+        let _pop = LetFrame {
+            scope: &self.let_scope,
+        };
+        let mut index = 0;
+        while index + 1 < arguments.len() {
+            let Expr::Local(name) = &arguments[index] else {
+                return Value::Error(CalcError::InvalidName);
+            };
+            let bound = self.bind_local(&arguments[index + 1]);
+            {
+                let mut stack = self.let_scope.borrow_mut();
+                let frame = stack.last_mut().expect("LET frame");
+                if frame.contains_key(name) {
+                    return Value::Error(CalcError::InvalidName);
+                }
+                frame.insert(name.clone(), bound);
+            }
+            index += 2;
+        }
+        self.evaluate(&arguments[arguments.len() - 1])
+    }
+
+    fn bind_local(&self, expression: &Expr<usize>) -> Bound {
+        let array_like = matches!(
+            expression,
+            Expr::Local(_) | Expr::RangeNode { .. } | Expr::Array(_)
+        ) || contains_array_operand(expression);
+        if !array_like {
+            return Bound::Scalar(self.evaluate(expression));
+        }
+        match self.evaluate_array(expression) {
+            Ok(array) if array.values.len() == 1 => {
+                Bound::Scalar(array.values.into_iter().next().unwrap_or(Value::Blank))
+            }
+            Ok(array) => Bound::Grid(array),
+            Err(error) => Bound::Scalar(Value::Error(error)),
+        }
+    }
+
+    fn local_scalar(&self, name: &str) -> Value {
+        match self.local_bound(name) {
+            Some(Bound::Scalar(value)) => value,
+            Some(Bound::Grid(grid)) => grid.values.first().cloned().unwrap_or(Value::Blank),
+            None => Value::Error(CalcError::InvalidName),
+        }
+    }
+
+    fn local_grid(&self, name: &str) -> Result<ArrayValue, CalcError> {
+        match self.local_bound(name) {
+            Some(Bound::Grid(grid)) => Ok(grid),
+            Some(Bound::Scalar(value)) => Ok(ArrayValue::scalar(value)),
+            None => Err(CalcError::InvalidName),
+        }
+    }
+
+    fn local_bound(&self, name: &str) -> Option<Bound> {
+        let stack = self.let_scope.borrow();
+        for frame in stack.iter().rev() {
+            if let Some(bound) = frame.get(name) {
+                return Some(bound.clone());
+            }
+        }
+        None
     }
 
     fn evaluate_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
@@ -2278,6 +2378,9 @@ impl Workbook {
                 | Function::XLookup
         ) {
             return self.evaluate_lookup_function(function, arguments);
+        }
+        if function == Function::Let {
+            return self.evaluate_let(arguments);
         }
         if matches!(
             function,
@@ -2518,6 +2621,7 @@ impl Workbook {
             | Function::VLookup
             | Function::XLookup
             | Function::Lookup
+            | Function::Let
             | Function::YearFrac
             | Function::Days360
             | Function::NetworkDays
@@ -3402,6 +3506,10 @@ impl Workbook {
             Expr::Function(Function::ReferenceSpan, arguments) => self
                 .reference_span(arguments)
                 .map(|reference| reference.array(self)),
+            Expr::Local(name) => match self.local_grid(name) {
+                Ok(array) => Ok(array),
+                Err(error) => Err(error),
+            },
             Expr::RangeNode {
                 node,
                 rows,
@@ -4379,7 +4487,8 @@ fn broadcast_shape(shapes: &[(usize, usize)]) -> Result<(usize, usize), CalcErro
 /// lookups, criteria functions) produce one value and stop the search.
 fn contains_array_operand(expression: &Expr<usize>) -> bool {
     match expression {
-        Expr::RangeNode { .. }
+        Expr::Local(_)
+        | Expr::RangeNode { .. }
         | Expr::Array(_)
         | Expr::Function(
             Function::Index
@@ -4594,7 +4703,8 @@ fn parse_numeric_text(text: &str) -> Option<f64> {
             .ok()
             .map(|value| value / 100.0);
     }
-    text.parse().ok()
+    // Rust accepts `NaN` and `inf`. Excel does not; the text `NaN` is `#VALUE!`.
+    text.parse().ok().filter(|value: &f64| value.is_finite())
 }
 
 fn truthy(value: Value) -> Result<bool, CalcError> {
@@ -6231,6 +6341,7 @@ fn compile_expression(
         Expr::Text(value) => Expr::Text(value),
         Expr::Error(error) => Expr::Error(error),
         Expr::Empty => Expr::Empty,
+        Expr::Local(name) => Expr::Local(name),
         Expr::Array(array) => Expr::Array(array),
         Expr::Reference(cell) => Expr::Reference(indices[&cell]),
         Expr::UnaryMinus(inner) => {
@@ -6428,6 +6539,7 @@ fn collect_dependencies(
         | Expr::Number(_)
         | Expr::Boolean(_)
         | Expr::Text(_)
+        | Expr::Local(_)
         | Expr::Error(_)
         | Expr::Array(_)
         | Expr::Empty
@@ -6826,6 +6938,8 @@ struct Parser<'source, 'sheets> {
     structured: StructuredContext<'sheets>,
     used_tables: BTreeSet<String>,
     name_depth: usize,
+    /// Lower-cased `LET` names visible while parsing a value or the calculation.
+    let_names: Vec<String>,
 }
 
 /// Defined names by scope. Lower-cased name to definition source; a
@@ -6866,6 +6980,7 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             structured: StructuredContext::default(),
             used_tables: BTreeSet::new(),
             name_depth: 0,
+            let_names: Vec::new(),
         }
     }
 
@@ -7266,6 +7381,9 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
         sheet: u32,
     ) -> Result<Expr, FormulaError> {
         let name = token.trim_start_matches('$');
+        if let Some(local) = self.local_in_scope(name) {
+            return Ok(Expr::Local(local));
+        }
         let Some(definition) = self.defined_names.resolve(sheet, &name.to_lowercase()) else {
             return Err(FormulaError::UnknownName(name.into()));
         };
@@ -7966,6 +8084,9 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
     fn parse_function(&mut self, name: &str) -> Result<Expr, FormulaError> {
         let function = parse_function_name(name)?;
         self.expect(b'(')?;
+        if function == Function::Let {
+            return self.parse_let_call();
+        }
         let mut arguments = Vec::new();
         self.skip_space();
         if self.peek() == Some(b')') {
@@ -7991,6 +8112,101 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             }
         }
         self.finish_call(function, arguments)
+    }
+
+    /// `LET(name, value, ..., calculation)`. A name is in scope for every
+    /// argument after its value. The last argument is the calculation, which
+    /// is the only one not followed by another name/value pair.
+    fn parse_let_call(&mut self) -> Result<Expr, FormulaError> {
+        let depth = self.let_names.len();
+        let mut arguments = Vec::new();
+        loop {
+            let name = self.parse_let_name()?;
+            self.skip_space();
+            self.expect(b',')?;
+            let value = self.parse_comparison()?;
+            arguments.push(Expr::Local(name.clone()));
+            arguments.push(value);
+            self.let_names.push(name);
+            self.skip_space();
+            if self.peek() != Some(b',') {
+                self.let_names.truncate(depth);
+                return Err(FormulaError::UnexpectedToken(self.offset));
+            }
+            let commas = self.top_level_commas_until_close();
+            self.offset += 1;
+            if commas <= 1 {
+                let calculation = self.parse_comparison()?;
+                arguments.push(calculation);
+                self.skip_space();
+                self.expect(b')')?;
+                self.let_names.truncate(depth);
+                return self.finish_call(Function::Let, arguments);
+            }
+        }
+    }
+
+    fn parse_let_name(&mut self) -> Result<String, FormulaError> {
+        self.skip_space();
+        let start = self.offset;
+        if !matches!(
+            self.peek(),
+            Some(byte) if byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$' | b'\\')
+        ) {
+            return Err(FormulaError::UnexpectedToken(start));
+        }
+        while matches!(
+            self.peek(),
+            Some(byte) if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'$' | b'\\')
+        ) {
+            self.offset += 1;
+        }
+        let token = &self.source[start..self.offset];
+        let_binding_name(token).ok_or_else(|| FormulaError::UnsupportedName(token.into()))
+    }
+
+    fn local_in_scope(&self, token: &str) -> Option<String> {
+        let bare = strip_xlpm(token);
+        let key = bare.to_ascii_lowercase();
+        if self.let_names.iter().any(|name| name == &key) || bare.len() != token.len() {
+            Some(key)
+        } else {
+            None
+        }
+    }
+
+    /// Top-level commas from the current offset through the `)` that closes
+    /// this call. Commas inside nested calls are ignored.
+    fn top_level_commas_until_close(&self) -> usize {
+        let bytes = self.source.as_bytes();
+        let mut index = self.offset;
+        let mut depth = 0_i32;
+        let mut commas = 0_usize;
+        let mut in_string = false;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if in_string {
+                if byte == b'"' {
+                    if bytes.get(index + 1) == Some(&b'"') {
+                        index += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'(' | b'{' => depth += 1,
+                b')' | b'}' if depth == 0 => return commas,
+                b')' | b'}' => depth -= 1,
+                b',' if depth == 0 => commas += 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        commas
     }
 
     fn finish_call(&self, function: Function, arguments: Vec<Expr>) -> Result<Expr, FormulaError> {
@@ -8168,6 +8384,7 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("NETWORKDAYS", Function::NetworkDays),
     ("WORKDAY", Function::WorkDay),
     ("LOOKUP", Function::Lookup),
+    ("LET", Function::Let),
     ("PMT", Function::Pmt),
     ("IPMT", Function::Ipmt),
     ("PPMT", Function::Ppmt),
@@ -8233,6 +8450,38 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
 /// The supported function names in registry order.
 pub fn supported_function_names() -> impl Iterator<Item = &'static str> {
     FUNCTION_REGISTRY.iter().map(|(name, _)| *name)
+}
+
+fn strip_xlpm(token: &str) -> &str {
+    if token.len() >= 6 && token[..6].eq_ignore_ascii_case("_xlpm.") {
+        &token[6..]
+    } else {
+        token
+    }
+}
+
+/// A `LET` name: a letter, underscore, or backslash, not a cell reference.
+/// `_xlpm.name` is the spelling Excel stores in the file.
+fn let_binding_name(token: &str) -> Option<String> {
+    let bare = strip_xlpm(token.trim_start_matches('$'));
+    let mut chars = bare.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '\\') {
+        return None;
+    }
+    if !bare
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '\\'))
+    {
+        return None;
+    }
+    if bare.eq_ignore_ascii_case("TRUE") || bare.eq_ignore_ascii_case("FALSE") {
+        return None;
+    }
+    if parse_a1(bare, 0).is_ok() {
+        return None;
+    }
+    Some(bare.to_ascii_lowercase())
 }
 
 fn parse_function_name(name: &str) -> Result<Function, FormulaError> {
@@ -11017,6 +11266,44 @@ mod tests {
                 "{formula}"
             );
         }
+    }
+
+    #[test]
+    fn let_evaluates_each_name_once_and_keeps_an_array() {
+        let mut workbook = Workbook::default();
+        for (column, value) in [1.0, 0.0, 4.0].into_iter().enumerate() {
+            workbook.set_number(cell(0, column as u32), value);
+        }
+        for (column, value) in [10.0, 20.0, 30.0].into_iter().enumerate() {
+            workbook.set_number(cell(1, column as u32), value);
+        }
+        let cases = [
+            ("=LET(x,1,x+1)", Value::Number(2.0)),
+            ("=LET(x,2,y,x*3,y+1)", Value::Number(7.0)),
+            ("=_xlfn.LET(_xlpm.x,10,_xlpm.x+5)", Value::Number(15.0)),
+            ("=LET(v,A1:C1,SUM(FILTER(v,v<>0)))", Value::Number(5.0)),
+            (
+                "=LET(v,A1:C1,d,A2:C2,vnz,FILTER(v,v<>0),dnz,FILTER(d,v<>0),SUM(dnz))",
+                Value::Number(40.0),
+            ),
+            (
+                "=LET(x,1,x,2,x)",
+                Value::Error(CalcError::InvalidName),
+            ),
+            ("=1*\"NaN\"", Value::Error(CalcError::InvalidValue)),
+            ("=1*\"inf\"", Value::Error(CalcError::InvalidValue)),
+        ];
+        for (formula, expected) in cases {
+            workbook.set_formula(cell(3, 0), formula).unwrap();
+            assert_eq!(workbook.value(cell(3, 0)), expected, "{formula}");
+        }
+        assert!(workbook.set_formula(cell(3, 1), "=LET(A1,1,A1)").is_err());
+        workbook
+            .set_formula(cell(3, 0), "=LET(v,A1:C1,SUM(v))")
+            .unwrap();
+        assert_eq!(workbook.value(cell(3, 0)), Value::Number(5.0));
+        workbook.set_number(cell(0, 1), 8.0);
+        assert_eq!(workbook.value(cell(3, 0)), Value::Number(13.0));
     }
 
     #[test]

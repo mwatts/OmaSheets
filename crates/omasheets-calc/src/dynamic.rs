@@ -221,6 +221,7 @@ fn argument_can_be_array(expression: &Expr<usize>) -> bool {
     matches!(
         expression,
         Expr::Array(_)
+            | Expr::Local(_)
             | Expr::RangeNode { .. }
             | Expr::Function(
                 Function::Transpose
