@@ -31,34 +31,43 @@ unsupported-function distribution and the failure kinds), and
 baseline engine named in that delta. Both are aggregate only; the JSON records
 the exact engine revisions and runners.
 
-The latest score was taken on 2026-09-25 at engine `0f169a8` on Darwin arm64.
+The latest score was taken on 2026-09-25 at engine `405867e` on Darwin arm64.
 macOS does not implement `RLIMIT_AS`, so that ceiling was not applied and the
-probe still ran. The frozen 1,000-workbook manifest is unchanged and still
-exposes 924,235 formula cells. `enron-figshare.score-delta.json` remains the
+probe still ran. The frozen 1,000-workbook manifest is unchanged. This pass
+observes 980,734 formula cells because two workbooks the bounding-box cap had
+rejected now open. `enron-figshare.score-delta.json` remains the
 2026-09-08 paired comparison and was not recomputed.
 [Workflow evidence](https://github.com/tcballard/OmaSheets/actions/runs/34254502652)
 for that earlier run.
 
-| Owned engine lane | 2026-09-08 (`12d1c8c`) | 2026-09-24 (`f08a50a`) | 2026-09-25 (`0f169a8`) |
-|---|---:|---:|---:|
-| Workbooks opened | 996 / 1,000 | 996 / 1,000 | 996 / 1,000 |
-| Formula cells observed | 924,235 | 924,235 | 924,235 |
-| Loaded and compared | 829,529 (89.75%) | 881,148 (95.34%) | 886,449 (95.91%) |
-| Stored values matched | 828,437 | 874,541 | 883,617 |
-| Match rate of compared | 99.87% | 99.25% | 99.68% |
-| Stored values mismatched | 1,092 | 6,607 | 2,832 |
-| Not compiled | 94,706 | 43,087 | 37,786 |
+| Owned engine lane | 2026-09-08 (`12d1c8c`) | 2026-09-24 (`f08a50a`) | 2026-09-25 (`0f169a8`) | 2026-09-25 (`405867e`) |
+|---|---:|---:|---:|---:|
+| Workbooks opened | 996 / 1,000 | 996 / 1,000 | 996 / 1,000 | 998 / 1,000 |
+| Formula cells observed | 924,235 | 924,235 | 924,235 | 980,734 |
+| Loaded and compared | 829,529 (89.75%) | 881,148 (95.34%) | 886,449 (95.91%) | 934,478 (95.28%) |
+| Stored values matched | 828,437 | 874,541 | 883,617 | 928,272 |
+| Match rate of compared | 99.87% | 99.25% | 99.68% | 99.34% |
+| Stored values mismatched | 1,092 | 6,607 | 2,832 | 6,206 |
+| Not compiled | 94,706 | 43,087 | 37,786 | 46,256 |
 
-This pass is commit `0f169a8`. The score process took about 140s after the
-release build. Owned peak RSS was 11,890,917,376 bytes. The 120
-three-dimensional sums on the plant model, previously unknown names, now
-match the stored values. Two number-versus-number misses and 28 cycles remain
-on that workbook. Stored-value mismatches fell from 2,849 to 2,832.
+This pass is commit `405867e`. The import budget counts occupied cells, so the
+two workbooks whose used-range boxes exceeded 2,000,000 now open. One options
+model accounts for the whole movement in formula and mismatch totals: 56,499
+formulas, 48,029 compared, 44,655 matched, 3,374 mismatched, and 8,470 not
+compiled. The other opened workbook has values and no formulas; three macro
+sheets on it are skipped, so skipped sheets move from 48 to 51 and workbooks
+with skipped sheets from 23 to 24. The score process took about 142s after the
+release build. Owned peak RSS was 11,888,443,392 bytes. The only workbooks
+still refused declare the 1904 date system.
 
-First-failure groups are 8,549 external workbook references, 21,737
-unsupported functions, 7,495 cycles, and 5 structured references. Unknown
-names are gone. These are compatibility measurements, not target-desktop
-performance claims.
+First-failure groups are 8,672 external workbook references, 30,084
+unsupported functions, 7,495 cycles, and 5 structured references. The new
+unsupported calls sit on that options model (`_XLL.OSTRIP`, `BSD`,
+`_XLL.SPRDOPT`, `_XLL.XCALCSKEW`, `_XLL.DIGITAL`). Stored-value mismatches rose
+by that model's 3,374 cells: 2,681 number-versus-number, 560 `#DIV/0!`
+against `#VALUE!`, 82 `#N/A` against `#VALUE!`, and 51 number against `#N/A`.
+The plant model's 120 three-dimensional sums still match. These are
+compatibility measurements, not target-desktop performance claims.
 
 
 Generate both files from a measured schema-2 scorer report with

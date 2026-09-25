@@ -13,62 +13,64 @@
     "formula_cells_loaded": 419854,
     "formula_cells_observed": 419854,
     "formula_parse_rate": 1.0,
-    "peak_rss_bytes_max": 200720384,
+    "peak_rss_bytes_max": 201850880,
     "succeeded": 834,
     "timed_out": 2,
     "value_cells_observed": 3843371
   },
   "command": "omasheets-corpus score enron-figshare.jsonl <root> <out> --timeout-seconds 30",
-  "engine_commit": "0f169a8fd53b473fc87669bf13bf709b2eeb25aa",
+  "engine_commit": "405867ea7da9f33ccd48acb8a2512b0b5ba674d9",
   "manifest": "enron-figshare.jsonl",
   "manifest_sha256": "2f5ea94c02ae3779206d6ca1b1da9e77002450bc070fa968ca566cfd526ff80d",
   "notes": [
     "Aggregate only: no workbook paths, cell contents or per-file results are recorded here.",
-    "Unchanged frozen 1,000-workbook manifest, scored on 2026-09-25 on Darwin arm64 at 0f169a8.",
-    "This pass adds PROPER, Excel number-format display, and 3D sheet spans. The 120 unknown names on the plant model now match.",
+    "Unchanged frozen 1,000-workbook manifest, scored on 2026-09-25 on Darwin arm64 at 405867e.",
+    "The import budget counts occupied cells. Two workbooks the bounding-box cap rejected now open. One options model accounts for the entire formula and mismatch movement. A second workbook has values and no formulas.",
+    "The only remaining open failures are two workbooks that declare the 1904 date system.",
     "macOS does not implement RLIMIT_AS. The probe still ran. The per-file timeout and output caps still applied.",
-    "wall_seconds is about 140s for the score process after the release binary was built.",
-    "Owned peak RSS was 11890917376 bytes.",
+    "wall_seconds is about 142s for the score process after the release binary was built.",
+    "Owned peak RSS reported by the scorer was 11888443392 bytes. The performance wrapper was not rerun.",
     "enron-figshare.score-delta.json remains the 2026-09-08 baseline comparison and was not recomputed."
   ],
   "owned_engine": "omasheets-owned-m0",
   "owned_failure_kinds": {
-    "cell_limit_2000000_exceeded": 2,
     "date_system_1904_rejected": 2
   },
   "owned_summary": {
-    "comparison_coverage": 0.9591164584764698,
-    "failed": 4,
+    "comparison_coverage": 0.9528353253787469,
+    "failed": 2,
     "files": 1000,
-    "formula_cells_compared": 886449,
-    "formula_cells_loaded": 886449,
-    "formula_cells_observed": 924235,
-    "formula_parse_rate": 0.9591164584764698,
-    "opened": 996,
-    "peak_rss_bytes_max": 11890917376,
-    "skipped_sheets": 48,
-    "stored_value_match_rate": 0.9968052307577763,
-    "stored_values_matched": 883617,
-    "stored_values_mismatched": 2832,
+    "formula_cells_compared": 934478,
+    "formula_cells_loaded": 934478,
+    "formula_cells_observed": 980734,
+    "formula_parse_rate": 0.9528353253787469,
+    "opened": 998,
+    "peak_rss_bytes_max": 11888443392,
+    "skipped_sheets": 51,
+    "stored_value_match_rate": 0.9933588591705744,
+    "stored_values_matched": 928272,
+    "stored_values_mismatched": 6206,
     "syntax_failure_tokens": {},
     "timed_out": 0,
     "unsupported_formulas": 37786,
     "unsupported_reasons": {
       "cycle": 7495,
-      "external_reference": 8549,
+      "external_reference": 8672,
       "structured_reference": 5,
-      "unsupported_function": 21737
+      "unsupported_function": 30084
     },
-    "workbooks_with_skipped_sheets": 23,
+    "workbooks_with_skipped_sheets": 24,
     "reference_failure_kinds": {},
     "mismatch_value_kinds": {
+      "#DIV/0! -> #VALUE!": 560,
+      "#N/A -> #VALUE!": 82,
       "#NAME? -> #VALUE!": 19,
       "#VALUE! -> number": 78,
       "#VALUE! -> text": 2,
-      "number -> #N/A": 1597,
+      "number -> #N/A": 1648,
       "number -> #REF!": 892,
       "number -> #VALUE!": 10,
-      "number -> number": 173,
+      "number -> number": 2854,
       "text -> #VALUE!": 14,
       "text -> text": 47
     }
@@ -76,6 +78,10 @@
   "owned_unsupported_functions": {
     "AVERAGEPRICES": {
       "formula_cells": 139,
+      "workbooks": 1
+    },
+    "BSD": {
+      "formula_cells": 3021,
       "workbooks": 1
     },
     "CALCSKEW": {
@@ -106,6 +112,10 @@
       "formula_cells": 150,
       "workbooks": 1
     },
+    "_XLL.DIGITAL": {
+      "formula_cells": 4,
+      "workbooks": 1
+    },
     "_XLL.EURO": {
       "formula_cells": 2992,
       "workbooks": 2
@@ -116,6 +126,14 @@
     },
     "_XLL.IMPVOLAB": {
       "formula_cells": 22,
+      "workbooks": 1
+    },
+    "_XLL.OSTRIP": {
+      "formula_cells": 3052,
+      "workbooks": 1
+    },
+    "_XLL.SPRDOPT": {
+      "formula_cells": 1790,
       "workbooks": 1
     },
     "_XLL.XASN": {
@@ -130,23 +148,27 @@
       "formula_cells": 1,
       "workbooks": 1
     },
+    "_XLL.XCALCSKEW": {
+      "formula_cells": 476,
+      "workbooks": 1
+    },
     "_XLL.XCRUDEAPO": {
       "formula_cells": 2011,
       "workbooks": 1
     },
     "_XLL.XEURO": {
-      "formula_cells": 3642,
-      "workbooks": 1
+      "formula_cells": 3646,
+      "workbooks": 2
     },
     "_XLL.XXCOL2": {
       "formula_cells": 2,
       "workbooks": 1
     }
   },
-  "process_tree_peak_rss_bytes": 11890491392,
+  "process_tree_peak_rss_bytes": 11888443392,
   "runner": "Darwin arm64, 18 CPUs; RLIMIT_AS returns EINVAL and the probe continues; owned peak is ru_maxrss of one probe; not a GitHub runner",
   "schema": 1,
-  "scored": "2026-09-24",
+  "scored": "2026-09-25",
   "source": "enron-figshare",
-  "wall_seconds": 137
+  "wall_seconds": 142
 }
