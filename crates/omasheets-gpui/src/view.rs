@@ -146,9 +146,6 @@ impl SpreadsheetView {
     }
 
     fn commit_formula(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session.is_browsing() {
-            return;
-        }
         match self.session.commit_edit() {
             Ok((address, source)) => {
                 let sheet = self
