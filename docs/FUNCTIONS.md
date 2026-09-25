@@ -63,6 +63,15 @@ with the text functions below.
 Approximate lookups (`VLOOKUP`/`HLOOKUP` without `FALSE`, `MATCH` types 1 and
 -1) binary-search sorted keys per Excel's documented contract; results over
 unsorted keys are undefined in Excel and are not promised here.
+`XLOOKUP` takes an optional if-not-found value, a match mode, and a search
+mode. An omitted if-not-found is `#N/A`. Match mode 0 is exact, -1 is the
+next smaller value of the same type, 1 is the next larger, and 2 is a
+wildcard match (`*`, `?`, `~`). Search mode 1 reads first to last, -1 last
+to first, and 2 or -2 binary-searches a vector sorted ascending or
+descending. Any other mode is `#VALUE!`. `SUMIF` and `AVERAGEIF` read a sum
+block whose top-left is the sum range's top-left and whose shape is the
+criteria range. `LOOKUP` evaluates an array expression in either vector, so
+`LOOKUP(2,1/(range<>""),range)` returns the last non-blank.
 
 ## Registry
 

@@ -1164,7 +1164,11 @@ impl Workbook {
         cell: CellId,
         formula: ParsedFormula,
     ) -> Result<RecalcReport, FormulaError> {
-        let parsed = reference::narrow_reference_dependencies(formula.expression);
+        let mut parsed = reference::narrow_reference_dependencies(formula.expression);
+        // SUMIF/AVERAGEIF read a criteria-shaped block from the sum range's
+        // top-left. Rewrite that argument so the dependency is the block
+        // Excel reads, not the written rectangle.
+        align_criteria_sums(&mut parsed);
         let mut structural_cells = BTreeSet::new();
         let mut structural_ranges = Vec::new();
         collect_dependencies(&parsed, &mut structural_cells, &mut structural_ranges);
@@ -3519,8 +3523,15 @@ impl Workbook {
 
         let mut output_values = vec![Value::Blank; length];
         if let Some(expression) = output_expression {
-            output_values.clear();
-            self.flatten_values(expression, &mut output_values);
+            // Excel ignores the written size of a SUMIF/AVERAGEIF sum range
+            // and reads a block of the criteria range's shape from its
+            // top-left cell. Equal rectangles stay the same cells.
+            if let Some(aligned) = self.criteria_shaped_sum(function, arguments) {
+                output_values = aligned;
+            } else {
+                output_values.clear();
+                self.flatten_values(expression, &mut output_values);
+            }
             if output_values.len() != length {
                 return Value::Error(CalcError::InvalidArguments);
             }
@@ -3561,6 +3572,64 @@ impl Workbook {
             }
             Function::AverageIf | Function::AverageIfs => Value::Error(CalcError::DivisionByZero),
             _ => unreachable!("validated above"),
+        }
+    }
+
+    /// The cells Excel sums for a 3-argument `SUMIF` or `AVERAGEIF`: the
+    /// criteria range's row and column counts, starting at the sum range's
+    /// top-left. A position past the grid is `#REF!`. `None` leaves the
+    /// caller's length check in place (a non-rectangle, or a block too large
+    /// to copy).
+    fn criteria_shaped_sum(
+        &self,
+        function: Function,
+        arguments: &[Expr<usize>],
+    ) -> Option<Vec<Value>> {
+        if !matches!(function, Function::SumIf | Function::AverageIf) || arguments.len() != 3 {
+            return None;
+        }
+        let (rows, columns) = self.rectangle_extent(&arguments[0])?;
+        let anchor = self.rectangle_origin(&arguments[2])?;
+        let cells = rows.checked_mul(columns)?;
+        if cells > DENSE_RANGE_CELLS {
+            return None;
+        }
+        let mut output = Vec::with_capacity(cells);
+        for row_offset in 0..rows {
+            for column_offset in 0..columns {
+                let row = u64::from(anchor.row) + row_offset as u64;
+                let column = u64::from(anchor.column) + column_offset as u64;
+                if row >= u64::from(MAX_ROWS) || column >= u64::from(MAX_COLUMNS) {
+                    output.push(Value::Error(CalcError::InvalidReference));
+                } else {
+                    output.push(self.value(CellId::new(anchor.sheet, row as u32, column as u32)));
+                }
+            }
+        }
+        Some(output)
+    }
+
+    /// Rows and columns of a compiled rectangle, or 1×1 for a single cell.
+    fn rectangle_extent(&self, expression: &Expr<usize>) -> Option<(usize, usize)> {
+        match expression {
+            Expr::Reference(_) => Some((1, 1)),
+            Expr::RangeNode { node, .. } => match self.range_shape(*node) {
+                RangeShape::Rectangle { rows, columns, .. } => Some((rows, columns)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Top-left of a compiled rectangle, or the cell itself.
+    fn rectangle_origin(&self, expression: &Expr<usize>) -> Option<CellId> {
+        match expression {
+            Expr::Reference(index) => Some(self.cells[*index].id),
+            Expr::RangeNode { node, .. } => match self.range_shape(*node) {
+                RangeShape::Rectangle { anchor, .. } => Some(anchor),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -3607,6 +3676,82 @@ impl Workbook {
             }
         }
         found
+    }
+
+    /// `XLOOKUP(lookup, lookup_array, return_array, [if_not_found], [match_mode], [search_mode])`.
+    /// An omitted if-not-found is `#N/A`. Match mode 0 is exact, -1 is the
+    /// next smaller value of the same type, 1 is the next larger, and 2 is a
+    /// wildcard. Search mode 1 reads first to last, -1 last to first, and 2
+    /// or -2 binary-searches a vector that Excel requires to be sorted
+    /// ascending or descending. Any other mode is `#VALUE!`.
+    fn evaluate_xlookup(&self, arguments: &[Expr<usize>]) -> Value {
+        let lookup = self.evaluate(&arguments[0]);
+        if matches!(lookup, Value::Error(_)) {
+            return lookup;
+        }
+        let lookup_input = match ArrayInput::new(&arguments[1], self) {
+            Ok(input) => input,
+            Err(error) => return Value::Error(error),
+        };
+        let return_input = match ArrayInput::new(&arguments[2], self) {
+            Ok(input) => input,
+            Err(error) => return Value::Error(error),
+        };
+        let (lookup_rows, lookup_columns) = lookup_input.shape();
+        let (return_rows, return_columns) = return_input.shape();
+        let length = lookup_rows * lookup_columns;
+        if (lookup_rows != 1 && lookup_columns != 1)
+            || (return_rows != 1 && return_columns != 1)
+            || length != return_rows * return_columns
+        {
+            return Value::Error(CalcError::InvalidArguments);
+        }
+        if length > DENSE_RANGE_CELLS {
+            return Value::Error(CalcError::InvalidValue);
+        }
+        let match_mode = match self.xlookup_switch(arguments.get(4), 0, &[-1, 0, 1, 2]) {
+            Ok(mode) => mode,
+            Err(error) => return Value::Error(error),
+        };
+        let search_mode = match self.xlookup_switch(arguments.get(5), 1, &[-2, -1, 1, 2]) {
+            Ok(mode) => mode,
+            Err(error) => return Value::Error(error),
+        };
+        let candidates = lookup_input.values(self);
+        if candidates.len() != length {
+            return candidates
+                .into_iter()
+                .find(|value| matches!(value, Value::Error(_)))
+                .unwrap_or(Value::Error(CalcError::InvalidValue));
+        }
+        match xlookup_position(&lookup, &candidates, match_mode, search_mode) {
+            Ok(index) => return_input.value(self, index),
+            Err(CalcError::NotAvailable) => match arguments.get(3) {
+                None | Some(Expr::Empty) => Value::Error(CalcError::NotAvailable),
+                Some(argument) => self.evaluate(argument),
+            },
+            Err(error) => Value::Error(error),
+        }
+    }
+
+    fn xlookup_switch(
+        &self,
+        argument: Option<&Expr<usize>>,
+        default: i32,
+        choices: &[i32],
+    ) -> Result<i32, CalcError> {
+        let Some(argument) = argument else {
+            return Ok(default);
+        };
+        if matches!(argument, Expr::Empty) {
+            return Ok(default);
+        }
+        let value = number(self.evaluate(argument))?;
+        choices
+            .iter()
+            .copied()
+            .find(|choice| value == f64::from(*choice))
+            .ok_or(CalcError::InvalidValue)
     }
 
     fn evaluate_lookup_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
@@ -3716,42 +3861,83 @@ impl Workbook {
                     Err(error) => Value::Error(error),
                 }
             }
-            Function::XLookup if matches!(arguments.len(), 3 | 4) => {
-                let lookup = self.evaluate(&arguments[0]);
-                if matches!(lookup, Value::Error(_)) {
-                    return lookup;
-                }
-                let lookup_input = match ArrayInput::new(&arguments[1], self) {
-                    Ok(input) => input,
-                    Err(error) => return Value::Error(error),
-                };
-                let return_input = match ArrayInput::new(&arguments[2], self) {
-                    Ok(input) => input,
-                    Err(error) => return Value::Error(error),
-                };
-                let (lookup_rows, lookup_columns) = lookup_input.shape();
-                let (return_rows, return_columns) = return_input.shape();
-                let length = lookup_rows * lookup_columns;
-                if (lookup_rows != 1 && lookup_columns != 1)
-                    || (return_rows != 1 && return_columns != 1)
-                    || length != return_rows * return_columns
-                {
-                    return Value::Error(CalcError::InvalidArguments);
-                }
-                for index in 0..length {
-                    let candidate = lookup_input.value(self, index);
-                    if lookup_equal(&lookup, &candidate) {
-                        return return_input.value(self, index);
-                    }
-                }
-                if arguments.len() == 4 {
-                    return self.evaluate(&arguments[3]);
-                }
-                Value::Error(CalcError::NotAvailable)
-            }
+            Function::XLookup if matches!(arguments.len(), 3..=6) => self.evaluate_xlookup(arguments),
             _ => Value::Error(CalcError::InvalidArguments),
         }
     }
+}
+
+/// Replaces a `SUMIF`/`AVERAGEIF` sum range with the criteria-shaped block
+/// Excel reads, clipped to the grid. Nested calls are aligned first.
+fn align_criteria_sums(expression: &mut Expr) {
+    match expression {
+        Expr::UnaryMinus(inner) | Expr::Percent(inner) => align_criteria_sums(inner),
+        Expr::Binary(_, left, right) => {
+            align_criteria_sums(left);
+            align_criteria_sums(right);
+        }
+        Expr::Function(function, arguments) => {
+            for argument in arguments.iter_mut() {
+                align_criteria_sums(argument);
+            }
+            if matches!(function, Function::SumIf | Function::AverageIf)
+                && let Some(RangeKey::Rectangle {
+                    anchor,
+                    rows,
+                    columns,
+                }) = criteria_shaped_sum_key(arguments)
+            {
+                arguments[2] = Expr::Range {
+                    anchor,
+                    members: None,
+                    rows,
+                    columns,
+                };
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Dependency rectangle for a 3-argument `SUMIF`/`AVERAGEIF`: criteria shape
+/// anchored at the sum range's top-left, clipped to the grid. A single cell
+/// is a 1×1 rectangle. The same cells [`Workbook::criteria_shaped_sum`]
+/// reads, excluding positions past the grid (those are `#REF!` and have no
+/// cell).
+fn criteria_shaped_sum_key(arguments: &[Expr]) -> Option<RangeKey> {
+    if arguments.len() != 3 {
+        return None;
+    }
+    let (rows, columns) = match &arguments[0] {
+        Expr::Reference(_) => (1, 1),
+        Expr::Range {
+            rows,
+            columns,
+            members: None,
+            ..
+        } => (*rows, *columns),
+        _ => return None,
+    };
+    let anchor = match &arguments[2] {
+        Expr::Reference(cell) => *cell,
+        Expr::Range {
+            anchor,
+            members: None,
+            ..
+        } => *anchor,
+        _ => return None,
+    };
+    let rows = rows.min(MAX_ROWS.saturating_sub(anchor.row) as usize);
+    let columns = columns.min(MAX_COLUMNS.saturating_sub(anchor.column) as usize);
+    let cells = rows.checked_mul(columns)?;
+    if rows == 0 || columns == 0 || cells > DENSE_RANGE_CELLS {
+        return None;
+    }
+    Some(RangeKey::Rectangle {
+        anchor,
+        rows,
+        columns,
+    })
 }
 
 fn match_mode_for(value: f64) -> MatchMode {
@@ -3898,6 +4084,173 @@ fn typed_compare(left: &Value, right: &Value) -> Result<std::cmp::Ordering, Calc
     })
 }
 
+fn same_value_kind(left: &Value, right: &Value) -> bool {
+    std::mem::discriminant(left) == std::mem::discriminant(right)
+}
+
+/// Index of the `XLOOKUP` match. Blanks and errors in the lookup vector are
+/// skipped and do not propagate. Approximate modes stay inside one value
+/// type, so a number never matches text. Binary search (`search_mode` 2 and
+/// -2) assumes the vector is sorted in that direction; on an ascending vector
+/// an exact match is the last equal key.
+fn xlookup_position(
+    lookup: &Value,
+    candidates: &[Value],
+    match_mode: i32,
+    search_mode: i32,
+) -> Result<usize, CalcError> {
+    if match_mode == 2 {
+        let Value::Text(pattern) = lookup else {
+            return Err(CalcError::InvalidValue);
+        };
+        return xlookup_wildcard(&pattern.to_lowercase(), candidates, search_mode < 0);
+    }
+    if search_mode.abs() == 2 {
+        return xlookup_binary(lookup, candidates, match_mode, search_mode > 0);
+    }
+    xlookup_linear(lookup, candidates, match_mode, search_mode < 0)
+}
+
+fn xlookup_linear(
+    lookup: &Value,
+    candidates: &[Value],
+    match_mode: i32,
+    reverse: bool,
+) -> Result<usize, CalcError> {
+    let mut best: Option<usize> = None;
+    for step in 0..candidates.len() {
+        let index = if reverse {
+            candidates.len() - 1 - step
+        } else {
+            step
+        };
+        let candidate = &candidates[index];
+        if matches!(candidate, Value::Blank | Value::Error(_))
+            || !same_value_kind(lookup, candidate)
+        {
+            continue;
+        }
+        if match_mode == 0 {
+            if lookup_equal(lookup, candidate) {
+                return Ok(index);
+            }
+            continue;
+        }
+        match typed_compare(candidate, lookup)? {
+            std::cmp::Ordering::Equal => return Ok(index),
+            std::cmp::Ordering::Less if match_mode == -1 => {
+                let replace = match best {
+                    None => true,
+                    Some(chosen) => {
+                        typed_compare(candidate, &candidates[chosen])? == std::cmp::Ordering::Greater
+                    }
+                };
+                if replace {
+                    best = Some(index);
+                }
+            }
+            std::cmp::Ordering::Greater if match_mode == 1 => {
+                let replace = match best {
+                    None => true,
+                    Some(chosen) => {
+                        typed_compare(candidate, &candidates[chosen])? == std::cmp::Ordering::Less
+                    }
+                };
+                if replace {
+                    best = Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    best.ok_or(CalcError::NotAvailable)
+}
+
+fn xlookup_wildcard(pattern: &str, candidates: &[Value], reverse: bool) -> Result<usize, CalcError> {
+    for step in 0..candidates.len() {
+        let index = if reverse {
+            candidates.len() - 1 - step
+        } else {
+            step
+        };
+        let Value::Text(text) = &candidates[index] else {
+            continue;
+        };
+        if wildcard_matches(pattern, &text.to_lowercase()) {
+            return Ok(index);
+        }
+    }
+    Err(CalcError::NotAvailable)
+}
+
+/// Binary search of a vector Excel requires to be sorted. Descending input is
+/// reversed into ascending order first, so both directions share one bound.
+fn xlookup_binary(
+    lookup: &Value,
+    candidates: &[Value],
+    match_mode: i32,
+    ascending: bool,
+) -> Result<usize, CalcError> {
+    let mut populated: Vec<(usize, &Value)> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| !matches!(candidate, Value::Blank | Value::Error(_)))
+        .collect();
+    if !ascending {
+        populated.reverse();
+    }
+    if match_mode == 1 {
+        return xlookup_lower_bound(lookup, &populated);
+    }
+    let position = xlookup_upper_previous(lookup, &populated)?;
+    if match_mode == 0 && !lookup_equal(lookup, &candidates[position]) {
+        return Err(CalcError::NotAvailable);
+    }
+    Ok(position)
+}
+
+/// Rightmost populated entry that compares `<=` lookup and has the same type.
+fn xlookup_upper_previous(
+    lookup: &Value,
+    populated: &[(usize, &Value)],
+) -> Result<usize, CalcError> {
+    let mut low = 0;
+    let mut high = populated.len();
+    while low < high {
+        let middle = (low + high) / 2;
+        let ordering = typed_compare(populated[middle].1, lookup)?;
+        if ordering != std::cmp::Ordering::Greater {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    match low.checked_sub(1) {
+        Some(index) if same_value_kind(populated[index].1, lookup) => Ok(populated[index].0),
+        _ => Err(CalcError::NotAvailable),
+    }
+}
+
+/// Leftmost populated entry that compares `>=` lookup and has the same type.
+fn xlookup_lower_bound(lookup: &Value, populated: &[(usize, &Value)]) -> Result<usize, CalcError> {
+    let mut low = 0;
+    let mut high = populated.len();
+    while low < high {
+        let middle = (low + high) / 2;
+        let ordering = typed_compare(populated[middle].1, lookup)?;
+        if ordering == std::cmp::Ordering::Less {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if low < populated.len() && same_value_kind(populated[low].1, lookup) {
+        Ok(populated[low].0)
+    } else {
+        Err(CalcError::NotAvailable)
+    }
+}
+
 /// An intermediate array inside an aggregate argument, row-major.
 #[derive(Clone, Debug, PartialEq)]
 struct ArrayValue {
@@ -3948,6 +4301,11 @@ impl<'a> ArrayInput<'a> {
                 Err(error) => Err(error),
             },
             Expr::Error(error) => Err(error.clone()),
+            // `LOOKUP(2,1/(range<>""),range)` and the other array expressions
+            // an aggregate already evaluates elementwise.
+            other if contains_array_operand(other) => {
+                workbook.evaluate_array(other).map(Self::Computed)
+            }
             _ => Err(CalcError::InvalidArguments),
         }
     }
@@ -8955,6 +9313,51 @@ mod tests {
     }
 
     #[test]
+    fn sumif_sizes_the_sum_block_from_the_criteria_range() {
+        let mut workbook = Workbook::default();
+        // Criteria A1:B2 is 2×2. The written sum range A4:B4 is 1×2; Excel
+        // still reads A4:B5. A 1×2 criteria against a 2×1 sum range of the
+        // same length is not paired in flatten order.
+        workbook.set_number(cell(0, 0), 1.0);
+        workbook.set_number(cell(0, 1), 0.0);
+        workbook.set_number(cell(1, 0), 1.0);
+        workbook.set_number(cell(1, 1), 0.0);
+        workbook.set_number(cell(3, 0), 10.0);
+        workbook.set_number(cell(3, 1), 99.0);
+        workbook.set_number(cell(4, 0), 30.0);
+        workbook.set_number(cell(4, 1), 99.0);
+        workbook.set_number(cell(6, 0), 1.0);
+        workbook.set_number(cell(6, 1), 1.0);
+        workbook.set_number(cell(7, 0), 100.0);
+        workbook.set_number(cell(7, 1), 7.0);
+        workbook.set_number(cell(8, 0), 50.0);
+        workbook.set_number(cell(11, 0), 1.0);
+        workbook.set_number(cell(11, 1), 1.0);
+        workbook.set_number(cell(0, 16_383), 5.0);
+        let cases = [
+            ("=SUMIF(A1:B2,1,A4:B4)", Value::Number(40.0)),
+            ("=AVERAGEIF(A1:B2,1,A4:B4)", Value::Number(20.0)),
+            ("=SUMIF(A1:B2,1,A4:B5)", Value::Number(40.0)),
+            // Same flattened length, different shape: Excel reads A8:B8, not A8:A9.
+            ("=SUMIF(A7:B7,1,A8:A9)", Value::Number(107.0)),
+            ("=SUMIF(A12:B12,1,XFD1)", Value::Error(CalcError::InvalidReference)),
+        ];
+        for (column, (formula, expected)) in cases.into_iter().enumerate() {
+            let target = cell(14, column as u32);
+            workbook.set_formula(target, formula).unwrap();
+            assert_eq!(workbook.value(target), expected, "{formula}");
+        }
+        // B8 is outside the written sum range A8:A9. Changing it must recalculate.
+        workbook.set_number(cell(7, 1), 1.0);
+        assert_eq!(workbook.value(cell(14, 3)), Value::Number(101.0));
+        // The formula itself sits in the block it would read.
+        assert!(matches!(
+            workbook.set_formula(cell(4, 2), "=SUMIF(A1:A2,1,C4:C4)"),
+            Err(FormulaError::Cycle(_))
+        ));
+    }
+
+    #[test]
     fn text_criteria_keep_their_spacing_and_match_wildcards() {
         let mut workbook = Workbook::default();
         workbook.set_text(cell(0, 0), "ABQ Energy Group, Ltd ");
@@ -10649,6 +11052,102 @@ mod tests {
         ] {
             workbook.set_formula(cell(0, 3), formula).unwrap();
             assert_eq!(workbook.value(cell(0, 3)), expected, "{formula}");
+        }
+    }
+
+    #[test]
+    fn lookup_of_a_computed_vector_returns_the_last_nonblank() {
+        let mut workbook = Workbook::default();
+        workbook.set_number(cell(0, 0), 10.0);
+        workbook.set_text(cell(2, 0), "x");
+        workbook.set_number(cell(0, 4), 1.0);
+        workbook.set_number(cell(0, 6), 9.0);
+        workbook.set_formula(cell(0, 3), "=LOOKUP(2,1/(A1:A4<>\"\"),A1:A4)").unwrap();
+        assert_eq!(workbook.value(cell(0, 3)), Value::Text("x".into()));
+        workbook.set_text(cell(3, 0), "last");
+        assert_eq!(workbook.value(cell(0, 3)), Value::Text("last".into()));
+        workbook
+            .set_formula(cell(1, 3), "=LOOKUP(2,1/(E1:G1<>\"\"),E1:G1)")
+            .unwrap();
+        assert_eq!(workbook.value(cell(1, 3)), Value::Number(9.0));
+        workbook.set_formula(cell(2, 3), "=LOOKUP(2,1/(A6:A8<>\"\"),A6:A8)").unwrap();
+        assert_eq!(
+            workbook.value(cell(2, 3)),
+            Value::Error(CalcError::NotAvailable)
+        );
+    }
+
+    #[test]
+    fn xlookup_match_and_search_modes_follow_excel() {
+        let mut workbook = Workbook::default();
+        let cases = [
+            ("=XLOOKUP(2.5,{1,2,3},{10,20,30},,-1)", Value::Number(20.0)),
+            ("=XLOOKUP(4,{1,3,3,8},{10,30,31,80},,-1)", Value::Number(30.0)),
+            (
+                "=XLOOKUP(4,{1,3,3,8},{10,30,31,80},,-1,-1)",
+                Value::Number(31.0),
+            ),
+            (
+                "=XLOOKUP(3,{1,3,3,8},{10,30,31,80},,0,-1)",
+                Value::Number(31.0),
+            ),
+            (
+                "=XLOOKUP(0,{1,3,8},{10,30,80},,-1)",
+                Value::Error(CalcError::NotAvailable),
+            ),
+            (
+                "=XLOOKUP(0,{1,3,8},{10,30,80},\"missing\",-1)",
+                Value::Text("missing".into()),
+            ),
+            ("=XLOOKUP(4,{1,3,8},{10,30,80},,1)", Value::Number(80.0)),
+            ("=XLOOKUP(3,{1,3,8},{10,30,80},,1)", Value::Number(30.0)),
+            ("=XLOOKUP(9,{1,3,8},{10,30,80},,1)", Value::Error(CalcError::NotAvailable)),
+            (
+                "=XLOOKUP(1,{1,3,8},{10,30,80},,3)",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (
+                "=XLOOKUP(1,{1,3,8},{10,30,80},,0,0)",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            ("=XLOOKUP(1,{1,3,8},{10,30,80},,0,2)", Value::Number(10.0)),
+            ("=XLOOKUP(4,{1,3,8},{10,30,80},,-1,2)", Value::Number(30.0)),
+            ("=XLOOKUP(4,{1,3,8},{10,30,80},,1,2)", Value::Number(80.0)),
+            ("=XLOOKUP(4,{8,3,1},{80,30,10},,-1,-2)", Value::Number(30.0)),
+            ("=XLOOKUP(4,{8,3,1},{80,30,10},,1,-2)", Value::Number(80.0)),
+            ("=XLOOKUP(3,{8,3,1},{80,30,10},,0,-2)", Value::Number(30.0)),
+            (
+                "=XLOOKUP(4,{8,3,1},{80,30,10},,0,-2)",
+                Value::Error(CalcError::NotAvailable),
+            ),
+            // Binary search on an ascending vector stops on the last equal key.
+            ("=XLOOKUP(3,{1,3,3,8},{10,30,31,80},,0,2)", Value::Number(31.0)),
+            ("=XLOOKUP(\"b*\",{\"bat\",\"car\",\"bag\"},{1,2,3},,2)", Value::Number(1.0)),
+            (
+                "=XLOOKUP(\"b*\",{\"bat\",\"car\",\"bag\"},{1,2,3},,2,-1)",
+                Value::Number(3.0),
+            ),
+            ("=XLOOKUP(\"c?r\",{\"bat\",\"car\",\"bag\"},{1,2,3},,2)", Value::Number(2.0)),
+            (
+                "=XLOOKUP(1,{\"a\",\"b\"},{1,2},,2)",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (
+                "=XLOOKUP(\"b\",{1,2,3},{10,20,30},,-1)",
+                Value::Error(CalcError::NotAvailable),
+            ),
+            ("=XLOOKUP(2,{1,\"b\",3},{10,20,30},,-1)", Value::Number(10.0)),
+            ("=XLOOKUP(1,{1},{10},1/0)", Value::Number(10.0)),
+            (
+                "=XLOOKUP(0,{1},{10},1/0,-1)",
+                Value::Error(CalcError::DivisionByZero),
+            ),
+            ("=XLOOKUP(\"B\",{\"a\",\"b\"},{1,2})", Value::Number(2.0)),
+        ];
+        for (column, (formula, expected)) in cases.into_iter().enumerate() {
+            let target = cell(0, column as u32);
+            workbook.set_formula(target, formula).unwrap();
+            assert_eq!(workbook.value(target), expected, "{formula}");
         }
     }
 
