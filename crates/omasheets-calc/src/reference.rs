@@ -143,6 +143,24 @@ impl ReferenceView {
                     let index = (self.row + row) * columns + self.column + column;
                     workbook.cells[workbook.cells[node].dependencies[index]].id
                 }
+                RangeShape::Stack {
+                    first_sheet,
+                    row: origin_row,
+                    column: origin_column,
+                    rows: span_rows,
+                    columns: span_columns,
+                    ..
+                } => {
+                    let per = span_rows.saturating_mul(span_columns).max(1);
+                    let index = (self.row + row) * self.columns.max(1) + self.column + column;
+                    let sheet = first_sheet + (index / per) as u32;
+                    let within = index % per;
+                    CellId::new(
+                        sheet,
+                        origin_row + (within / span_columns.max(1)) as u32,
+                        origin_column + (within % span_columns.max(1)) as u32,
+                    )
+                }
             }
         } else {
             CellId::new(

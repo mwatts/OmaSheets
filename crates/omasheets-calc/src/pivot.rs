@@ -205,6 +205,7 @@ impl Workbook {
                             .saturating_sub(1),
                     ))
                 }
+                RangeShape::Stack { .. } => None,
                 RangeShape::Members { .. } => {
                     let mut bounds: Option<(u32, u32, u32, u32, u32)> = None;
                     for member in &self.cells[*node].dependencies {
