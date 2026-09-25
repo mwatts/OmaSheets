@@ -4,6 +4,9 @@
 //! and opens it. Arrow keys move the selection, Page Up and Page Down move a
 //! screen, and the scroll wheel moves the window.
 //!
+//! The sample directory is `$OMASHEETS_CORPUS` when that is set, otherwise
+//! `~/omasheets-corpus/spreadsheet-rl-2026/sample`.
+//!
 //! ```text
 //! cargo run --release -p omasheets-gpui --bin omasheets-view
 //! ```
@@ -18,7 +21,20 @@ use gpui_kit::{
 };
 use omasheets_gpui::{SpreadsheetSession, SpreadsheetView};
 
-const CORPUS: &str = "/Users/markwatts/omasheets-corpus/spreadsheet-rl-2026/sample";
+fn corpus_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("OMASHEETS_CORPUS") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    let mut path = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    path.push("omasheets-corpus");
+    path.push("spreadsheet-rl-2026");
+    path.push("sample");
+    path
+}
 
 struct CatalogEntry {
     label: &'static str,
@@ -75,12 +91,13 @@ struct CorpusHost {
 impl CorpusHost {
     fn new(spreadsheet: Entity<SpreadsheetView>, cx: &mut Context<Self>) -> Self {
         let watch = cx.observe(&spreadsheet, |_, _, cx| cx.notify());
+        let corpus = corpus_dir();
         let files = CATALOG
             .iter()
             .map(|entry| CorpusFile {
                 label: entry.label,
                 note: entry.note,
-                path: PathBuf::from(CORPUS).join(entry.file),
+                path: corpus.join(entry.file),
             })
             .collect();
         Self {
@@ -98,7 +115,8 @@ impl CorpusHost {
     fn open_initial(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.files.iter().position(|file| file.path.is_file()) else {
             self.failed = true;
-            self.message = format!("No corpus files found under {CORPUS}");
+            let root = corpus_dir();
+            self.message = format!("No corpus files found under {}", root.display());
             cx.notify();
             return;
         };
