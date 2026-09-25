@@ -3,9 +3,9 @@
   "source": "spreadsheet-rl",
   "manifest": "spreadsheet-rl-manifest.jsonl",
   "manifest_sha256": "5d16d1e75b865ab3a7b004b435b3bedb53edaffc7766f3ccb77757d72d0893c3",
-  "scored": "2026-09-24",
+  "scored": "2026-09-25",
   "command": "omasheets-corpus score spreadsheet-rl-manifest.jsonl <root> <out> --timeout-seconds 30",
-  "engine_commit": "f08a50a916ae9441f2aa37f0a3f8b2b36ae8cb5e",
+  "engine_commit": "0f169a8fd53b473fc87669bf13bf709b2eeb25aa",
   "runner": "Darwin arm64, local cargo release; probe RLIMIT_AS returns EINVAL on this host and was allowed to succeed; not a GitHub ubuntu-latest runner",
   "candidate_engine": "formualizer-calamine-0.8.4",
   "candidate_summary": {
@@ -17,7 +17,7 @@
     "formula_cells_observed": 5264,
     "formula_cells_loaded": 5264,
     "formula_parse_rate": 1.0,
-    "peak_rss_bytes_max": 69615616
+    "peak_rss_bytes_max": 68927488
   },
   "owned_engine": "omasheets-owned-m0",
   "owned_summary": {
@@ -47,7 +47,7 @@
     },
     "workbooks_with_skipped_sheets": 0,
     "skipped_sheets": 0,
-    "peak_rss_bytes_max": 85016576
+    "peak_rss_bytes_max": 85049344
   },
   "owned_unsupported_functions": {},
   "candidate_failure_kinds": {
@@ -60,10 +60,10 @@
     "Aggregate only: no workbook paths, cell contents or per-file results are recorded here.",
     "Schema 1 aggregate summary derived from one omasheets-corpus schema 2 score. The per-workbook list is not stored.",
     "Source is Hugging Face Spreadsheet-RL (2026-05-17, CC-BY-SA-4.0), a 16-workbook sample. This is not the Enron corpus and not the full 33,015-file zip. The full zip was not scored.",
-    "Engine commit is still f08a50a. This rescore is the same uncommitted tree after the DATEVALUE, external-text, LINEST/OFFSET, and YEARFRAC fixes. Formula totals are unchanged from the previous same-day sample score. No engine source was changed for the score itself.",
+    "Rescored 2026-09-25 at 0f169a8. Formula totals are unchanged from the 2026-09-24 sample score.",
     "The scored manifest is local and not vendored. Identifiers longer than 64 characters were shortened; the 16 digests are unchanged.",
     "Candidate formula-cell totals include only workbooks that lane opened. Workbooks that failed to open stay in the file count.",
     "macOS does not implement RLIMIT_AS. The probe still ran.",
-    "The 16-file totals in this file are unchanged. Three complex SpreadsheetBench-2 workbooks were scored separately the same day, before the dynamic OFFSET wait fix and the 16-digit PMT fix: 285,660 formula cells, 240,204 matched, 45,399 mismatched, 57 not compiled. Reimporting the DCF workbook after both fixes leaves 0 mismatches and 7 cycles. The write-up is in spreadsheet-rl.md. Those passes are not folded into the numbers above."
+    "The 16-file totals in this file are unchanged. Three complex SpreadsheetBench-2 workbooks were rescored the same day at 0f169a8: 285,660 formula cells, 285,604 matched, 6 mismatched, 50 not compiled. PROPER on the valuation model now matches. The write-up is in spreadsheet-rl.md. Those passes are not folded into the numbers above."
   ]
 }
