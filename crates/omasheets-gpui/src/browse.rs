@@ -7,7 +7,7 @@
 
 use crate::format::{self, paint_number_in};
 use omasheets_calc::serial_date::DateSystem;
-use omasheets_calc::{CellId, Value};
+use omasheets_calc::{CellId, FormulaError, Value, Workbook};
 use omasheets_core::ApplyError;
 use omasheets_xlsx::{ImportError, ImportLimits, import_xlsx};
 use std::collections::{HashMap, HashSet};
@@ -41,6 +41,8 @@ pub(crate) struct BrowseCell {
     pub(crate) numeric: bool,
     /// `0xRRGGBB` from the number format, such as `[Red]`.
     pub(crate) format_color: Option<u32>,
+    /// Excel format code, kept so an edit can be painted again.
+    format_code: String,
 }
 
 pub(crate) struct BrowseSheet {
@@ -62,6 +64,8 @@ pub(crate) struct BrowseBook {
     /// Index into `sheets` of the first worksheet that has a cell.
     /// Cover sheets in the corpus are often empty.
     pub(crate) first_occupied: usize,
+    workbook: Workbook,
+    date_system: DateSystem,
 }
 
 pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
@@ -110,6 +114,7 @@ pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
                 input,
                 numeric,
                 format_color,
+                format_code: code.to_string(),
             },
         );
     }
@@ -153,7 +158,90 @@ pub(crate) fn load(path: &Path) -> Result<BrowseBook, LoadError> {
         occupied,
         formulas,
         first_occupied,
+        workbook: imported.workbook,
+        date_system,
     })
+}
+
+impl BrowseBook {
+    /// Writes `source` into one cell of the opened workbook and recalculates.
+    /// A leading `=` is a formula. Anything else is a number when it parses
+    /// as one, and text otherwise. The text `NaN` stays text.
+    pub(crate) fn apply_input(
+        &mut self,
+        sheet: u32,
+        row: u32,
+        column: u32,
+        source: &str,
+    ) -> Result<(), FormulaError> {
+        let cell = CellId::new(sheet, row, column);
+        let trimmed = source.trim();
+        if trimmed.is_empty() {
+            self.workbook.clear(cell);
+        } else if trimmed.starts_with('=') {
+            self.workbook.set_formula(cell, trimmed)?;
+        } else if trimmed.eq_ignore_ascii_case("TRUE") {
+            self.workbook.set_boolean(cell, true);
+        } else if trimmed.eq_ignore_ascii_case("FALSE") {
+            self.workbook.set_boolean(cell, false);
+        } else if let Ok(number) = trimmed.parse::<f64>() {
+            if number.is_finite() {
+                self.workbook.set_number(cell, number);
+            } else {
+                self.workbook.set_text(cell, trimmed);
+            }
+        } else {
+            self.workbook.set_text(cell, trimmed);
+        }
+        if let Some(info) = self.sheets.iter_mut().find(|info| info.index == sheet) {
+            info.rows = info.rows.max(row.saturating_add(1));
+            info.columns = info.columns.max(column.saturating_add(1));
+        }
+        let input = if trimmed.is_empty() {
+            String::new()
+        } else if trimmed.starts_with('=') {
+            formula_source(trimmed)
+        } else {
+            trimmed.to_string()
+        };
+        self.paint(sheet, row, column, Some(input));
+        let formula_cells: Vec<(u32, u32, u32)> = self
+            .cells
+            .iter()
+            .filter(|(key, cell)| {
+                **key != (sheet, row, column) && cell.input.starts_with('=')
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for (sheet, row, column) in formula_cells {
+            self.paint(sheet, row, column, None);
+        }
+        Ok(())
+    }
+
+    fn paint(&mut self, sheet: u32, row: u32, column: u32, input: Option<String>) {
+        let key = (sheet, row, column);
+        let format_code = self
+            .cells
+            .get(&key)
+            .map(|cell| cell.format_code.clone())
+            .unwrap_or_default();
+        let value = self.workbook.value(CellId::new(sheet, row, column));
+        let (text, numeric, format_color) = display_value(&value, &format_code, self.date_system);
+        let entry = self.cells.entry(key).or_insert_with(|| BrowseCell {
+            text: String::new(),
+            input: String::new(),
+            numeric: false,
+            format_color: None,
+            format_code,
+        });
+        entry.text = text;
+        entry.numeric = numeric;
+        entry.format_color = format_color;
+        if let Some(input) = input {
+            entry.input = input;
+        }
+    }
 }
 
 fn formula_source(formula: &str) -> String {
