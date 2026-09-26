@@ -19,7 +19,7 @@ use omasheets_core::{
     Actor, ActorKind, ApplyError, BranchId, CellRef, CellValue, CheckResult, Command, Document,
     Event, EventId, Lineage, Operation, Severity, Snapshot, Touch, WatchId,
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA_VERSION: i64 = 1;
 pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 100;
 pub const MAX_MERGE_EVENTS: usize = 10_000;
+/// Value of `meta.format` for a native OmaSheets document store.
+pub const FORMAT_MARKER: &str = "omasheets-store";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -45,6 +47,11 @@ pub enum StoreError {
     Conflicts(Vec<Touch>),
     NothingToMerge,
     TooManyEvents(usize),
+    /// The SQLite file is not an OmaSheets store (`meta.format` missing or wrong).
+    WrongFormat {
+        path: PathBuf,
+        found: Option<String>,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -76,6 +83,18 @@ impl fmt::Display for StoreError {
             }
             Self::NothingToMerge => write!(formatter, "the source branch has no new events"),
             Self::TooManyEvents(count) => write!(formatter, "{count} events exceed the bound"),
+            Self::WrongFormat { path, found } => match found {
+                Some(found) => write!(
+                    formatter,
+                    "{} is not an OmaSheets store (format {found}, expected {FORMAT_MARKER})",
+                    path.display()
+                ),
+                None => write!(
+                    formatter,
+                    "{} is not an OmaSheets store (missing format marker {FORMAT_MARKER})",
+                    path.display()
+                ),
+            },
         }
     }
 }
@@ -234,6 +253,7 @@ impl Store {
         let connection = Connection::open(&path)?;
         configure(&connection)?;
         migrate(&connection, &path)?;
+        require_format(&connection, &path)?;
         Ok(Self {
             connection,
             path,
@@ -956,8 +976,8 @@ fn install_schema(connection: &Connection) -> Result<(), StoreError> {
         "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n         CREATE TABLE events (\n             seq INTEGER PRIMARY KEY,\n             id TEXT NOT NULL UNIQUE,\n             parent TEXT,\n             branch TEXT NOT NULL,\n             actor_kind TEXT NOT NULL,\n             actor_id TEXT NOT NULL,\n             timestamp INTEGER NOT NULL,\n             canonical TEXT NOT NULL\n         );\n         CREATE INDEX events_branch_seq ON events (branch, seq);\n         CREATE TABLE branches (\n             id TEXT PRIMARY KEY,\n             name TEXT NOT NULL UNIQUE,\n             parent TEXT,\n             base_event TEXT,\n             head TEXT\n         );\n         CREATE TABLE snapshots (\n             branch TEXT NOT NULL,\n             seq INTEGER NOT NULL,\n             head TEXT NOT NULL,\n             event_count INTEGER NOT NULL,\n             digest TEXT NOT NULL,\n             payload TEXT NOT NULL,\n             PRIMARY KEY (branch, seq)\n         );",
     )?;
     connection.execute(
-        "INSERT INTO meta (key, value) VALUES ('schema_version', ?1), ('format', 'omasheets-store')",
-        params![SCHEMA_VERSION.to_string()],
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?1), ('format', ?2)",
+        params![SCHEMA_VERSION.to_string(), FORMAT_MARKER],
     )?;
     Ok(())
 }
@@ -975,6 +995,25 @@ fn read_schema_version(connection: &Connection) -> Result<i64, StoreError> {
         .ok_or(StoreError::UnsupportedSchema(-1))
 }
 
+fn read_format(connection: &Connection) -> Result<Option<String>, StoreError> {
+    Ok(connection
+        .query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn require_format(connection: &Connection, path: &Path) -> Result<(), StoreError> {
+    let found = read_format(connection)?;
+    match found.as_deref() {
+        Some(FORMAT_MARKER) => Ok(()),
+        other => Err(StoreError::WrongFormat {
+            path: path.to_path_buf(),
+            found: other.map(str::to_owned),
+        }),
+    }
+}
+
 /// Brings an older file forward. Version 0 is the pre-release layout that
 /// lacked the `(branch, seq)` index and the format marker.
 fn migrate(connection: &Connection, path: &Path) -> Result<(), StoreError> {
@@ -990,9 +1029,9 @@ fn migrate(connection: &Connection, path: &Path) -> Result<(), StoreError> {
     while version < SCHEMA_VERSION {
         match version {
             0 => {
-                connection.execute_batch(
-                    "CREATE INDEX IF NOT EXISTS events_branch_seq ON events (branch, seq);\n                     INSERT OR REPLACE INTO meta (key, value) VALUES ('format', 'omasheets-store');\n                     INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1');",
-                )?;
+                connection.execute_batch(&format!(
+                    "CREATE INDEX IF NOT EXISTS events_branch_seq ON events (branch, seq);\n                     INSERT OR REPLACE INTO meta (key, value) VALUES ('format', '{FORMAT_MARKER}');\n                     INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');"
+                ))?;
             }
             other => return Err(StoreError::UnsupportedSchema(other)),
         }
@@ -1158,12 +1197,10 @@ mod tests {
             value: Literal::Number(42.0),
         };
         setup.store.connection.execute_batch("CREATE TRIGGER refuse_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
-        assert!(
-            setup
-                .store
-                .append_batch(main, human(), 2_000, vec![command.clone()])
-                .is_err()
-        );
+        assert!(setup
+            .store
+            .append_batch(main, human(), 2_000, vec![command.clone()])
+            .is_err());
         assert_eq!(setup.store.document(main).unwrap().digest(), before);
         setup.store.connection.execute_batch("DROP TRIGGER refuse_event; CREATE TRIGGER refuse_snapshot BEFORE INSERT ON snapshots BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
         setup.store.set_snapshot_interval(1);
@@ -1604,11 +1641,60 @@ mod tests {
         ));
         cleanup(&foreign);
 
+        let wrong_format = temp_path("wrong-format");
+        {
+            let connection = Connection::open(&wrong_format).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n                     INSERT INTO meta (key, value) VALUES ('schema_version', '1'), ('format', 'application/vnd.sqlite3');\n                     CREATE TABLE events (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, parent TEXT, branch TEXT NOT NULL, actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, timestamp INTEGER NOT NULL, canonical TEXT NOT NULL);\n                     CREATE TABLE branches (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, parent TEXT, base_event TEXT, head TEXT);\n                     CREATE TABLE snapshots (branch TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL, event_count INTEGER NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (branch, seq));",
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            Store::open(&wrong_format).unwrap_err(),
+            StoreError::WrongFormat { found: Some(found), .. } if found == "application/vnd.sqlite3"
+        ));
+        cleanup(&wrong_format);
+
+        let missing_format = temp_path("missing-format");
+        {
+            let connection = Connection::open(&missing_format).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n                     INSERT INTO meta (key, value) VALUES ('schema_version', '1');\n                     CREATE TABLE events (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, parent TEXT, branch TEXT NOT NULL, actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, timestamp INTEGER NOT NULL, canonical TEXT NOT NULL);\n                     CREATE TABLE branches (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, parent TEXT, base_event TEXT, head TEXT);\n                     CREATE TABLE snapshots (branch TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL, event_count INTEGER NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (branch, seq));",
+                )
+                .unwrap();
+        }
+        let missing_error = Store::open(&missing_format).unwrap_err();
+        assert!(matches!(
+            missing_error,
+            StoreError::WrongFormat { found: None, .. }
+        ));
+        assert!(missing_error.to_string().contains("missing format marker"));
+        cleanup(&missing_format);
+
         let missing = temp_path("missing");
         assert!(matches!(
             Store::open(&missing).unwrap_err(),
             StoreError::NotADocumentStore(_)
         ));
+    }
+
+    #[test]
+    fn create_then_open_accepts_format_marker() {
+        let path = temp_path("format-ok");
+        Store::create(
+            &path,
+            DocumentId(ObjectId::from_seed("format-ok")),
+            "Budget",
+            human(),
+            1,
+        )
+        .unwrap();
+        let opened = Store::open(&path).unwrap();
+        assert_eq!(opened.schema_version().unwrap(), SCHEMA_VERSION);
+        drop(opened);
+        cleanup(&path);
     }
 
     #[test]

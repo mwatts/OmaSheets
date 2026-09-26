@@ -2,10 +2,10 @@
 
 use crate::appearance::{AppearanceTile, SheetChrome, VisibleWindow};
 use crate::browse::{self, BrowseBook};
-use crate::media::{XLSX_MEDIA_TYPE, is_native_media_type};
+use crate::media::{is_native_media_type, sniff_spreadsheet_media_type, XLSX_MEDIA_TYPE};
 use omasheets_core::{
-    Actor, ActorKind, ApplyError, CellInput, CellRef, CellValue, Command, Document, DocumentId,
-    Literal, ObjectId, SheetId, column_letters,
+    column_letters, Actor, ActorKind, ApplyError, BranchId, CellInput, CellRef, CellValue, Command,
+    Document, DocumentId, Literal, ObjectId, SheetId,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,12 @@ pub const VISIBLE_ROWS: u32 = 32;
 pub const VISIBLE_COLUMNS: u32 = 12;
 const BACKING_ROWS: usize = 64;
 const BACKING_COLUMNS: usize = 16;
+
+/// On-disk native store the session appends into for durable commits.
+struct NativeDurable {
+    path: PathBuf,
+    branch: BranchId,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellAddress {
@@ -50,6 +56,8 @@ pub struct SpreadsheetSession {
     /// Pixel overrides keyed by the active sheet index and the column or row.
     column_px: HashMap<(usize, usize), f32>,
     row_px: HashMap<(usize, usize), f32>,
+    /// When set, formula-bar commands append into this native store.
+    native: Option<NativeDurable>,
 }
 
 impl SpreadsheetSession {
@@ -116,6 +124,7 @@ impl SpreadsheetSession {
             chrome: None,
             column_px: HashMap::new(),
             row_px: HashMap::new(),
+            native: None,
         })
     }
 
@@ -158,12 +167,11 @@ impl SpreadsheetSession {
 
     /// Opens a native `.omasheets` store and shows its main-branch document.
     ///
-    /// Edits apply to the in-memory [`omasheets_core::Document`]. Persisting
-    /// back through Ashlar's workbook port is a later commit path; this open is
-    /// hydrate for display and local formula-bar edits.
+    /// Formula-bar commands append into this store so [`Self::durable_bytes`]
+    /// can checkpoint and export native file bytes.
     pub fn open_omasheets(path: impl AsRef<Path>) -> Result<Self, crate::LoadError> {
-        let mut store =
-            omasheets_store::Store::open(path.as_ref()).map_err(crate::LoadError::Store)?;
+        let path = path.as_ref().to_path_buf();
+        let mut store = omasheets_store::Store::open(&path).map_err(crate::LoadError::Store)?;
         let branch = store.branch_id("main").map_err(crate::LoadError::Store)?;
         let document = store
             .document(branch)
@@ -172,7 +180,9 @@ impl SpreadsheetSession {
         if document.sheets().is_empty() {
             return Err(crate::LoadError::NoSheets);
         }
-        Ok(Self::from_document(document))
+        let mut session = Self::from_document(document);
+        session.native = Some(NativeDurable { path, branch });
+        Ok(session)
     }
 
     /// Writes native store bytes to a temp `.omasheets` file and opens them.
@@ -188,13 +198,15 @@ impl SpreadsheetSession {
     /// Opens workbook bytes using the Ashlar / Freedesktop media type.
     ///
     /// Native documents use [`crate::NATIVE_MEDIA_TYPE`]. OOXML packages use the
-    /// Excel spreadsheet media type and remain import-only interchange.
+    /// Excel spreadsheet media type and remain import-only interchange. Empty or
+    /// `application/octet-stream` types are sniffed from the leading bytes.
     pub fn open_bytes(
         bytes: impl AsRef<[u8]>,
         label: impl Into<String>,
         content_type: &str,
     ) -> Result<Self, crate::LoadError> {
         let label = label.into();
+        let bytes = bytes.as_ref();
         if is_native_media_type(content_type) {
             return Self::open_omasheets_bytes(bytes, label);
         }
@@ -203,14 +215,23 @@ impl SpreadsheetSession {
             .next()
             .unwrap_or(content_type)
             .trim();
-        if essence.is_empty()
-            || essence.eq_ignore_ascii_case(XLSX_MEDIA_TYPE)
+        if essence.is_empty() || essence.eq_ignore_ascii_case("application/octet-stream") {
+            return match sniff_spreadsheet_media_type(bytes) {
+                Some(crate::NATIVE_MEDIA_TYPE) => Self::open_omasheets_bytes(bytes, label),
+                Some(crate::XLSX_MEDIA_TYPE) => Self::open_xlsx_bytes(bytes, label),
+                _ => Err(crate::LoadError::UnsupportedMediaType(
+                    content_type.to_owned(),
+                )),
+            };
+        }
+        if essence.eq_ignore_ascii_case(XLSX_MEDIA_TYPE)
             || essence.eq_ignore_ascii_case("application/vnd.ms-excel")
-            || essence.eq_ignore_ascii_case("application/octet-stream")
         {
             return Self::open_xlsx_bytes(bytes, label);
         }
-        Err(crate::LoadError::UnsupportedMediaType(content_type.to_owned()))
+        Err(crate::LoadError::UnsupportedMediaType(
+            content_type.to_owned(),
+        ))
     }
 
     fn write_temp_bytes(
@@ -251,11 +272,32 @@ impl SpreadsheetSession {
             chrome: None,
             column_px: HashMap::new(),
             row_px: HashMap::new(),
+            native: None,
         }
     }
 
     pub fn is_browsing(&self) -> bool {
         self.browse.is_some()
+    }
+
+    /// True when formula commits append into a native `.omasheets` store.
+    #[must_use]
+    pub fn is_native_durable(&self) -> bool {
+        self.native.is_some()
+    }
+
+    /// Checkpoint a native store and return its bytes for a workbook commit.
+    ///
+    /// Returns `Ok(None)` for xlsx browse sessions (no durable export yet).
+    pub fn durable_bytes(&mut self) -> Result<Option<Vec<u8>>, crate::LoadError> {
+        let Some(native) = &self.native else {
+            return Ok(None);
+        };
+        let path = native.path.clone();
+        let store = omasheets_store::Store::open(&path).map_err(crate::LoadError::Store)?;
+        store.close().map_err(crate::LoadError::Store)?;
+        let bytes = std::fs::read(&path).map_err(crate::LoadError::Io)?;
+        Ok(Some(bytes))
     }
 
     /// `Sheet · A1 · window A1`, or a blank-document label when nothing is open.
@@ -361,6 +403,7 @@ impl SpreadsheetSession {
             chrome: None,
             column_px: HashMap::new(),
             row_px: HashMap::new(),
+            native: None,
         })
     }
 
@@ -479,10 +522,12 @@ impl SpreadsheetSession {
                     ApplyError::ReferenceOutOfView("the opened workbook has no sheet".into())
                 })?;
             let source = self.formula_draft.clone();
-            self.browse
-                .as_mut()
-                .expect("browse checked")
-                .apply_input(sheet, address.row as u32, address.column as u32, &source)?;
+            self.browse.as_mut().expect("browse checked").apply_input(
+                sheet,
+                address.row as u32,
+                address.column as u32,
+                &source,
+            )?;
             return Ok((address, source));
         }
         let sheet =
@@ -501,10 +546,18 @@ impl SpreadsheetSession {
     /// Host entry: resolve and apply one command. A rejection leaves the document unchanged.
     pub fn apply_command(&mut self, command: Command) -> Result<(), ApplyError> {
         self.clock += 1;
-        self.document
-            .command(self.actor.clone(), self.clock, command)?;
-        self.clamp_view();
-        Ok(())
+        if let Some(native) = self.native.as_ref() {
+            let path = native.path.clone();
+            let branch = native.branch;
+            self.document = persist_native(&path, branch, self.actor.clone(), self.clock, command)?;
+            self.clamp_view();
+            Ok(())
+        } else {
+            self.document
+                .command(self.actor.clone(), self.clock, command)?;
+            self.clamp_view();
+            Ok(())
+        }
     }
 
     pub fn activate_sheet(&mut self, index: usize) -> bool {
@@ -889,6 +942,27 @@ fn format_number(number: f64) -> String {
     }
 }
 
+fn persist_native(
+    path: &Path,
+    branch: BranchId,
+    actor: Actor,
+    timestamp: i64,
+    command: Command,
+) -> Result<Document, ApplyError> {
+    let mut store = omasheets_store::Store::open(path).map_err(store_apply_error)?;
+    store
+        .append(branch, actor, timestamp, command)
+        .map_err(store_apply_error)?;
+    Ok(store.document(branch).map_err(store_apply_error)?.clone())
+}
+
+fn store_apply_error(error: omasheets_store::StoreError) -> ApplyError {
+    match error {
+        omasheets_store::StoreError::Apply(error) => error,
+        other => ApplyError::InvalidPresentation(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,20 +1190,90 @@ mod tests {
     #[test]
     fn open_omasheets_bytes_loads_native_document() {
         use crate::NATIVE_MEDIA_TYPE;
-        use omasheets_core::{Actor, ActorKind, Command, DocumentId, ObjectId};
-        use omasheets_store::Store;
 
+        let path = unique_temp("native-open", "omasheets");
+        write_native_grid(&path);
+        let bytes = std::fs::read(&path).expect("read");
+        cleanup_native(&path);
+        let session =
+            SpreadsheetSession::open_bytes(&bytes, "native-book", NATIVE_MEDIA_TYPE).expect("open");
+        assert!(!session.is_browsing());
+        assert!(session.is_native_durable());
+        assert_eq!(session.active_sheet_name(), Some("Sheet"));
+        assert_eq!(
+            crate::sniff_spreadsheet_media_type(&bytes),
+            Some(NATIVE_MEDIA_TYPE)
+        );
+        let sniffed = SpreadsheetSession::open_bytes(&bytes, "native-book", "").expect("sniff");
+        assert!(sniffed.is_native_durable());
+        assert_eq!(sniffed.active_sheet_name(), Some("Sheet"));
+        let octet =
+            SpreadsheetSession::open_bytes(&bytes, "native-book", "application/octet-stream")
+                .expect("octet-stream");
+        assert!(octet.is_native_durable());
+        assert!(matches!(
+            SpreadsheetSession::open_bytes(b"not a spreadsheet", "x", ""),
+            Err(crate::LoadError::UnsupportedMediaType(_))
+        ));
+    }
+
+    #[test]
+    fn native_durable_bytes_roundtrip_keeps_edits() {
+        let path = unique_temp("native-durable", "omasheets");
+        write_native_grid(&path);
+        let mut session = SpreadsheetSession::open_omasheets(&path).expect("open native");
+        assert!(session.is_native_durable());
+        let sheet = *session.document().sheets().last().expect("sheet");
+        session
+            .apply_command(Command::SetValue {
+                sheet,
+                a1: "A1".into(),
+                value: Literal::Number(42.0),
+            })
+            .expect("set A1");
+        let cell = session.document().resolve_a1(sheet, "A1").expect("A1");
+        assert_eq!(session.document().value(cell), CellValue::Number(42.0));
+        let bytes = session
+            .durable_bytes()
+            .expect("export")
+            .expect("native bytes");
+        assert_eq!(
+            crate::sniff_spreadsheet_media_type(&bytes),
+            Some(crate::NATIVE_MEDIA_TYPE)
+        );
+        let reopened = SpreadsheetSession::open_omasheets_bytes(&bytes, "reopen").expect("reopen");
+        assert!(reopened.is_native_durable());
+        let sheet = *reopened.document().sheets().last().expect("sheet");
+        let cell = reopened.document().resolve_a1(sheet, "A1").expect("A1");
+        assert_eq!(reopened.document().value(cell), CellValue::Number(42.0));
+        cleanup_native(&path);
+
+        let xlsx = unique_temp("xlsx-no-export", "xlsx");
+        write_edit_workbook(&xlsx);
+        let mut browsing = SpreadsheetSession::open_xlsx(&xlsx).expect("xlsx");
+        assert!(!browsing.is_native_durable());
+        assert!(browsing.durable_bytes().expect("no export").is_none());
+        let _ = std::fs::remove_file(&xlsx);
+    }
+
+    fn unique_temp(label: &str, extension: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "omasheets-native-{}-{nonce}.omasheets",
+        std::env::temp_dir().join(format!(
+            "omasheets-{label}-{}-{nonce}.{extension}",
             std::process::id()
-        ));
+        ))
+    }
+
+    fn write_native_grid(path: &Path) {
+        use omasheets_core::{Actor, ActorKind, DocumentId, ObjectId};
+        use omasheets_store::Store;
+
         let actor = Actor::new(ActorKind::Human, "host");
         let mut store = Store::create(
-            &path,
+            path,
             DocumentId(ObjectId::from_seed("native-book")),
             "native-book",
             actor.clone(),
@@ -1178,13 +1322,13 @@ mod tests {
                 },
             )
             .expect("rows");
-        drop(store);
-        let bytes = std::fs::read(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
-        let session =
-            SpreadsheetSession::open_bytes(bytes, "native-book", NATIVE_MEDIA_TYPE).expect("open");
-        assert!(!session.is_browsing());
-        assert_eq!(session.active_sheet_name(), Some("Sheet"));
+        store.close().expect("checkpoint");
+    }
+
+    fn cleanup_native(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     fn write_edit_workbook(path: &std::path::Path) {
