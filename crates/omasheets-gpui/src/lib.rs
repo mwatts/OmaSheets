@@ -19,7 +19,7 @@ pub use appearance::{
 };
 pub use browse::LoadError;
 pub use media::{
-    NATIVE_MEDIA_TYPE, ODS_MEDIA_TYPE, XLSX_MEDIA_TYPE, XLS_MEDIA_TYPE, is_native_media_type,
+    NATIVE_MEDIA_TYPE, ODS_MEDIA_TYPE, XLS_MEDIA_TYPE, XLSX_MEDIA_TYPE, is_native_media_type,
     is_spreadsheet_media_type,
 };
 pub use session::SpreadsheetSession;

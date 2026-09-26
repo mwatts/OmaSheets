@@ -682,7 +682,12 @@ impl RenderOnce for SheetGrid {
 
 /// The header border is the hit target. GPUI's mouse-down callback does not
 /// include the element bounds, so the edge is its own element.
-fn edge_handle(view: Entity<SpreadsheetView>, axis: ResizeAxis, width: f32, height: f32) -> gpui_kit::Div {
+fn edge_handle(
+    view: Entity<SpreadsheetView>,
+    axis: ResizeAxis,
+    width: f32,
+    height: f32,
+) -> gpui_kit::Div {
     div()
         .w(px(width))
         .h(px(height))

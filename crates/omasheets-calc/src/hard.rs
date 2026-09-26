@@ -342,11 +342,12 @@ impl Workbook {
             return Value::Error(CalcError::NotAvailable);
         };
         match function {
-            Function::Today => match serial_date::serial_from_unix_millis_in(self.date_system, at)
-            {
-                Ok(serial) => Value::Number(serial.trunc()),
-                Err(error) => Value::Error(error),
-            },
+            Function::Today => {
+                match serial_date::serial_from_unix_millis_in(self.date_system, at) {
+                    Ok(serial) => Value::Number(serial.trunc()),
+                    Err(error) => Value::Error(error),
+                }
+            }
             Function::Now => match serial_date::serial_from_unix_millis_in(self.date_system, at) {
                 Ok(serial) => number_value(serial),
                 Err(error) => Value::Error(error),
@@ -492,12 +493,9 @@ impl Workbook {
         let Ok(view) = self.reference_span(arguments) else {
             return;
         };
-        binding.ranges.push(range_key(
-            view.anchor,
-            None,
-            view.rows,
-            view.columns,
-        ));
+        binding
+            .ranges
+            .push(range_key(view.anchor, None, view.rows, view.columns));
     }
 
     fn note_parsed_offset(&self, arguments: &[Expr<CellId>], binding: &mut Binding) {
@@ -677,11 +675,12 @@ impl Workbook {
         };
         match self.cells[node].input {
             Input::Range {
-                shape: RangeShape::Rectangle {
-                    anchor,
-                    rows,
-                    columns,
-                },
+                shape:
+                    RangeShape::Rectangle {
+                        anchor,
+                        rows,
+                        columns,
+                    },
             } => {
                 let mut count = 0;
                 self.for_each_rectangle_cell(anchor, rows, columns, |_position, index| {
@@ -699,14 +698,15 @@ impl Workbook {
                 .filter(|index| still_due(**index))
                 .count(),
             Input::Range {
-                shape: RangeShape::Stack {
-                    first_sheet,
-                    last_sheet,
-                    row,
-                    column,
-                    rows,
-                    columns,
-                },
+                shape:
+                    RangeShape::Stack {
+                        first_sheet,
+                        last_sheet,
+                        row,
+                        column,
+                        rows,
+                        columns,
+                    },
             } => {
                 let mut count = 0;
                 self.for_each_stack_cell(
@@ -1139,7 +1139,9 @@ mod tests {
         workbook.replay_cached_random(cell(1, 0), 4.0);
         workbook.set_formula(draw, "=RAND()").unwrap();
         workbook.set_formula(cell(0, 1), "=A1*4").unwrap();
-        workbook.set_formula(cell(1, 0), "=RANDBETWEEN(1,6)").unwrap();
+        workbook
+            .set_formula(cell(1, 0), "=RANDBETWEEN(1,6)")
+            .unwrap();
         workbook.set_formula(cell(1, 1), "=A2*2").unwrap();
         assert_eq!(workbook.value(draw), Value::Number(0.25));
         assert_eq!(workbook.value(cell(0, 1)), Value::Number(1.0));
@@ -1152,7 +1154,9 @@ mod tests {
             Value::Error(CalcError::NotAvailable)
         );
         workbook.replay_cached_random(cell(2, 1), 9.0);
-        workbook.set_formula(cell(2, 1), "=RANDBETWEEN(1,6)").unwrap();
+        workbook
+            .set_formula(cell(2, 1), "=RANDBETWEEN(1,6)")
+            .unwrap();
         assert_eq!(
             workbook.value(cell(2, 1)),
             Value::Error(CalcError::NotAvailable)
@@ -1210,7 +1214,9 @@ mod tests {
                 .map(|_| workbook.value(cell(2, 3))),
             Ok(Value::Error(CalcError::InvalidNumber))
         );
-        workbook.set_formula(cell(3, 3), "=RANDBETWEEN(1.9,3.2)").unwrap();
+        workbook
+            .set_formula(cell(3, 3), "=RANDBETWEEN(1.9,3.2)")
+            .unwrap();
         match workbook.value(cell(3, 3)) {
             Value::Number(value) => assert!(
                 value.fract() == 0.0 && (1.0..=3.0).contains(&value),

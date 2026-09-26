@@ -371,8 +371,8 @@ pub fn edit(
                                 &effective_style(document, cell),
                                 document.date_system(),
                             )
-                                .chars()
-                                .count(),
+                            .chars()
+                            .count(),
                         );
                     }
                     presentation
@@ -892,8 +892,7 @@ pub fn display(
     if matches!(
         format,
         "yyyy-mm-dd" | "dd/mm/yyyy" | "mm/dd/yyyy" | "m/d/yy"
-    ) && let Ok(serial) =
-        omasheets_calc::serial_date::serial_from_number_in(date_system, number)
+    ) && let Ok(serial) = omasheets_calc::serial_date::serial_from_number_in(date_system, number)
         && let Ok(date) = omasheets_calc::serial_date::civil_from_serial_in(date_system, serial)
     {
         return match format {

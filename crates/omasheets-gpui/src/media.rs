@@ -34,11 +34,7 @@ pub fn is_spreadsheet_media_type(media_type: &str) -> bool {
 }
 
 fn essence(media_type: &str) -> &str {
-    media_type
-        .split(';')
-        .next()
-        .unwrap_or(media_type)
-        .trim()
+    media_type.split(';').next().unwrap_or(media_type).trim()
 }
 
 #[cfg(test)]
@@ -50,6 +46,8 @@ mod tests {
         assert!(is_native_media_type(NATIVE_MEDIA_TYPE));
         assert!(!is_native_media_type(XLSX_MEDIA_TYPE));
         assert!(is_spreadsheet_media_type(NATIVE_MEDIA_TYPE));
-        assert!(is_spreadsheet_media_type(&format!("{XLSX_MEDIA_TYPE}; charset=binary")));
+        assert!(is_spreadsheet_media_type(&format!(
+            "{XLSX_MEDIA_TYPE}; charset=binary"
+        )));
     }
 }

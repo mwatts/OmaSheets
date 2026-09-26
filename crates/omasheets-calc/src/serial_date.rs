@@ -697,7 +697,12 @@ pub fn year_fraction_in(
     year_fraction(system.to_1900(start)?, system.to_1900(end)?, basis)
 }
 
-pub fn days_360_in(system: DateSystem, start: i64, end: i64, european: bool) -> Result<i64, CalcError> {
+pub fn days_360_in(
+    system: DateSystem,
+    start: i64,
+    end: i64,
+    european: bool,
+) -> Result<i64, CalcError> {
     if system == DateSystem::Excel1900 {
         return days_360(start, end, european);
     }
@@ -776,7 +781,12 @@ pub fn serial_from_unix_millis_in(system: DateSystem, millis: i64) -> Result<f64
     let days = millis.div_euclid(MILLIS_PER_DAY);
     let within = millis.rem_euclid(MILLIS_PER_DAY);
     let date = civil_from_days(days);
-    let serial = serial_from_civil_in(system, date.year, i64::from(date.month), i64::from(date.day))?;
+    let serial = serial_from_civil_in(
+        system,
+        date.year,
+        i64::from(date.month),
+        i64::from(date.day),
+    )?;
     Ok(serial as f64 + (within as f64) / (MILLIS_PER_DAY as f64))
 }
 
@@ -834,7 +844,10 @@ mod tests {
         assert!((fraction - expected).abs() < 1e-12, "{fraction} {expected}");
         assert!(date_value("1/0/00").is_err());
         assert!(date_value("2/31/2020").is_err());
-        assert_eq!(date_value("2/29/2000").unwrap(), serial_from_civil(2000, 2, 29).unwrap());
+        assert_eq!(
+            date_value("2/29/2000").unwrap(),
+            serial_from_civil(2000, 2, 29).unwrap()
+        );
     }
 
     #[test]
@@ -1004,10 +1017,7 @@ mod tests {
         );
         let epoch = serial_from_unix_millis_in(system, 0).unwrap();
         assert_eq!(epoch, 24_107.0);
-        assert_eq!(
-            unix_millis_from_serial_in(system, epoch).unwrap(),
-            0
-        );
+        assert_eq!(unix_millis_from_serial_in(system, epoch).unwrap(), 0);
         assert_eq!(date_value_in(system, "1/1/1904").unwrap(), 0);
         assert_eq!(
             civil_from_serial_in(system, date_serial_in(system, 2024.0, 1.0, 1.0).unwrap()),

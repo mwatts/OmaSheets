@@ -1,16 +1,14 @@
 //! The `omasheets.Spreadsheet` control: declaration, factory, and open loop.
 
-use crate::{
-    PortError, WorkbookPort, WorkbookRead,
-};
+use crate::{PortError, WorkbookPort, WorkbookRead};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_shell::gpui::{
     AnyElement, App, AppContext as _, Context, Entity, IntoElement as _, ParentElement as _,
     Styled as _, Subscription, Task, Window, div, px,
 };
 use loom_gpui::{
-    ControlDeclaration, ControlEvents, ControlMount, ControlRender, JsonType, NativeControl,
-    Port, SurfaceControls,
+    ControlDeclaration, ControlEvents, ControlMount, ControlRender, JsonType, NativeControl, Port,
+    SurfaceControls,
 };
 use omasheets_gpui::{SpreadsheetSession, SpreadsheetUiEvent, SpreadsheetView};
 use serde_json::{Value, json};
@@ -43,10 +41,7 @@ pub fn declaration() -> ControlDeclaration {
     .bound_prop("workbookRef", JsonType::String)
     .prop("readonly", JsonType::Boolean)
     .prop("focusOnMount", JsonType::Boolean)
-    .event(
-        "selectionChange",
-        "{sheet, a1}: the active cell moved",
-    )
+    .event("selectionChange", "{sheet, a1}: the active cell moved")
     .event(
         "editCommitted",
         "{sheet, a1, source}: the formula bar committed a value",
@@ -93,25 +88,28 @@ pub fn register(controls: &mut SurfaceControls) -> anyhow::Result<()> {
 /// Registers `omasheets.Spreadsheet` with explicit options.
 pub fn register_with(controls: &mut SurfaceControls, options: Options) -> anyhow::Result<()> {
     let _ = options;
-    controls.register(declaration(), move |mount: ControlMount<'_>, _window, cx| {
-        let port = mount
-            .ports
-            .get::<dyn WorkbookPort>()
-            .expect("admission requires the workbook port");
-        SpreadsheetControl {
-            host: cx.new(|_| Host {
-                port,
-                events: mount.events.clone(),
-                reference: None,
-                state: BookState::Idle,
-                readonly: false,
-                focus_on_mount: false,
-                dirty: false,
-                version: None,
-                _ui: Vec::new(),
-            }),
-        }
-    })
+    controls.register(
+        declaration(),
+        move |mount: ControlMount<'_>, _window, cx| {
+            let port = mount
+                .ports
+                .get::<dyn WorkbookPort>()
+                .expect("admission requires the workbook port");
+            SpreadsheetControl {
+                host: cx.new(|_| Host {
+                    port,
+                    events: mount.events.clone(),
+                    reference: None,
+                    state: BookState::Idle,
+                    readonly: false,
+                    focus_on_mount: false,
+                    dirty: false,
+                    version: None,
+                    _ui: Vec::new(),
+                }),
+            }
+        },
+    )
 }
 
 /// The retained side of one `omasheets.Spreadsheet` node.
@@ -140,7 +138,13 @@ struct Host {
 }
 
 impl Host {
-    fn sync(&mut self, props: &Value, _tokens: &Value, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync(
+        &mut self,
+        props: &Value,
+        _tokens: &Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let readonly = props["readonly"].as_bool().unwrap_or(false);
         if readonly != self.readonly {
             self.readonly = readonly;
@@ -222,12 +226,7 @@ impl Host {
         }));
     }
 
-    fn show(
-        &mut self,
-        session: SpreadsheetSession,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn show(&mut self, session: SpreadsheetSession, window: &mut Window, cx: &mut Context<Self>) {
         let view = match &self.state {
             BookState::Open(existing) => {
                 existing.update(cx, |view, cx| {
@@ -246,17 +245,13 @@ impl Host {
                 view
             }
         };
-        self._ui = vec![cx.subscribe(&view, move |host, _view, event, _cx| {
-            match event {
+        self._ui = vec![
+            cx.subscribe(&view, move |host, _view, event, _cx| match event {
                 SpreadsheetUiEvent::SelectionChanged { sheet, a1 } => {
                     host.events
                         .emit("selectionChange", json!({ "sheet": sheet, "a1": a1 }));
                 }
-                SpreadsheetUiEvent::EditCommitted {
-                    sheet,
-                    a1,
-                    source,
-                } => {
+                SpreadsheetUiEvent::EditCommitted { sheet, a1, source } => {
                     host.on_ui(event);
                     host.events.emit(
                         "editCommitted",
@@ -267,8 +262,8 @@ impl Host {
                     host.events
                         .emit("commandFailed", json!({ "message": message }));
                 }
-            }
-        })];
+            }),
+        ];
         if self.focus_on_mount && !self.readonly {
             // SpreadsheetView focuses its grid on show_session / new.
         }
@@ -302,8 +297,9 @@ impl NativeControl for SpreadsheetControl {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        self.host
-            .update(cx, |host, cx| host.sync(input.props, input.tokens, window, cx));
+        self.host.update(cx, |host, cx| {
+            host.sync(input.props, input.tokens, window, cx)
+        });
         let tokens = input.tokens;
         let token = |name: &str| tokens[name].as_str().unwrap_or_default();
         let pad = match token("density") {
