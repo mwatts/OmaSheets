@@ -9,6 +9,7 @@
 mod appearance;
 mod browse;
 mod format;
+mod media;
 mod session;
 mod view;
 
@@ -17,6 +18,10 @@ pub use appearance::{
     project_xlsx_appearance,
 };
 pub use browse::LoadError;
+pub use media::{
+    NATIVE_MEDIA_TYPE, ODS_MEDIA_TYPE, XLSX_MEDIA_TYPE, XLS_MEDIA_TYPE, is_native_media_type,
+    is_spreadsheet_media_type,
+};
 pub use session::SpreadsheetSession;
 pub use view::{SpreadsheetUiEvent, SpreadsheetView};
 
