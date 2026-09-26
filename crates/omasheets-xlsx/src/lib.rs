@@ -4,14 +4,14 @@
 //! matching `omasheets_calc::serial_date`. A workbook that declares the 1904
 //! date system keeps those serials and evaluates dates from 1904-01-01.
 
-use calamine::{Cell, CellErrorType, Data, DataType, Reader, Xlsx, XlsxFormulaMetadata};
 #[cfg(test)]
 use calamine::Range;
+use calamine::{Cell, CellErrorType, Data, DataType, Reader, Xlsx, XlsxFormulaMetadata};
 use omasheets_calc::pivot::{
     PivotAggregate, PivotCache, PivotCacheField, PivotDataField, PivotDateFilter, PivotDateGroup,
     PivotGroupBy, PivotScalar, PivotTable, cache_datetime_serial,
 };
-use omasheets_calc::serial_date::{DateSystem, DATE_SYSTEM};
+use omasheets_calc::serial_date::{DATE_SYSTEM, DateSystem};
 use omasheets_calc::{
     CalcError, CellId, FormulaError, StructuredColumn, StructuredTable, Value, Workbook,
 };
@@ -486,10 +486,11 @@ fn read_occupied_sheet<RS: Read + Seek>(
         .map_err(read_error)?
     {
         let has_value = !record.value.is_empty();
-        let counts_now = has_value || matches!(
-            record.formula,
-            Some(XlsxFormulaMetadata::Normal { .. } | XlsxFormulaMetadata::Shared { .. })
-        );
+        let counts_now = has_value
+            || matches!(
+                record.formula,
+                Some(XlsxFormulaMetadata::Normal { .. } | XlsxFormulaMetadata::Shared { .. })
+            );
         if counts_now {
             *observed_cells = observed_cells.saturating_add(1);
             if *observed_cells > limits.max_cells {
@@ -1988,10 +1989,12 @@ fn import_ranges_with_names(
         .iter()
         .enumerate()
         .map(|(index, sheet)| {
-            let (value_rows, value_columns) =
-                range_extent(span_end(sheet.values.iter().map(|cell| cell.get_position())));
-            let (formula_rows, formula_columns) =
-                range_extent(span_end(sheet.formulas.iter().map(|cell| cell.get_position())));
+            let (value_rows, value_columns) = range_extent(span_end(
+                sheet.values.iter().map(|cell| cell.get_position()),
+            ));
+            let (formula_rows, formula_columns) = range_extent(span_end(
+                sheet.formulas.iter().map(|cell| cell.get_position()),
+            ));
             SheetInfo {
                 index: index as u32,
                 name: sheet.name.clone(),
@@ -2410,11 +2413,7 @@ fn implied_year_fraction(probe: &YearFracProbe) -> Option<f64> {
     }
 }
 
-fn yearfrac_probe_error(
-    system: DateSystem,
-    serial: i64,
-    probes: &[YearFracProbe],
-) -> Option<f64> {
+fn yearfrac_probe_error(system: DateSystem, serial: i64, probes: &[YearFracProbe]) -> Option<f64> {
     let mut error = 0.0;
     for probe in probes {
         let fraction = omasheets_calc::serial_date::year_fraction_in(
@@ -2513,8 +2512,7 @@ fn tick_from_cached_volatile(cells: &[ImportedCell], system: DateSystem) -> Opti
         }
     }
     for serial in [now, today].into_iter().flatten() {
-        if let Ok(millis) =
-            omasheets_calc::serial_date::unix_millis_from_serial_in(system, serial)
+        if let Ok(millis) = omasheets_calc::serial_date::unix_millis_from_serial_in(system, serial)
         {
             return Some(millis);
         }
@@ -2579,7 +2577,11 @@ fn compact_formula(formula: &str) -> Option<String> {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
-    if compact.is_empty() { None } else { Some(compact) }
+    if compact.is_empty() {
+        None
+    } else {
+        Some(compact)
+    }
 }
 
 /// Commas that separate arguments, not commas inside strings or calls.
@@ -3284,7 +3286,9 @@ mod tests {
             imported.workbook.value(CellId::new(0, 0, 0)),
             Value::Number(2.0)
         );
-        let crowded: Vec<_> = (0..101).map(|row| Cell::new((row, 0), Data::Int(1))).collect();
+        let crowded: Vec<_> = (0..101)
+            .map(|row| Cell::new((row, 0), Data::Int(1)))
+            .collect();
         let error = import_ranges(ranges(crowded, vec![]), "c".repeat(64), limits)
             .err()
             .expect("101 cells exceed the budget");
@@ -3536,10 +3540,7 @@ mod tests {
 
     #[test]
     fn imports_a_1904_workbook_without_shifting_serials() {
-        let path = std::env::temp_dir().join(format!(
-            "omasheets-1904-{}.xlsx",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("omasheets-1904-{}.xlsx", std::process::id()));
         let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><workbookPr date1904="1"/><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
         let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f>DATE(1904,1,1)</f><v>0</v></c><c r="B1"><v>0</v></c></row></sheetData></worksheet>"#;
         write_owned(
@@ -3574,10 +3575,7 @@ mod tests {
 
     #[test]
     fn replays_cached_rand_draws_into_the_formulas_that_read_them() {
-        let path = std::env::temp_dir().join(format!(
-            "omasheets-rand-{}.xlsx",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("omasheets-rand-{}.xlsx", std::process::id()));
         let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f t="shared" ref="A1:B1" si="0">RAND()</f><v>0.25</v></c><c r="B1"><f t="shared" si="0"/><v>0.5</v></c><c r="C1"><f>A1+B1</f><v>0.75</v></c></row><row r="2"><c r="A2"><f>RANDBETWEEN(1,6)</f><v>4</v></c><c r="B2"><f>A2*2</f><v>8</v></c></row></sheetData></worksheet>"#;
         write_plain_workbook_xml(&path, sheet);
         let imported = import_xlsx(&path, ImportLimits::default()).unwrap();
@@ -4397,7 +4395,9 @@ mod tests {
 
     #[test]
     fn dcf_model_offset_drivers_match_stored_values() {
-        let path = Path::new("/Users/markwatts/omasheets-corpus/spreadsheet-rl-2026/sample/spreadsheetbench_2__Financial_Model__08_04__input.xlsx");
+        let path = Path::new(
+            "/Users/markwatts/omasheets-corpus/spreadsheet-rl-2026/sample/spreadsheetbench_2__Financial_Model__08_04__input.xlsx",
+        );
         if !path.is_file() {
             return;
         }

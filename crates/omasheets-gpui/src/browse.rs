@@ -41,7 +41,6 @@ impl fmt::Display for LoadError {
     }
 }
 
-
 impl std::error::Error for LoadError {}
 
 pub(crate) struct BrowseCell {
@@ -218,9 +217,7 @@ impl BrowseBook {
         let formula_cells: Vec<(u32, u32, u32)> = self
             .cells
             .iter()
-            .filter(|(key, cell)| {
-                **key != (sheet, row, column) && cell.input.starts_with('=')
-            })
+            .filter(|(key, cell)| **key != (sheet, row, column) && cell.input.starts_with('='))
             .map(|(key, _)| *key)
             .collect();
         for (sheet, row, column) in formula_cells {

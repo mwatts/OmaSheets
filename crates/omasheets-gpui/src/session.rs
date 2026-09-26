@@ -210,7 +210,9 @@ impl SpreadsheetSession {
         {
             return Self::open_xlsx_bytes(bytes, label);
         }
-        Err(crate::LoadError::UnsupportedMediaType(content_type.to_owned()))
+        Err(crate::LoadError::UnsupportedMediaType(
+            content_type.to_owned(),
+        ))
     }
 
     fn write_temp_bytes(
@@ -479,10 +481,12 @@ impl SpreadsheetSession {
                     ApplyError::ReferenceOutOfView("the opened workbook has no sheet".into())
                 })?;
             let source = self.formula_draft.clone();
-            self.browse
-                .as_mut()
-                .expect("browse checked")
-                .apply_input(sheet, address.row as u32, address.column as u32, &source)?;
+            self.browse.as_mut().expect("browse checked").apply_input(
+                sheet,
+                address.row as u32,
+                address.column as u32,
+                &source,
+            )?;
             return Ok((address, source));
         }
         let sheet =

@@ -750,8 +750,7 @@ mod tests {
         bulk.begin_bulk();
         bulk.set_number(cell(0, 3), 2.0);
         bulk.set_number(cell(2, 13), 0.84);
-        bulk.set_formula(cell(0, 13), "=OFFSET(N1,$D$1,0)")
-            .unwrap();
+        bulk.set_formula(cell(0, 13), "=OFFSET(N1,$D$1,0)").unwrap();
         bulk.end_bulk();
         assert_eq!(bulk.value(cell(0, 13)), Value::Number(0.84));
         assert!(matches!(
