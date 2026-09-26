@@ -7,12 +7,13 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-gpui-kit = "0.6"
+# Same vendored kit Ashlar and Loom pin (see ashlar ui/loom-source.json).
+gpui-kit = { path = "../../../loom/vendor/gpui-kit/crates/kit" }
 omasheets-calc = { path = "../omasheets-calc" }
 omasheets-core = { path = "../omasheets-core" }
 omasheets-xlsx = { path = "../omasheets-xlsx" }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-gpui-kit = { version = "0.6", features = ["test-support"] }
+gpui-kit = { path = "../../../loom/vendor/gpui-kit/crates/kit", features = ["test-support"] }
 omasheets-core = { path = "../omasheets-core" }

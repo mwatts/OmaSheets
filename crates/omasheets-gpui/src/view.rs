@@ -52,6 +52,7 @@ pub struct SpreadsheetView {
     scroll_cols: f32,
     chrome_epoch: u64,
     resize: Option<SizeDrag>,
+    readonly: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -87,6 +88,7 @@ impl SpreadsheetView {
             scroll_cols: 0.0,
             chrome_epoch: 0,
             resize: None,
+            readonly: false,
             _subscriptions: subscriptions,
         };
         cx.defer_in(window, |this, window, cx| {
@@ -97,6 +99,18 @@ impl SpreadsheetView {
 
     pub fn session(&self) -> &SpreadsheetSession {
         &self.session
+    }
+
+    /// When true, formula commits and host commands are rejected.
+    pub fn set_readonly(&mut self, readonly: bool, cx: &mut Context<Self>) {
+        if self.readonly != readonly {
+            self.readonly = readonly;
+            cx.notify();
+        }
+    }
+
+    pub fn readonly(&self) -> bool {
+        self.readonly
     }
 
     /// Replaces the document the grid is showing and focuses the grid.
@@ -120,6 +134,10 @@ impl SpreadsheetView {
 
     /// Applies one document command and notifies. A rejection emits [`SpreadsheetUiEvent::CommandFailed`].
     pub fn apply_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        if self.readonly {
+            self.fail_message("workbook is read-only", cx);
+            return;
+        }
         match self.session.apply_command(command) {
             Ok(()) => {
                 self.sync_formula(window, cx);
@@ -146,6 +164,10 @@ impl SpreadsheetView {
     }
 
     fn commit_formula(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.readonly {
+            self.fail_message("workbook is read-only", cx);
+            return;
+        }
         match self.session.commit_edit() {
             Ok((address, source)) => {
                 let sheet = self
@@ -348,8 +370,12 @@ impl SpreadsheetView {
     }
 
     fn fail(&mut self, error: ApplyError, cx: &mut Context<Self>) {
+        self.fail_message(error.to_string(), cx);
+    }
+
+    fn fail_message(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         cx.emit(SpreadsheetUiEvent::CommandFailed {
-            message: error.to_string(),
+            message: message.into(),
         });
         cx.notify();
     }
