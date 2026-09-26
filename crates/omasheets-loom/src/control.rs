@@ -1,7 +1,7 @@
 //! The `omasheets.Spreadsheet` control: declaration, factory, and open loop.
 
 use crate::{
-    PortError, WorkbookPort, WorkbookRead,
+    PortError, WorkbookDraft, WorkbookPort, WorkbookRead,
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_shell::gpui::{
@@ -14,7 +14,7 @@ use loom_gpui::{
 };
 use omasheets_gpui::{SpreadsheetSession, SpreadsheetUiEvent, SpreadsheetView};
 use serde_json::{Value, json};
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 /// The registered type name.
 pub const SPREADSHEET: &str = "omasheets.Spreadsheet";
@@ -108,6 +108,7 @@ pub fn register_with(controls: &mut SurfaceControls, options: Options) -> anyhow
                 focus_on_mount: false,
                 dirty: false,
                 version: None,
+                commit: None,
                 _ui: Vec::new(),
             }),
         }
@@ -134,8 +135,8 @@ struct Host {
     readonly: bool,
     focus_on_mount: bool,
     dirty: bool,
-    #[allow(dead_code)]
     version: Option<String>,
+    commit: Option<Task<()>>,
     _ui: Vec<Subscription>,
 }
 
@@ -246,7 +247,7 @@ impl Host {
                 view
             }
         };
-        self._ui = vec![cx.subscribe(&view, move |host, _view, event, _cx| {
+        self._ui = vec![cx.subscribe(&view, move |host, _view, event, cx| {
             match event {
                 SpreadsheetUiEvent::SelectionChanged { sheet, a1 } => {
                     host.events
@@ -257,7 +258,7 @@ impl Host {
                     a1,
                     source,
                 } => {
-                    host.on_ui(event);
+                    host.on_ui(event, cx);
                     host.events.emit(
                         "editCommitted",
                         json!({ "sheet": sheet, "a1": a1, "source": source }),
@@ -279,15 +280,85 @@ impl Host {
         cx.notify();
     }
 
-    fn on_ui(&mut self, event: &SpreadsheetUiEvent) {
+    fn on_ui(&mut self, event: &SpreadsheetUiEvent, cx: &mut Context<Self>) {
         if matches!(event, SpreadsheetUiEvent::EditCommitted { .. }) && !self.dirty {
             self.dirty = true;
             self.events.emit("dirtyChange", json!(true));
+            self.schedule_commit(cx);
         }
     }
 
-    /// Session-local edits are not durable yet; drop them on unmount.
+    fn schedule_commit(&mut self, cx: &mut Context<Self>) {
+        self.commit = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |host, cx| {
+                host.flush_commit(cx);
+            });
+        }));
+    }
+
+    /// Persist dirty native bytes through the workbook port when possible.
+    fn flush_commit(&mut self, cx: &mut Context<Self>) {
+        if !self.dirty || self.readonly {
+            return;
+        }
+        let Some(reference) = self.reference.clone() else {
+            return;
+        };
+        let Some(expected) = self.version.clone() else {
+            return;
+        };
+        let BookState::Open(view) = &self.state else {
+            return;
+        };
+        let bytes = match view.update(cx, |view, _cx| view.session_mut().durable_bytes()) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                self.events.emit("saveState", json!("unavailable"));
+                return;
+            }
+            Err(error) => {
+                self.events.emit("saveState", json!("failed"));
+                self.events
+                    .emit("commandFailed", json!({ "message": error.to_string() }));
+                return;
+            }
+        };
+        let port = self.port.clone();
+        let draft = WorkbookDraft {
+            expected_version: expected,
+            bytes,
+        };
+        self.commit = Some(cx.spawn(async move |this, cx| {
+            let outcome = port.commit(&reference, draft).await;
+            let _ = this.update(cx, |host, cx| {
+                match outcome {
+                    Ok(version) => {
+                        host.version = Some(version);
+                        host.dirty = false;
+                        host.events.emit("dirtyChange", json!(false));
+                        host.events.emit("saveState", json!("saved"));
+                    }
+                    Err(PortError::Conflict { current }) => {
+                        host.version = Some(current);
+                        host.events.emit("saveState", json!("conflict"));
+                    }
+                    Err(error) => {
+                        host.events.emit("saveState", json!("failed"));
+                        host.events
+                            .emit("commandFailed", json!({ "message": error.to_string() }));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Drop local dirt when durable commit is impossible (xlsx browse).
     fn discard_local(&mut self) {
+        self.commit = None;
         if self.dirty {
             self.dirty = false;
             self.events.emit("dirtyChange", json!(false));
@@ -348,8 +419,15 @@ impl NativeControl for SpreadsheetControl {
     }
 
     fn before_unmount(&mut self, cx: &mut App) {
-        // v1: discard in-memory edits; durable commit waits on xlsx export.
-        self.host.update(cx, |host, _cx| host.discard_local());
+        self.host.update(cx, |host, cx| {
+            if host.dirty {
+                host.flush_commit(cx);
+            }
+            // Native flush is async; if still dirty (xlsx / failed), drop local dirt.
+            if host.dirty {
+                host.discard_local();
+            }
+        });
     }
 }
 

@@ -1,20 +1,15 @@
 //! `omasheets.Spreadsheet`: the GPUI spreadsheet as a Loom native composite.
 //!
-//! # Persistence policy (v1)
+//! # Persistence policy
 //!
-//! The control opens workbook bytes through [`WorkbookPort`] and shows them
-//! with [`omasheets_gpui::SpreadsheetView`]. Formula-bar edits update the
-//! in-memory browse engine (xlsx interchange) or the native document and emit
-//! `dirtyChange` / `editCommitted`. Durable export of edited packages is not
-//! implemented yet, so [`before_unmount`] discards unsaved edits and does not
-//! call [`WorkbookPort::commit`]. Agent mutations stay on the OmaSheets
-//! service/MCP path outside this composite.
+//! The control opens workbook bytes through [`WorkbookPort`]. Native
+//! `.omasheets` documents append formula-bar edits into the store; a debounced
+//! (and unmount) flush calls [`WorkbookPort::commit`] with checkpointed bytes.
+//! OOXML browse sessions still cannot export; dirty local edits are discarded
+//! on unmount with `saveState=unavailable` after a flush attempt.
 //!
 //! Native Ashlar media type is [`NATIVE_MEDIA_TYPE`] (`.omasheets`). OOXML is
 //! import/export interchange only.
-//!
-//! When durable export exists, commit on debounce/unmount should send a
-//! [`WorkbookDraft`] with the expected version from the last open.
 
 mod block;
 mod control;
@@ -26,6 +21,6 @@ pub use control::{
 };
 pub use omasheets_gpui::{
     NATIVE_MEDIA_TYPE, ODS_MEDIA_TYPE, XLSX_MEDIA_TYPE, XLS_MEDIA_TYPE, is_native_media_type,
-    is_spreadsheet_media_type,
+    is_spreadsheet_media_type, sniff_spreadsheet_media_type,
 };
 pub use port::{PortError, PortFuture, WorkbookDraft, WorkbookPort, WorkbookRead, WorkbookVersion};
