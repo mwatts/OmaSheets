@@ -33,6 +33,20 @@ pub fn is_spreadsheet_media_type(media_type: &str) -> bool {
         || essence.eq_ignore_ascii_case("application/vnd.ms-excel.sheet.macroEnabled.12")
 }
 
+/// Guess a spreadsheet media type from leading bytes when the host omitted one.
+///
+/// Native stores start with the SQLite header. OOXML packages are zip (`PK`).
+#[must_use]
+pub fn sniff_spreadsheet_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"SQLite format 3") {
+        return Some(NATIVE_MEDIA_TYPE);
+    }
+    if bytes.starts_with(b"PK") {
+        return Some(XLSX_MEDIA_TYPE);
+    }
+    None
+}
+
 fn essence(media_type: &str) -> &str {
     media_type.split(';').next().unwrap_or(media_type).trim()
 }
@@ -49,5 +63,18 @@ mod tests {
         assert!(is_spreadsheet_media_type(&format!(
             "{XLSX_MEDIA_TYPE}; charset=binary"
         )));
+    }
+
+    #[test]
+    fn sniff_recognizes_sqlite_and_zip() {
+        assert_eq!(
+            sniff_spreadsheet_media_type(b"SQLite format 3\0rest"),
+            Some(NATIVE_MEDIA_TYPE)
+        );
+        assert_eq!(
+            sniff_spreadsheet_media_type(b"PK\x03\x04"),
+            Some(XLSX_MEDIA_TYPE)
+        );
+        assert_eq!(sniff_spreadsheet_media_type(b"%PDF"), None);
     }
 }
