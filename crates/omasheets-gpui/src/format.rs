@@ -4,9 +4,7 @@
 //! those numbers into the text Excel would paint from the cell's format code.
 //! It does not read a clock.
 
-use omasheets_calc::serial_date::{
-    civil_from_serial_in, serial_from_number_in, DateSystem,
-};
+use omasheets_calc::serial_date::{DateSystem, civil_from_serial_in, serial_from_number_in};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -148,7 +146,10 @@ fn style_formats(styles: &str) -> Vec<String> {
     let mut custom = HashMap::new();
     let mut rest = styles;
     while let Some(start) = rest.find("<numFmt ") {
-        let tag_end = rest[start..].find('>').map(|end| start + end).unwrap_or(rest.len());
+        let tag_end = rest[start..]
+            .find('>')
+            .map(|end| start + end)
+            .unwrap_or(rest.len());
         let tag = &rest[start..tag_end];
         if let (Some(id), Some(code)) = (attr_u32(tag, "numFmtId"), attr(tag, "formatCode")) {
             custom.insert(id, unescape(&code));
@@ -159,7 +160,10 @@ fn style_formats(styles: &str) -> Vec<String> {
     let mut formats = Vec::new();
     rest = xfs;
     while let Some(start) = rest.find("<xf ") {
-        let tag_end = rest[start..].find('>').map(|end| start + end).unwrap_or(rest.len());
+        let tag_end = rest[start..]
+            .find('>')
+            .map(|end| start + end)
+            .unwrap_or(rest.len());
         let tag = &rest[start..tag_end];
         let id = attr_u32(tag, "numFmtId").unwrap_or(0);
         let code = custom
@@ -176,7 +180,10 @@ fn style_formats(styles: &str) -> Vec<String> {
 fn scan_sheet(xml: &str, sheet: &str, formats: &[String], look: &mut WorkbookLook) {
     let mut rest = xml;
     while let Some(start) = rest.find("<row ") {
-        let tag_end = rest[start..].find('>').map(|end| start + end).unwrap_or(rest.len());
+        let tag_end = rest[start..]
+            .find('>')
+            .map(|end| start + end)
+            .unwrap_or(rest.len());
         let tag = &rest[start..tag_end];
         if let (Some(row), Some(height)) = (attr_u32(tag, "r"), attr_f64(tag, "ht")) {
             if height.is_finite() && height > 0.0 {
@@ -200,7 +207,10 @@ fn scan_sheet(xml: &str, sheet: &str, formats: &[String], look: &mut WorkbookLoo
 fn scan_cells(xml: &str, sheet: &str, row: u32, formats: &[String], look: &mut WorkbookLook) {
     let mut rest = xml;
     while let Some(start) = rest.find("<c ") {
-        let tag_end = rest[start..].find('>').map(|end| start + end).unwrap_or(rest.len());
+        let tag_end = rest[start..]
+            .find('>')
+            .map(|end| start + end)
+            .unwrap_or(rest.len());
         let tag = &rest[start..tag_end];
         if let (Some(reference), Some(style)) = (attr(tag, "r"), attr_u32(tag, "s")) {
             if let Some(code) = formats.get(style as usize) {
@@ -221,7 +231,10 @@ fn sheet_names(workbook: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = head;
     while let Some(start) = rest.find("<sheet ") {
-        let tag_end = rest[start..].find('>').map(|end| start + end).unwrap_or(rest.len());
+        let tag_end = rest[start..]
+            .find('>')
+            .map(|end| start + end)
+            .unwrap_or(rest.len());
         let tag = &rest[start..tag_end];
         if let Some(name) = attr(tag, "name") {
             names.push(unescape(&name));

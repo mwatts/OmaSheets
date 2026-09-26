@@ -8,8 +8,8 @@
 use crate::WorkbookPort;
 use gpui_component_block_view::{BlockSnapshot, register_custom_block};
 use gpui_shell::gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, Global, IntoElement as _, ParentElement as _,
-    SharedString, Styled as _, Subscription, Task, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, Global, IntoElement as _,
+    ParentElement as _, SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
 use omasheets_gpui::{SpreadsheetSession, SpreadsheetView};
 use std::collections::HashMap;
@@ -53,7 +53,10 @@ fn compose(block: &BlockSnapshot, window: &mut Window, cx: &mut App) -> AnyEleme
         .filter(|url| !url.is_empty())
         .or_else(|| block.props.get("url").cloned())
         .unwrap_or_default();
-    let Some(port) = cx.try_global::<BlockPort>().map(|installed| installed.0.clone()) else {
+    let Some(port) = cx
+        .try_global::<BlockPort>()
+        .map(|installed| installed.0.clone())
+    else {
         return placeholder("spreadsheet port unavailable");
     };
     if !cx.has_global::<LeafCache>() {
@@ -61,12 +64,7 @@ fn compose(block: &BlockSnapshot, window: &mut Window, cx: &mut App) -> AnyEleme
             leaves: HashMap::new(),
         });
     }
-    if let Some(existing) = cx
-        .global::<LeafCache>()
-        .leaves
-        .get(&key)
-        .cloned()
-    {
+    if let Some(existing) = cx.global::<LeafCache>().leaves.get(&key).cloned() {
         existing.update(cx, |leaf, cx| {
             leaf.set_reference(reference, window, cx);
         });
@@ -122,12 +120,7 @@ impl Leaf {
         leaf
     }
 
-    fn set_reference(
-        &mut self,
-        reference: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_reference(&mut self, reference: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.reference == reference && !matches!(self.state, LeafState::Idle) {
             return;
         }
@@ -163,30 +156,25 @@ impl Leaf {
                         let content_type = read.content_type.clone();
                         let bytes = read.bytes;
                         leaf.state = LeafState::Opening;
-                        leaf._open =
-                            Some(cx.spawn_in(window, async move |this, cx| {
-                                let session = cx
-                                    .background_spawn(async move {
-                                        SpreadsheetSession::open_bytes(
-                                            bytes,
-                                            label,
-                                            &content_type,
-                                        )
-                                    })
-                                    .await;
-                                let _ = this.update_in(cx, |leaf, window, cx| {
-                                    if leaf.reference != reference {
-                                        return;
+                        leaf._open = Some(cx.spawn_in(window, async move |this, cx| {
+                            let session = cx
+                                .background_spawn(async move {
+                                    SpreadsheetSession::open_bytes(bytes, label, &content_type)
+                                })
+                                .await;
+                            let _ = this.update_in(cx, |leaf, window, cx| {
+                                if leaf.reference != reference {
+                                    return;
+                                }
+                                match session {
+                                    Ok(session) => leaf.show(session, window, cx),
+                                    Err(error) => {
+                                        leaf.state = LeafState::Failed(error.to_string());
+                                        cx.notify();
                                     }
-                                    match session {
-                                        Ok(session) => leaf.show(session, window, cx),
-                                        Err(error) => {
-                                            leaf.state = LeafState::Failed(error.to_string());
-                                            cx.notify();
-                                        }
-                                    }
-                                });
-                            }));
+                                }
+                            });
+                        }));
                     }
                     Err(error) => {
                         leaf.state = LeafState::Failed(error.to_string());
@@ -197,12 +185,7 @@ impl Leaf {
         }));
     }
 
-    fn show(
-        &mut self,
-        session: SpreadsheetSession,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn show(&mut self, session: SpreadsheetSession, window: &mut Window, cx: &mut Context<Self>) {
         let view = match &self.state {
             LeafState::Open(existing) => {
                 existing.update(cx, |view, cx| {
@@ -234,10 +217,7 @@ impl gpui_shell::gpui::Render for Leaf {
                 .min_h(px(120.))
                 .p_3()
                 .child(SharedString::from(message.clone())),
-            LeafState::Open(view) => div()
-                .w_full()
-                .min_h(px(240.))
-                .child(view.clone()),
+            LeafState::Open(view) => div().w_full().min_h(px(240.)).child(view.clone()),
         }
     }
 }

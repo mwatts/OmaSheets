@@ -22,10 +22,10 @@ mod port;
 
 pub use block::{SPREADSHEET_BLOCK, install as install_block};
 pub use control::{
-    SPREADSHEET, SpreadsheetControl, declaration, init, register, register_with, Options,
+    Options, SPREADSHEET, SpreadsheetControl, declaration, init, register, register_with,
 };
 pub use omasheets_gpui::{
-    NATIVE_MEDIA_TYPE, ODS_MEDIA_TYPE, XLSX_MEDIA_TYPE, XLS_MEDIA_TYPE, is_native_media_type,
+    NATIVE_MEDIA_TYPE, ODS_MEDIA_TYPE, XLS_MEDIA_TYPE, XLSX_MEDIA_TYPE, is_native_media_type,
     is_spreadsheet_media_type,
 };
 pub use port::{PortError, PortFuture, WorkbookDraft, WorkbookPort, WorkbookRead, WorkbookVersion};
