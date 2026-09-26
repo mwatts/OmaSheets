@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 pub enum LoadError {
     Import(ImportError),
     Document(ApplyError),
+    Io(std::io::Error),
     NoSheets,
 }
 
@@ -27,6 +28,7 @@ impl fmt::Display for LoadError {
         match self {
             Self::Import(error) => write!(formatter, "{error}"),
             Self::Document(error) => write!(formatter, "{error}"),
+            Self::Io(error) => write!(formatter, "{error}"),
             Self::NoSheets => write!(formatter, "workbook has no worksheets"),
         }
     }
