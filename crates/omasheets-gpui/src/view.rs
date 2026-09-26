@@ -101,6 +101,10 @@ impl SpreadsheetView {
         &self.session
     }
 
+    pub fn session_mut(&mut self) -> &mut SpreadsheetSession {
+        &mut self.session
+    }
+
     /// When true, formula commits and host commands are rejected.
     pub fn set_readonly(&mut self, readonly: bool, cx: &mut Context<Self>) {
         if self.readonly != readonly {
