@@ -12,7 +12,8 @@ pub type WorkbookVersion = String;
 pub struct WorkbookRead {
     pub bytes: Vec<u8>,
     pub version: WorkbookVersion,
-    /// Typically an OOXML spreadsheet media type.
+    /// Typically [`crate::NATIVE_MEDIA_TYPE`] for `.omasheets`, or an OOXML
+    /// spreadsheet type when the bytes are Excel interchange.
     pub content_type: String,
 }
 

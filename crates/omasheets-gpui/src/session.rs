@@ -2,12 +2,13 @@
 
 use crate::appearance::{AppearanceTile, SheetChrome, VisibleWindow};
 use crate::browse::{self, BrowseBook};
+use crate::media::{XLSX_MEDIA_TYPE, is_native_media_type};
 use omasheets_core::{
     Actor, ActorKind, ApplyError, CellInput, CellRef, CellValue, Command, Document, DocumentId,
     Literal, ObjectId, SheetId, column_letters,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const VISIBLE_ROWS: u32 = 32;
 pub const VISIBLE_COLUMNS: u32 = 12;
@@ -151,6 +152,72 @@ impl SpreadsheetSession {
         label: impl Into<String>,
     ) -> Result<Self, crate::LoadError> {
         let label = label.into();
+        let path = Self::write_temp_bytes(&label, "xlsx", bytes.as_ref())?;
+        Self::open_xlsx(path)
+    }
+
+    /// Opens a native `.omasheets` store and shows its main-branch document.
+    ///
+    /// Edits apply to the in-memory [`omasheets_core::Document`]. Persisting
+    /// back through Ashlar's workbook port is a later commit path; this open is
+    /// hydrate for display and local formula-bar edits.
+    pub fn open_omasheets(path: impl AsRef<Path>) -> Result<Self, crate::LoadError> {
+        let mut store =
+            omasheets_store::Store::open(path.as_ref()).map_err(crate::LoadError::Store)?;
+        let branch = store.branch_id("main").map_err(crate::LoadError::Store)?;
+        let document = store
+            .document(branch)
+            .map_err(crate::LoadError::Store)?
+            .clone();
+        if document.sheets().is_empty() {
+            return Err(crate::LoadError::NoSheets);
+        }
+        Ok(Self::from_document(document))
+    }
+
+    /// Writes native store bytes to a temp `.omasheets` file and opens them.
+    pub fn open_omasheets_bytes(
+        bytes: impl AsRef<[u8]>,
+        label: impl Into<String>,
+    ) -> Result<Self, crate::LoadError> {
+        let label = label.into();
+        let path = Self::write_temp_bytes(&label, "omasheets", bytes.as_ref())?;
+        Self::open_omasheets(path)
+    }
+
+    /// Opens workbook bytes using the Ashlar / Freedesktop media type.
+    ///
+    /// Native documents use [`crate::NATIVE_MEDIA_TYPE`]. OOXML packages use the
+    /// Excel spreadsheet media type and remain import-only interchange.
+    pub fn open_bytes(
+        bytes: impl AsRef<[u8]>,
+        label: impl Into<String>,
+        content_type: &str,
+    ) -> Result<Self, crate::LoadError> {
+        let label = label.into();
+        if is_native_media_type(content_type) {
+            return Self::open_omasheets_bytes(bytes, label);
+        }
+        let essence = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim();
+        if essence.is_empty()
+            || essence.eq_ignore_ascii_case(XLSX_MEDIA_TYPE)
+            || essence.eq_ignore_ascii_case("application/vnd.ms-excel")
+            || essence.eq_ignore_ascii_case("application/octet-stream")
+        {
+            return Self::open_xlsx_bytes(bytes, label);
+        }
+        Err(crate::LoadError::UnsupportedMediaType(content_type.to_owned()))
+    }
+
+    fn write_temp_bytes(
+        label: &str,
+        extension: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf, crate::LoadError> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -161,11 +228,30 @@ impl SpreadsheetSession {
             .take(48)
             .collect();
         let path = std::env::temp_dir().join(format!(
-            "omasheets-bytes-{safe}-{}-{nonce}.xlsx",
+            "omasheets-bytes-{safe}-{}-{nonce}.{extension}",
             std::process::id()
         ));
-        std::fs::write(&path, bytes.as_ref()).map_err(crate::LoadError::Io)?;
-        Self::open_xlsx(path)
+        std::fs::write(&path, bytes).map_err(crate::LoadError::Io)?;
+        Ok(path)
+    }
+
+    fn from_document(document: Document) -> Self {
+        let clock = i64::try_from(document.event_count()).unwrap_or(i64::MAX);
+        Self {
+            document,
+            actor: Actor::new(ActorKind::Human, "host"),
+            clock,
+            active: 0,
+            selection: Some(CellAddress { row: 0, column: 0 }),
+            origin_row: 0,
+            origin_column: 0,
+            formula_draft: String::new(),
+            appearance: None,
+            browse: None,
+            chrome: None,
+            column_px: HashMap::new(),
+            row_px: HashMap::new(),
+        }
     }
 
     pub fn is_browsing(&self) -> bool {
@@ -1025,6 +1111,80 @@ mod tests {
             .map(|cell| cell.text)
             .unwrap_or_default();
         assert_eq!(a1, "2");
+    }
+
+    #[test]
+    fn open_omasheets_bytes_loads_native_document() {
+        use crate::NATIVE_MEDIA_TYPE;
+        use omasheets_core::{Actor, ActorKind, Command, DocumentId, ObjectId};
+        use omasheets_store::Store;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "omasheets-native-{}-{nonce}.omasheets",
+            std::process::id()
+        ));
+        let actor = Actor::new(ActorKind::Human, "host");
+        let mut store = Store::create(
+            &path,
+            DocumentId(ObjectId::from_seed("native-book")),
+            "native-book",
+            actor.clone(),
+            1,
+        )
+        .expect("create store");
+        let branch = store.branch_id("main").expect("main");
+        store
+            .append(
+                branch,
+                actor.clone(),
+                2,
+                Command::AddSheet {
+                    name: "Sheet".into(),
+                },
+            )
+            .expect("sheet");
+        let sheet = *store
+            .document(branch)
+            .expect("doc")
+            .sheets()
+            .last()
+            .expect("sheet id");
+        store
+            .append(
+                branch,
+                actor.clone(),
+                3,
+                Command::AddColumns {
+                    sheet,
+                    count: 8,
+                    at: 0,
+                },
+            )
+            .expect("cols");
+        store
+            .append(
+                branch,
+                actor,
+                4,
+                Command::AddRows {
+                    sheet,
+                    count: 8,
+                    at: 0,
+                    table: None,
+                },
+            )
+            .expect("rows");
+        drop(store);
+        let bytes = std::fs::read(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        let session =
+            SpreadsheetSession::open_bytes(bytes, "native-book", NATIVE_MEDIA_TYPE).expect("open");
+        assert!(!session.is_browsing());
+        assert_eq!(session.active_sheet_name(), Some("Sheet"));
     }
 
     fn write_edit_workbook(path: &std::path::Path) {

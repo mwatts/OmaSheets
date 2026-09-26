@@ -9,18 +9,21 @@ use crate::format::{self, paint_number_in};
 use omasheets_calc::serial_date::DateSystem;
 use omasheets_calc::{CellId, FormulaError, Value, Workbook};
 use omasheets_core::ApplyError;
+use omasheets_store::StoreError;
 use omasheets_xlsx::{ImportError, ImportLimits, import_xlsx};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// Why [`crate::SpreadsheetSession::open_xlsx`] could not open a workbook.
+/// Why [`crate::SpreadsheetSession::open_xlsx`] / native open could not load.
 #[derive(Debug)]
 pub enum LoadError {
     Import(ImportError),
     Document(ApplyError),
+    Store(StoreError),
     Io(std::io::Error),
     NoSheets,
+    UnsupportedMediaType(String),
 }
 
 impl fmt::Display for LoadError {
@@ -28,11 +31,16 @@ impl fmt::Display for LoadError {
         match self {
             Self::Import(error) => write!(formatter, "{error}"),
             Self::Document(error) => write!(formatter, "{error}"),
+            Self::Store(error) => write!(formatter, "{error}"),
             Self::Io(error) => write!(formatter, "{error}"),
             Self::NoSheets => write!(formatter, "workbook has no worksheets"),
+            Self::UnsupportedMediaType(media) => {
+                write!(formatter, "unsupported spreadsheet media type: {media}")
+            }
         }
     }
 }
+
 
 impl std::error::Error for LoadError {}
 

@@ -10,6 +10,7 @@ description = "OmaSheets spreadsheet as a Loom native composite (omasheets.Sprea
 [dependencies]
 anyhow = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
+gpui-component-block-view = { path = "../../../loom/vendor/gpui-kit/crates/block-view" }
 gpui-kit = { path = "../../../loom/vendor/gpui-kit/crates/kit" }
 gpui-shell = { path = "../../../loom/vendor/gpui-kit/crates/shell" }
 loom-gpui = { path = "../../../loom/crates/loom-gpui" }

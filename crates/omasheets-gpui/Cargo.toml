@@ -11,6 +11,7 @@ publish = false
 gpui-kit = { path = "../../../loom/vendor/gpui-kit/crates/kit" }
 omasheets-calc = { path = "../omasheets-calc" }
 omasheets-core = { path = "../omasheets-core" }
+omasheets-store = { path = "../omasheets-store" }
 omasheets-xlsx = { path = "../omasheets-xlsx" }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 

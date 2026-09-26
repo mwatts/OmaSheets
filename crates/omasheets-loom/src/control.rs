@@ -76,7 +76,8 @@ pub fn declaration() -> ControlDeclaration {
     declaration.qualifiers = [
         "a spreadsheet",
         "workbook grid",
-        "xlsx viewer",
+        "omasheets document",
+        "xlsx import",
         "formula sheet",
     ]
     .map(str::to_owned)
@@ -198,9 +199,12 @@ impl Host {
             .unwrap_or(reference.as_str())
             .to_string();
         let bytes = read.bytes;
+        let content_type = read.content_type;
         self.state = BookState::Opening(cx.spawn_in(window, async move |this, cx| {
             let session = cx
-                .background_spawn(async move { SpreadsheetSession::open_xlsx_bytes(bytes, label) })
+                .background_spawn(async move {
+                    SpreadsheetSession::open_bytes(bytes, label, &content_type)
+                })
                 .await;
             let _ = this.update_in(cx, |host, window, cx| {
                 if host.reference.as_deref() != Some(reference.as_str()) {
