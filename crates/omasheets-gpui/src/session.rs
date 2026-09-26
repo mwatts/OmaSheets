@@ -141,6 +141,33 @@ impl SpreadsheetSession {
         Ok(session)
     }
 
+    /// Imports workbook bytes through a private temp package, then opens it.
+    ///
+    /// The temp file is kept so sheet chrome and appearance can still read the
+    /// package. Callers that own a durable store (Ashlar's workbook port) should
+    /// treat this as a hydrate cache, not the publication path.
+    pub fn open_xlsx_bytes(
+        bytes: impl AsRef<[u8]>,
+        label: impl Into<String>,
+    ) -> Result<Self, crate::LoadError> {
+        let label = label.into();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let safe: String = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .take(48)
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "omasheets-bytes-{safe}-{}-{nonce}.xlsx",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes.as_ref()).map_err(crate::LoadError::Io)?;
+        Self::open_xlsx(path)
+    }
+
     pub fn is_browsing(&self) -> bool {
         self.browse.is_some()
     }
@@ -975,6 +1002,29 @@ mod tests {
         session.commit_edit().unwrap();
         assert_eq!(text(&session, 1), "40");
         assert_eq!(session.formula_draft(), "=A1*4");
+    }
+
+    #[test]
+    fn open_xlsx_bytes_shows_engine_values() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "omasheets-bytes-src-{}-{nonce}.xlsx",
+            std::process::id()
+        ));
+        write_edit_workbook(&path);
+        let bytes = std::fs::read(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        let session = SpreadsheetSession::open_xlsx_bytes(bytes, "bytes-book").expect("open bytes");
+        let a1 = session
+            .visible_cells()
+            .into_iter()
+            .find(|cell| cell.row == 0 && cell.column == 0)
+            .map(|cell| cell.text)
+            .unwrap_or_default();
+        assert_eq!(a1, "2");
     }
 
     fn write_edit_workbook(path: &std::path::Path) {

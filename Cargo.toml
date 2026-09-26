@@ -4,6 +4,7 @@ members = [
   "crates/omasheets-core",
   "crates/omasheets-corpus",
   "crates/omasheets-gpui",
+  "crates/omasheets-loom",
   "crates/omasheets-service",
   "crates/omasheets-store",
   "crates/omasheets-xlsx",
@@ -15,6 +16,10 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
+
+# Same facade as Loom/Ashlar: shell names crates.io `rquickjs`.
+[patch.crates-io]
+rquickjs = { path = "../loom/vendor/gpui-kit/crates/shell/rquickjs-compat" }
 
 [profile.release]
 codegen-units = 1
