@@ -71,7 +71,7 @@ fn open_spreadsheet(cx: &mut TestAppContext) -> Opened {
         });
         slot_for_open.borrow_mut().replace(spreadsheet.clone());
         let host = cx.new(|cx| Host::new(spreadsheet, sink, cx));
-        Root::new(host, window, cx).bordered(false)
+        Root::new(host, window, cx)
     });
     Opened {
         window,
@@ -93,11 +93,25 @@ fn formula_bar_id(window: &Window) -> gpui_kit::ElementId {
         })
 }
 
-fn type_formula(window: &mut Window, cx: &mut gpui_kit::App, source: &str) {
-    let id = formula_bar_id(window);
-    window.click(id, cx);
-    window.input(source, cx);
-    window.press("enter", cx);
+fn interact(
+    opened: &Opened,
+    cx: &mut TestAppContext,
+    action: impl FnOnce(&mut Window, &mut gpui_kit::App),
+) {
+    cx.update_window(opened.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        action(window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn type_formula(opened: &Opened, cx: &mut TestAppContext, source: &str) {
+    interact(opened, cx, |window, cx| {
+        window.click(formula_bar_id(window), cx)
+    });
+    interact(opened, cx, |window, cx| window.input(source, cx));
+    interact(opened, cx, |window, cx| window.press("enter", cx));
 }
 
 fn events(opened: &Opened) -> Vec<SpreadsheetUiEvent> {
@@ -111,60 +125,46 @@ fn clear_events(opened: &Opened) {
 #[gpui_kit::test]
 fn clicking_a_cell_and_entering_a_formula_commits_and_displays_the_result(cx: &mut TestAppContext) {
     let opened = open_spreadsheet(cx);
-    cx.update_window(opened.window.into(), |_, window, cx| {
-        window.render_frame(cx);
-        window.click("cell-0-0", cx);
-        type_formula(window, cx, "=1+2");
-
-        let committed = events(&opened)
-            .into_iter()
-            .find(|event| matches!(event, SpreadsheetUiEvent::EditCommitted { .. }));
-        assert_eq!(
-            committed,
-            Some(SpreadsheetUiEvent::EditCommitted {
-                sheet: "Sheet".into(),
-                a1: "A1".into(),
-                source: "=1+2".into(),
-            }),
-            "committing the formula bar should tell the host the A1 source"
-        );
-
+    interact(&opened, cx, |window, cx| window.click("cell-0-0", cx));
+    type_formula(&opened, cx, "=1+2");
+    let committed = events(&opened)
+        .into_iter()
+        .find(|event| matches!(event, SpreadsheetUiEvent::EditCommitted { .. }));
+    assert_eq!(
+        committed,
+        Some(SpreadsheetUiEvent::EditCommitted {
+            sheet: "Sheet".into(),
+            a1: "A1".into(),
+            source: "=1+2".into(),
+        }),
+        "committing the formula bar should tell the host the A1 source"
+    );
+    interact(&opened, cx, |window, _| {
         let displayed = window.find("cell-0-0");
-        let model = opened
-            .spreadsheet
-            .read(cx)
-            .session()
-            .visible_cells()
-            .into_iter()
-            .find(|cell| cell.row == 0 && cell.column == 0)
-            .map(|cell| cell.text);
         assert_eq!(
             displayed.value().or(displayed.label()),
             Some("3"),
-            "A1 should display the calculated result 3; model text is {model:?}; snapshot {displayed:?}"
+            "A1 should display the calculated result 3; snapshot {displayed:?}"
         );
-    })
-    .unwrap();
+    });
 }
 
 #[gpui_kit::test]
 fn clicking_another_cell_moves_the_selection_and_formula_bar(cx: &mut TestAppContext) {
     let opened = open_spreadsheet(cx);
-    cx.update_window(opened.window.into(), |_, window, cx| {
-        window.render_frame(cx);
-        window.click("cell-0-0", cx);
-        type_formula(window, cx, "=1+2");
-        clear_events(&opened);
-        window.click("cell-0-1", cx);
-
-        assert_eq!(
-            events(&opened),
-            vec![SpreadsheetUiEvent::SelectionChanged {
-                sheet: "Sheet".into(),
-                a1: "B1".into(),
-            }],
-            "clicking B1 should notify the host of that selection"
-        );
+    interact(&opened, cx, |window, cx| window.click("cell-0-0", cx));
+    type_formula(&opened, cx, "=1+2");
+    clear_events(&opened);
+    interact(&opened, cx, |window, cx| window.click("cell-0-1", cx));
+    assert_eq!(
+        events(&opened),
+        vec![SpreadsheetUiEvent::SelectionChanged {
+            sheet: "Sheet".into(),
+            a1: "B1".into(),
+        }],
+        "clicking B1 should notify the host of that selection"
+    );
+    interact(&opened, cx, |window, cx| {
         assert_eq!(
             opened
                 .spreadsheet
@@ -178,19 +178,19 @@ fn clicking_another_cell_moves_the_selection_and_formula_bar(cx: &mut TestAppCon
         assert_eq!(
             formula.value(),
             Some(""),
-            "the formula bar should follow B1, which is empty, not keep A1's formula; snapshot {formula:?}"
+            "the formula bar should follow B1, which is empty"
         );
-    })
-    .unwrap();
+    });
 }
 
 #[gpui_kit::test]
 fn rejected_command_emits_command_failed_without_changing_the_document(cx: &mut TestAppContext) {
     let opened = open_spreadsheet(cx);
-    cx.update_window(opened.window.into(), |_, window, cx| {
-        window.render_frame(cx);
-        let before = opened.spreadsheet.read(cx).session().document().digest();
-        clear_events(&opened);
+    let before = opened
+        .spreadsheet
+        .read_with(cx, |view, _| view.session().document().digest());
+    clear_events(&opened);
+    interact(&opened, cx, |window, cx| {
         opened.spreadsheet.update(cx, |view, cx| {
             view.apply_command(
                 Command::AddSheet {
@@ -198,61 +198,59 @@ fn rejected_command_emits_command_failed_without_changing_the_document(cx: &mut 
                 },
                 window,
                 cx,
-            );
+            )
         });
-        assert!(
-            events(&opened).iter().any(|event| matches!(
-                event,
-                SpreadsheetUiEvent::CommandFailed { message }
-                    if message.contains("DuplicateName")
-            )),
-            "a duplicate sheet name should emit CommandFailed, got {:?}",
-            events(&opened)
-        );
-        assert_eq!(
-            opened.spreadsheet.read(cx).session().document().digest(),
-            before,
-            "a rejected command must not change the document"
-        );
-    })
-    .unwrap();
+    });
+    assert!(
+        events(&opened).iter().any(|event| matches!(event,
+            SpreadsheetUiEvent::CommandFailed { message } if message.contains("DuplicateName")
+        )),
+        "a duplicate sheet name should emit CommandFailed, got {:?}",
+        events(&opened)
+    );
+    assert_eq!(
+        opened
+            .spreadsheet
+            .read_with(cx, |view, _| view.session().document().digest()),
+        before,
+        "a rejected command must not change the document"
+    );
 }
 
 #[gpui_kit::test]
 fn committing_a_formula_with_no_selection_emits_command_failed(cx: &mut TestAppContext) {
     let opened = open_spreadsheet(cx);
-    cx.update_window(opened.window.into(), |_, window, cx| {
-        window.render_frame(cx);
+    interact(&opened, cx, |window, cx| {
         let sheet = opened.spreadsheet.read(cx).session().document().sheets()[0];
         opened.spreadsheet.update(cx, |view, cx| {
-            view.apply_command(Command::DeleteSheet { sheet }, window, cx);
+            view.apply_command(Command::DeleteSheet { sheet }, window, cx)
         });
-        let before = opened.spreadsheet.read(cx).session().document().digest();
-        clear_events(&opened);
-        type_formula(window, cx, "=1+2");
-
-        assert!(
-            events(&opened).iter().any(|event| matches!(
-                event,
-                SpreadsheetUiEvent::CommandFailed { message }
-                    if message.contains("no cell is selected")
-            )),
-            "enter in the formula bar with no selection should emit CommandFailed, got {:?}",
-            events(&opened)
-        );
-        assert!(
-            events(&opened)
-                .iter()
-                .all(|event| !matches!(event, SpreadsheetUiEvent::EditCommitted { .. })),
-            "a rejected edit must not emit EditCommitted"
-        );
-        assert_eq!(
-            opened.spreadsheet.read(cx).session().document().digest(),
-            before,
-            "the rejected edit must not change the document"
-        );
-    })
-    .unwrap();
+    });
+    let before = opened
+        .spreadsheet
+        .read_with(cx, |view, _| view.session().document().digest());
+    clear_events(&opened);
+    type_formula(&opened, cx, "=1+2");
+    assert!(
+        events(&opened).iter().any(|event| matches!(event,
+            SpreadsheetUiEvent::CommandFailed { message } if message.contains("no cell is selected")
+        )),
+        "enter with no selection should emit CommandFailed, got {:?}",
+        events(&opened)
+    );
+    assert!(
+        events(&opened)
+            .iter()
+            .all(|event| !matches!(event, SpreadsheetUiEvent::EditCommitted { .. })),
+        "a rejected edit must not emit EditCommitted"
+    );
+    assert_eq!(
+        opened
+            .spreadsheet
+            .read_with(cx, |view, _| view.session().document().digest()),
+        before,
+        "the rejected edit must not change the document"
+    );
 }
 
 #[gpui_kit::test]
