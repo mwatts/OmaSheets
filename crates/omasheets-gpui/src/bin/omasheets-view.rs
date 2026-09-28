@@ -308,7 +308,7 @@ fn open_corpus(cx: &mut gpui_kit::App) {
         window.defer(cx, move |window, cx| {
             host_for_open.update(cx, |host, cx| host.open_initial(window, cx));
         });
-        cx.new(|cx| Root::new(host, window, cx).bordered(false))
+        cx.new(|cx| Root::new(host, window, cx))
     })
     .expect("open the corpus window");
 }

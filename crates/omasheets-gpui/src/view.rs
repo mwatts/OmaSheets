@@ -7,7 +7,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
     MouseMoveEvent, ParentElement, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
-    Subscription, Window, div, px, rgb,
+    Subscription, TestSupportExt, Window, div, px, rgb,
 };
 use omasheets_core::{ApplyError, Command};
 use std::path::Path;
@@ -617,6 +617,8 @@ impl RenderOnce for SheetGrid {
                 row = row.child(
                     align
                         .id(id)
+                        .aria_label(cell.text.clone())
+                        .test_support()
                         .w(px(width))
                         .h(px(height))
                         .px_1()
