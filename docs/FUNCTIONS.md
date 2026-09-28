@@ -205,9 +205,10 @@ and empty strings, propagates errors, and refuses output beyond 32,767 UTF-16 un
 
 `TEXT` formats a number with one code, compared without regard to case:
 `General`, `0`, `0.00`, `#`, `#,##0`, `#,##0.00`, `0%`, `0.00%`, `yyyy-mm-dd`,
-or `mm/dd/yyyy`. Any other code, including a literal suffix such as `0.0x`,
-is `#VALUE!`. `#` rounds half away from zero to an integer and shows nothing
-for zero. Date codes use the 1900 serial, including the fictitious 1900-02-29.
+or `mm/dd/yyyy`. Any other code, including surrounding whitespace or a literal
+suffix such as `0.0x`, is `#VALUE!`. `#` rounds half away from zero to an
+integer and shows nothing for zero. Date codes use the 1900 serial, including
+the fictitious 1900-02-29.
 `HYPERLINK` returns its friendly name, or the link when the name is omitted,
 and does not fetch the target. `RANK` is a competition rank over numbers in
 the reference (ties share a rank and the next rank is skipped); a zero or

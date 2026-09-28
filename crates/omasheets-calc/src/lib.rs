@@ -4009,11 +4009,12 @@ enum TextFormat {
     DateUs,
 }
 
-/// Locale-free `TEXT` codes. `#` is the optional integer digit the sample
-/// uses; a rounded zero is an empty string. Anything else, including
-/// literals such as `0.0x`, is refused.
+/// Locale-free `TEXT` codes. Comparison ignores ASCII case and keeps
+/// surrounding whitespace, so `" 0 "` is not `"0"`. `#` is the optional
+/// integer digit the sample uses; a rounded zero is an empty string.
+/// Anything else, including literals such as `0.0x`, is refused.
 fn text_format(code: &str) -> Option<TextFormat> {
-    match code.trim().to_ascii_lowercase().as_str() {
+    match code.to_ascii_lowercase().as_str() {
         "general" => Some(TextFormat::General),
         "0" => Some(TextFormat::Integer {
             group: false,
@@ -4058,9 +4059,7 @@ fn format_text_value(value: &Value, format: &str) -> Result<String, CalcError> {
     };
     match format {
         TextFormat::General => format_general(number),
-        TextFormat::Integer { group, optional } => {
-            format_scaled(number, 0, group, optional, "")
-        }
+        TextFormat::Integer { group, optional } => format_scaled(number, 0, group, optional, ""),
         TextFormat::Fixed { decimals, group } => {
             format_scaled(number, i32::from(decimals), group, false, "")
         }
@@ -4080,6 +4079,18 @@ fn format_text_date(number: f64, format: TextFormat) -> Result<String, CalcError
     })
 }
 
+/// `magnitude / 10^exponent` for a positive finite magnitude. Direct powers
+/// of ten underflow to zero below `1e-308`, which would turn a subnormal
+/// into an infinite mantissa.
+fn decimal_mantissa(magnitude: f64, exponent: i32) -> f64 {
+    let power = 10_f64.powi(exponent);
+    if power.is_finite() && power != 0.0 {
+        magnitude / power
+    } else {
+        (magnitude.ln() - f64::from(exponent) * std::f64::consts::LN_10).exp()
+    }
+}
+
 fn format_general(value: f64) -> Result<String, CalcError> {
     if !value.is_finite() {
         return Err(CalcError::InvalidNumber);
@@ -4091,7 +4102,10 @@ fn format_general(value: f64) -> Result<String, CalcError> {
     let magnitude = value.abs();
     let exponent = magnitude.log10().floor() as i32;
     let body = if exponent >= 11 || exponent <= -10 {
-        let mut mantissa = magnitude / 10_f64.powi(exponent);
+        let mut mantissa = decimal_mantissa(magnitude, exponent);
+        if !mantissa.is_finite() || mantissa <= 0.0 {
+            return Err(CalcError::InvalidNumber);
+        }
         let mut exponent = exponent;
         if mantissa >= 10.0 {
             mantissa /= 10.0;
@@ -4169,7 +4183,9 @@ fn format_scaled(
         return Err(CalcError::InvalidNumber);
     }
     let scaled = (value * factor).round();
-    if !scaled.is_finite() || scaled.abs() > u128::MAX as f64 {
+    // `u128::MAX as f64` is 2^128. That value does not fit in `u128`, and the
+    // cast saturates to `u128::MAX`.
+    if !scaled.is_finite() || scaled.abs() >= u128::MAX as f64 {
         return Err(CalcError::InvalidNumber);
     }
     let negative = scaled.is_sign_negative() && scaled != 0.0;
@@ -7195,11 +7211,7 @@ mod tests {
                 "=RANK(1,A8:A8)",
                 Value::Error(CalcError::DivisionByZero),
             ),
-            (
-                31,
-                "=RANK(1,A5:A6)",
-                Value::Error(CalcError::NotAvailable),
-            ),
+            (31, "=RANK(1,A5:A6)", Value::Error(CalcError::NotAvailable)),
             (
                 32,
                 "=RANK(\"x\",A1:A3)",
@@ -7221,7 +7233,11 @@ mod tests {
                 "=HYPERLINK(\"url\",NA())",
                 Value::Error(CalcError::NotAvailable),
             ),
-            (37, "=HYPERLINK()", Value::Error(CalcError::InvalidArguments)),
+            (
+                37,
+                "=HYPERLINK()",
+                Value::Error(CalcError::InvalidArguments),
+            ),
         ] {
             workbook.set_formula(cell(0, column), formula).unwrap();
             assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
@@ -7235,15 +7251,81 @@ mod tests {
             assert_close(workbook.value(cell(0, column)), expected, 1e-9, formula);
         }
         for (column, formula, expected) in [
-            (41, "=RRI(0,100,121)", Value::Error(CalcError::InvalidNumber)),
+            (
+                41,
+                "=RRI(0,100,121)",
+                Value::Error(CalcError::InvalidNumber),
+            ),
             (42, "=RRI(10,0,121)", Value::Error(CalcError::InvalidNumber)),
-            (43, "=RRI(10,-100,121)", Value::Error(CalcError::InvalidNumber)),
-            (44, "=RRI(10,\"x\",121)", Value::Error(CalcError::InvalidValue)),
+            (
+                43,
+                "=RRI(10,-100,121)",
+                Value::Error(CalcError::InvalidNumber),
+            ),
+            (
+                44,
+                "=RRI(10,\"x\",121)",
+                Value::Error(CalcError::InvalidValue),
+            ),
             (45, "=RRI(1,2)", Value::Error(CalcError::InvalidArguments)),
+            (
+                46,
+                "=TEXT(1,\" 0 \")",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (47, "=TEXT(1,\"0 \")", Value::Error(CalcError::InvalidValue)),
+            (
+                48,
+                "=TEXT(1,\" general\")",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (
+                49,
+                "=TEXT(2^128,\"0\")",
+                Value::Error(CalcError::InvalidNumber),
+            ),
+            (
+                50,
+                "=TEXT(-(2^128),\"0\")",
+                Value::Error(CalcError::InvalidNumber),
+            ),
+            (
+                51,
+                "=TEXT(1E-309,\"General\")",
+                Value::Text("1E-309".into()),
+            ),
+            (
+                52,
+                "=TEXT(2^-1074,\"General\")",
+                Value::Text("4.94066E-324".into()),
+            ),
+            (
+                53,
+                "=TEXT(-(2^-1074),\"General\")",
+                Value::Text("-4.94066E-324".into()),
+            ),
         ] {
             workbook.set_formula(cell(0, column), formula).unwrap();
             assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
         }
+    }
+
+    #[test]
+    fn text_scaled_formats_the_largest_exact_f64_integer_below_two_pow_128() {
+        let boundary = u128::MAX as f64;
+        assert_eq!(
+            format_scaled(boundary, 0, false, false, ""),
+            Err(CalcError::InvalidNumber)
+        );
+        let below = f64::from_bits(boundary.to_bits() - 1);
+        assert_eq!(
+            format_scaled(below, 0, false, false, "").as_deref(),
+            Ok("340282366920938425684442744474606501888")
+        );
+        assert_eq!(
+            format_scaled(-below, 0, false, false, "").as_deref(),
+            Ok("-340282366920938425684442744474606501888")
+        );
     }
 
     #[test]
@@ -7269,6 +7351,15 @@ mod tests {
             "docs/FUNCTIONS.md must list exactly the parser registry"
         );
         assert!(documented.contains(&format!("{} function names", registry.len())));
+        let support = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/NATIVE-SPREADSHEET-SUPPORT.md"
+        ))
+        .expect("docs/NATIVE-SPREADSHEET-SUPPORT.md exists");
+        assert!(
+            support.contains(&format!("contains {} function names", registry.len())),
+            "docs/NATIVE-SPREADSHEET-SUPPORT.md must report the parser registry count"
+        );
     }
 
     #[test]
