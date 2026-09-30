@@ -1,4 +1,10 @@
-# Spreadsheet-RL sample
+# Historical Spreadsheet-RL sample
+
+This is an archived measurement of commit `371fc30`, not a score of this branch.
+The original local manifest and pinned archive register were not committed and
+are unavailable here. These figures cannot currently be reproduced and are not
+part of the registered corpus or evidence for this change. Preserve the original
+manifest digest in the JSON record; do not substitute a different sample.
 
 Source: [Spreadsheet-RL](https://huggingface.co/datasets/Spreadsheet-RL/Spreadsheet-RL) on Hugging Face, released with the Spreadsheet-RL paper and code drop dated 2026-05-17. License: CC-BY-SA-4.0.
 

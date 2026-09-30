@@ -416,7 +416,7 @@ fn read_occupied_sheet<RS: Read + Seek>(
     };
     let mut anchors: HashMap<usize, ((u32, u32), String)> = HashMap::new();
     let mut values = Vec::new();
-    let mut value_positions = HashSet::new();
+    let mut occupied_positions = HashSet::new();
     let mut formulas = Vec::new();
     let mut pending = Vec::new();
     while let Some(record) = reader
@@ -424,12 +424,13 @@ fn read_occupied_sheet<RS: Read + Seek>(
         .map_err(read_error)?
     {
         let has_value = !record.value.is_empty();
-        let counts_now = has_value
-            || matches!(
-                record.formula,
-                Some(XlsxFormulaMetadata::Normal { .. } | XlsxFormulaMetadata::Shared { .. })
-            );
-        if counts_now {
+        let has_formula = record.formula.is_some();
+        if has_value || has_formula {
+            if !occupied_positions.insert(record.pos) {
+                return Err(ImportError::Read(
+                    "duplicate occupied worksheet cell".into(),
+                ));
+            }
             *observed_cells = observed_cells.saturating_add(1);
             if *observed_cells > limits.max_cells {
                 return Err(ImportError::TooManyCells {
@@ -438,8 +439,16 @@ fn read_occupied_sheet<RS: Read + Seek>(
                 });
             }
         }
+        if has_formula {
+            *observed_formulas = observed_formulas.saturating_add(1);
+            if *observed_formulas > limits.max_formulas {
+                return Err(ImportError::TooManyFormulas {
+                    observed: *observed_formulas,
+                    maximum: limits.max_formulas,
+                });
+            }
+        }
         if has_value {
-            value_positions.insert(record.pos);
             values.push(Cell::new(record.pos, Data::from(record.value)));
         }
         match record.formula {
@@ -457,15 +466,6 @@ fn read_occupied_sheet<RS: Read + Seek>(
             Some(XlsxFormulaMetadata::SharedDerived { shared_index }) => {
                 pending.push((record.pos, shared_index));
             }
-            Some(_) if !has_value => {
-                *observed_cells = observed_cells.saturating_add(1);
-                if *observed_cells > limits.max_cells {
-                    return Err(ImportError::TooManyCells {
-                        observed: *observed_cells,
-                        maximum: limits.max_cells,
-                    });
-                }
-            }
             Some(_) | None => {}
         }
     }
@@ -478,29 +478,7 @@ fn read_occupied_sheet<RS: Read + Seek>(
         if formula.is_empty() {
             continue;
         }
-        let already_counted = value_positions.contains(&position);
-        if !already_counted {
-            *observed_cells = observed_cells.saturating_add(1);
-            if *observed_cells > limits.max_cells {
-                return Err(ImportError::TooManyCells {
-                    observed: *observed_cells,
-                    maximum: limits.max_cells,
-                });
-            }
-        }
         formulas.push(Cell::new(position, formula));
-    }
-    *observed_formulas = observed_formulas.saturating_add(
-        formulas
-            .iter()
-            .filter(|cell| !cell.get_value().is_empty())
-            .count(),
-    );
-    if *observed_formulas > limits.max_formulas {
-        return Err(ImportError::TooManyFormulas {
-            observed: *observed_formulas,
-            maximum: limits.max_formulas,
-        });
     }
     Ok(OccupiedSheet {
         name: name.to_string(),
@@ -897,7 +875,6 @@ fn import_ranges_with_names(
     let mut source_cells = BTreeMap::new();
 
     for (sheet_index, sheet) in ranges.into_iter().enumerate() {
-        let mut stored_values = HashMap::new();
         for cell in sheet.values {
             if cell.get_value().is_empty() {
                 continue;
@@ -905,7 +882,6 @@ fn import_ranges_with_names(
             let (row, column) = cell.get_position();
             let id = CellId::new(sheet_index as u32, row, column);
             set_source_value(&mut workbook, id, cell.get_value());
-            stored_values.insert((row, column), source_value(cell.get_value()));
             source_cells.insert(
                 id,
                 ImportedCell {
@@ -925,10 +901,7 @@ fn import_ranges_with_names(
                 .entry(id)
                 .or_insert_with(|| ImportedCell {
                     cell: id,
-                    stored: stored_values
-                        .get(&(row, column))
-                        .cloned()
-                        .unwrap_or(Value::Blank),
+                    stored: Value::Blank,
                     formula: None,
                 })
                 .formula = Some(cell.get_value().clone());
@@ -1666,6 +1639,109 @@ mod tests {
             imported.workbook.value(CellId::new(0, 1_048_575, 16_383)),
             Value::Number(2.0)
         );
+    }
+
+    #[test]
+    fn streaming_import_enforces_cell_and_formula_budgets() {
+        let cases = [
+            (
+                "cached-formula",
+                "<c r=\"A1\"><f>1+1</f><v>2</v></c>",
+                1,
+                1,
+                None,
+                1,
+            ),
+            ("formula-only", "<c r=\"A1\"><f>1+1</f></c>", 1, 1, None, 1),
+            ("styled-empty", "<c r=\"A1\" s=\"0\"/>", 0, 0, None, 0),
+            (
+                "cell-overflow",
+                "<c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>2</v></c>",
+                1,
+                1,
+                Some(ImportError::TooManyCells {
+                    observed: 2,
+                    maximum: 1,
+                }),
+                0,
+            ),
+            (
+                "formula-overflow",
+                "<c r=\"A1\"><f>1</f></c><c r=\"B1\"><f>2</f></c>",
+                2,
+                1,
+                Some(ImportError::TooManyFormulas {
+                    observed: 2,
+                    maximum: 1,
+                }),
+                0,
+            ),
+            (
+                "pending-cell-overflow",
+                "<c r=\"A1\"><f t=\"shared\" si=\"0\"/></c><c r=\"B1\"><f t=\"shared\" si=\"0\"/></c>",
+                1,
+                2,
+                Some(ImportError::TooManyCells {
+                    observed: 2,
+                    maximum: 1,
+                }),
+                0,
+            ),
+            (
+                "pending-formula-overflow",
+                "<c r=\"A1\"><f t=\"shared\" si=\"0\"/></c><c r=\"B1\"><f t=\"shared\" si=\"0\"/></c>",
+                2,
+                1,
+                Some(ImportError::TooManyFormulas {
+                    observed: 2,
+                    maximum: 1,
+                }),
+                0,
+            ),
+            (
+                "duplicate-cell",
+                "<c r=\"A1\"><v>1</v></c><c r=\"A1\"><v>2</v></c>",
+                2,
+                0,
+                Some(ImportError::Read(
+                    "duplicate occupied worksheet cell".into(),
+                )),
+                0,
+            ),
+        ];
+        for (name, cells, max_cells, max_formulas, error, occupied) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "omasheets-budget-{}-{name}.xlsx",
+                std::process::id()
+            ));
+            let sheet = format!(
+                "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\">{cells}</row></sheetData></worksheet>"
+            );
+            write_plain_workbook_xml(&path, &sheet);
+            let result = import_xlsx(
+                &path,
+                ImportLimits {
+                    max_cells,
+                    max_formulas,
+                    ..ImportLimits::default()
+                },
+            );
+            std::fs::remove_file(&path).unwrap();
+            match error {
+                Some(expected) => assert_eq!(result.err(), Some(expected), "{name}"),
+                None => {
+                    let imported = result.unwrap_or_else(|error| panic!("{name}: {error}"));
+                    assert_eq!(imported.source_cells.len(), occupied, "{name}");
+                    if occupied == 1 {
+                        assert_eq!(
+                            imported.workbook.value(CellId::new(0, 0, 0)),
+                            Value::Number(2.0),
+                            "{name}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
