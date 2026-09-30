@@ -1,5 +1,6 @@
 //! Bounded SpreadsheetML presentation conversion. Values remain the responsibility
 //! of the calculation importer; this layer never extracts files or follows links.
+pub(crate) mod extras;
 use crate::{ServiceError, xml_text};
 use omasheets_core::presentation::{
     Alignment, Border, CellStyle, PresentedCell, Region, SheetPresentation,
@@ -331,6 +332,15 @@ pub(crate) struct Layout {
     frozen_rows: usize,
     frozen_columns: usize,
     hide_grid: bool,
+    notes: Vec<(usize, usize, String)>,
+    filter: Option<(Rectangle, usize, String)>,
+    conditional: Vec<(
+        Rectangle,
+        omasheets_core::presentation::Comparison,
+        f64,
+        CellStyle,
+    )>,
+    charts: Vec<(Rectangle, String, omasheets_core::presentation::ChartKind)>,
 }
 impl Layout {
     pub fn bind(
@@ -366,6 +376,49 @@ impl Layout {
                 columns: cols[c..c + w].to_vec(),
             });
         }
+        let region = |(r, c, h, w): Rectangle| Region {
+            rows: rows[r..r + h].to_vec(),
+            columns: cols[c..c + w].to_vec(),
+        };
+        for (r, c, note) in &self.notes {
+            presentation
+                .cell_mut(omasheets_core::CellRef {
+                    sheet,
+                    row: rows[*r],
+                    column: cols[*c],
+                })
+                .note = note.clone();
+        }
+        if let Some((rect, col, text)) = &self.filter {
+            presentation.filter = Some(omasheets_core::presentation::Filter {
+                range: region(*rect),
+                column: cols[rect.1 + col],
+                text: text.clone(),
+                case_sensitive: false,
+                header: true,
+            });
+        }
+        for (rect, comparison, value, style) in &self.conditional {
+            presentation
+                .conditional
+                .push(omasheets_core::presentation::ConditionalRule {
+                    range: region(*rect),
+                    comparison: *comparison,
+                    value: *value,
+                    style: style.clone(),
+                });
+        }
+        for (i, (rect, title, kind)) in self.charts.iter().enumerate() {
+            presentation
+                .charts
+                .push(omasheets_core::presentation::Chart {
+                    id: format!("xlsx-chart-{i}"),
+                    title: title.clone(),
+                    kind: *kind,
+                    range: region(*rect),
+                });
+        }
+        presentation.canonicalize();
         presentation.validate(document, sheet).map_err(invalid)?;
         Ok(presentation)
     }
@@ -542,17 +595,6 @@ pub(crate) fn read(path: &Path) -> Result<ImportedPresentation, ServiceError> {
                         .get("showGridLines")
                         .is_some_and(|value| value == "0" || value == "false")
                 }
-                Some("conditionalFormatting") => {
-                    losses.insert("Conditional formatting rules are omitted on import.".into());
-                }
-                Some("autoFilter") => {
-                    losses.insert("Source filters are cleared on import.".into());
-                }
-                Some("drawing") | Some("legacyDrawing") => {
-                    losses.insert(
-                        "Charts, drawings, images and cell comments are omitted on import.".into(),
-                    );
-                }
                 _ => {}
             }
             if layout.cells.len() > 10000
@@ -564,6 +606,15 @@ pub(crate) fn read(path: &Path) -> Result<ImportedPresentation, ServiceError> {
             }
             Ok(())
         })?;
+        extras::read(
+            &mut archive,
+            (&path, &name),
+            &xml,
+            style_xml.as_deref(),
+            &mut layout,
+            &mut budget,
+            &mut losses,
+        )?;
         output.insert(name, layout);
     }
     losses.insert("Font families and default sheet dimensions use the native defaults; custom dimensions assume a 7-pixel maximum digit width.".into());
