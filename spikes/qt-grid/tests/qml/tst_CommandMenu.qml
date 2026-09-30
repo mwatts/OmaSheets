@@ -173,7 +173,12 @@ Item {
                 can_approve:true,truncated:false,unsupported_operations:[],diff:{conflicts:[]},
                 checks:[],cells:[{sheet:"Forecast",before:cell,after:cell}]});
             choose("review proposals");
+            const dialog=findChild(app,"proposalReviewDialog");
+            // onOpened sets initial focus; do not race it with Tab/PageDown.
+            tryCompare(dialog,"opened",true);
             const details=findChild(app,"proposalDetails");
+            tryVerify(() => details.contentItem.height>0
+                && details.contentItem.contentHeight>details.contentItem.height);
             let reached=false;
             for(let i=0;i<10;i++) {
                 keyClick(Qt.Key_Tab);
