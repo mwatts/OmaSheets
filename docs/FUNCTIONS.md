@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-114 function names listed below, grouped for reading.
+119 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -33,18 +33,38 @@ retain their bounded envelope; potential cycles within it are still refused. A m
 whose current A1 spelling cannot preserve those identities reports a projection
 refusal instead of exporting different references.
 
-Deliberately unsupported: `TODAY`, `NOW`, `RAND` and every other volatile
-function (until the calculation context consumes stored tick events), external workbook references,
-3D references, spilling array formulas, `INDIRECT`, `OFFSET`,
-`CELL`, add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`,
-and the 1904 date system. `TEXT` accepts only the locale-free codes listed
-with the text functions below.
+Deliberately unsupported: clock/random evaluation without an explicit tick,
+external workbook references, 3D references, spilling array formulas,
+dynamic `INDIRECT`/`OFFSET` arguments, `CELL`, add-in (`_xll.`) calls,
+locale-sensitive parsing such as `DATEVALUE`, and the 1904 date system.
+`TEXT` accepts only the locale-free codes listed with the text functions below.
 
 Approximate lookups (`VLOOKUP`/`HLOOKUP` without `FALSE`, `MATCH` types 1 and
 -1) binary-search sorted keys per Excel's documented contract; results over
 unsorted keys are undefined in Excel and are not promised here.
 
 ## Registry
+
+### Explicit tick and bounded references
+
+- `TODAY`
+- `NOW`
+- `RAND`
+- `OFFSET`
+- `INDIRECT`
+
+`TODAY`, `NOW` and `RAND` require a persisted `Tick` event before a formula
+can be installed. Use Commands → Data → Refresh date and random formulas
+to create or update that tick. Tick timestamps are UTC Unix milliseconds. Recalculation and
+reopen reuse that tick; a new explicit tick updates the values and dependents.
+RAND uses a fixed deterministic mixing algorithm with the tick, stable native
+cell identity and call order. It is not cryptographic randomness.
+
+`OFFSET` accepts bounded reference arguments with literal numeric offsets and
+sizes. `INDIRECT` accepts literal A1 text within this workbook. They compile to
+normal tracked references and retain native stable-ID behavior after edits.
+Dynamic text/offset expressions and R1C1 mode are explicitly refused pending a
+bounded dynamic-dependency design. External workbooks are never opened.
 
 ### Matrices and databases
 

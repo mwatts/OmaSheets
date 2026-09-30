@@ -303,6 +303,11 @@ enum BinaryOp {
 enum Function {
     /// Internal reference operator; deliberately absent from the function registry.
     ReferenceSpan,
+    Today,
+    Now,
+    Rand,
+    Offset,
+    Indirect,
     Transpose,
     MMult,
     DAverage,
@@ -713,6 +718,9 @@ pub struct Workbook {
     /// and `ROW()`/`COLUMN()`. Evaluation is sequential, so a plain cell is
     /// enough.
     evaluating: std::cell::Cell<CellId>,
+    tick: Option<(u64, i64)>,
+    random_keys: HashMap<CellId, u64>,
+    random_slot: std::cell::Cell<u64>,
 }
 
 impl Default for Workbook {
@@ -731,11 +739,39 @@ impl Default for Workbook {
             generation: 1,
             bulk: None,
             evaluating: std::cell::Cell::new(CellId::new(0, 0, 0)),
+            tick: None,
+            random_keys: HashMap::new(),
+            random_slot: std::cell::Cell::new(0),
         }
     }
 }
 
 impl Workbook {
+    /// Set an explicit persisted tick (UTC Unix milliseconds). Never reads time.
+    pub fn set_tick(&mut self, sequence: u64, unix_ms: i64) -> RecalcReport {
+        self.tick = Some((sequence, unix_ms));
+        let seeds: Vec<_> = self
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| match &c.input {
+                Input::Formula(e) if volatile_function(e).is_some() => Some(i),
+                _ => None,
+            })
+            .collect();
+        if let Some(pending) = &mut self.bulk {
+            pending.extend(seeds);
+            RecalcReport::default()
+        } else {
+            self.recalculate(&seeds)
+        }
+    }
+
+    /// Native callers derive this key from stable cell identity for snapshot replay.
+    pub fn set_random_key(&mut self, cell: CellId, key: u64) {
+        self.random_keys.insert(cell, key);
+    }
+
     pub fn define_sheet(&mut self, index: u32, name: impl Into<String>) {
         self.sheet_names.insert(name.into().to_lowercase(), index);
     }
@@ -819,6 +855,11 @@ impl Workbook {
         cell: CellId,
         formula: ParsedFormula,
     ) -> Result<RecalcReport, FormulaError> {
+        if self.tick.is_none() {
+            if let Some(name) = volatile_function(&formula.expression) {
+                return Err(FormulaError::UnsupportedFunction(name.into()));
+            }
+        }
         let parsed = reference::narrow_reference_dependencies(formula.expression);
         let mut cells = BTreeSet::new();
         let mut range_keys = Vec::new();
@@ -1350,6 +1391,7 @@ impl Workbook {
                 Input::Literal(value) => Some(value.clone()),
                 Input::Formula(expression) => {
                     self.evaluating.set(self.cells[cell_index].id);
+                    self.random_slot.set(0);
                     Some(match self.evaluate(expression) {
                         // A formula whose result is an empty reference shows 0.
                         Value::Blank => Value::Number(0.0),
@@ -1468,6 +1510,34 @@ impl Workbook {
     }
 
     fn evaluate_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
+        if matches!(function, Function::Today | Function::Now | Function::Rand) {
+            if !arguments.is_empty() {
+                return Value::Error(CalcError::InvalidArguments);
+            }
+            let Some((sequence, unix_ms)) = self.tick else {
+                return Value::Error(CalcError::NotAvailable);
+            };
+            if function == Function::Rand {
+                let cell = self.evaluating.get();
+                let key = self.random_keys.get(&cell).copied().unwrap_or_else(|| {
+                    mix64(u64::from(cell.sheet))
+                        ^ mix64(u64::from(cell.row))
+                        ^ u64::from(cell.column)
+                });
+                let slot = self.random_slot.get();
+                self.random_slot.set(slot.wrapping_add(1));
+                let bits = mix64(key ^ mix64(sequence) ^ mix64(unix_ms as u64) ^ mix64(slot));
+                return Value::Number((bits >> 11) as f64 / ((1_u64 << 53) as f64));
+            }
+            return match serial_date::from_unix_milliseconds(unix_ms) {
+                Ok(serial) => Value::Number(if function == Function::Today {
+                    serial.floor()
+                } else {
+                    serial
+                }),
+                Err(error) => Value::Error(error),
+            };
+        }
         if matches!(function, Function::Transpose | Function::MMult) {
             return match self.matrix_array(function, arguments) {
                 Ok(array) => array.values.into_iter().next().unwrap_or(Value::Blank),
@@ -1851,6 +1921,11 @@ impl Workbook {
             | Function::DMin
             | Function::DStDev
             | Function::ReferenceSpan
+            | Function::Today
+            | Function::Now
+            | Function::Rand
+            | Function::Offset
+            | Function::Indirect
             | Function::Hyperlink
             | Function::Rank
             | Function::Text
@@ -5099,6 +5174,51 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
                 _ => return Err(FormulaError::UnexpectedToken(self.offset)),
             }
         }
+        if function == Function::Offset {
+            return literal_offset(&arguments);
+        }
+        if function == Function::Indirect {
+            if !matches!(arguments.len(), 1 | 2) {
+                return Ok(Expr::Error(CalcError::InvalidArguments));
+            }
+            if arguments.get(1).is_some_and(|e| {
+                !matches!(e, Expr::Boolean(true) | Expr::Number(1.0) | Expr::Empty)
+            }) {
+                return Err(FormulaError::UnsupportedFunction(
+                    "INDIRECT requires A1 reference mode".into(),
+                ));
+            }
+            let Expr::Text(text) = &arguments[0] else {
+                return Err(FormulaError::UnsupportedFunction(
+                    "INDIRECT requires a literal same-workbook reference".into(),
+                ));
+            };
+            if text.contains('[') {
+                return Err(FormulaError::ExternalReference(text.clone()));
+            }
+            // A reference only, not arbitrary nested formulas or names from text.
+            let (sheet, reference) = if let Some((owner, r)) = text.rsplit_once('!') {
+                let owner = owner
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .unwrap_or(owner)
+                    .replace("''", "'");
+                (self.resolve_sheet(&owner)?, r)
+            } else {
+                (self.sheet, text.as_str())
+            };
+            let (first, last) = reference.split_once(':').unwrap_or((reference, reference));
+            return match (parse_a1(first, sheet), parse_a1(last, sheet)) {
+                (Ok(a), Ok(b)) => {
+                    if a == b {
+                        Ok(Expr::Reference(a))
+                    } else {
+                        expand_range(a, b)
+                    }
+                }
+                _ => Ok(Expr::Error(CalcError::InvalidReference)),
+            };
+        }
         Ok(Expr::Function(function, arguments))
     }
 
@@ -5130,7 +5250,73 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
 /// table is the single registry: `parse_function_name` and
 /// [`supported_function_names`] both read it, and a test keeps
 /// `docs/FUNCTIONS.md` in step with it so documented counts cannot drift.
+fn mix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+fn volatile_function<T>(e: &Expr<T>) -> Option<&'static str> {
+    match e {
+        Expr::Function(Function::Today, _) => Some("TODAY"),
+        Expr::Function(Function::Now, _) => Some("NOW"),
+        Expr::Function(Function::Rand, _) => Some("RAND"),
+        Expr::Function(_, args) => args.iter().find_map(volatile_function),
+        Expr::UnaryMinus(e) | Expr::Percent(e) => volatile_function(e),
+        Expr::Binary(_, a, b) => volatile_function(a).or_else(|| volatile_function(b)),
+        _ => None,
+    }
+}
+fn literal_integer(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Number(n) if n.is_finite() && n.abs() < 1.0e9 => Some(n.trunc() as i64),
+        Expr::UnaryMinus(e) => literal_integer(e).map(|n| -n),
+        Expr::Empty => Some(0),
+        _ => None,
+    }
+}
+fn literal_offset(args: &[Expr]) -> Result<Expr, FormulaError> {
+    if !(3..=5).contains(&args.len()) {
+        return Ok(Expr::Error(CalcError::InvalidArguments));
+    }
+    let Some((first, last)) = reference_bounds(&args[0]) else {
+        return Ok(Expr::Error(CalcError::InvalidReference));
+    };
+    let literal = |e: &Expr| {
+        literal_integer(e).ok_or_else(|| {
+            FormulaError::UnsupportedFunction(
+                "OFFSET requires literal offsets and dimensions".into(),
+            )
+        })
+    };
+    let row = i64::from(first.row) + literal(&args[1])?;
+    let col = i64::from(first.column) + literal(&args[2])?;
+    let h = match args.get(3) {
+        None | Some(Expr::Empty) => i64::from(last.row - first.row) + 1,
+        Some(e) => literal(e)?,
+    };
+    let w = match args.get(4) {
+        None | Some(Expr::Empty) => i64::from(last.column - first.column) + 1,
+        Some(e) => literal(e)?,
+    };
+    if row < 0 || col < 0 || h <= 0 || w <= 0 || row + h > 1_048_576 || col + w > 16_384 {
+        return Ok(Expr::Error(CalcError::InvalidReference));
+    }
+    let a = CellId::new(first.sheet, row as u32, col as u32);
+    let b = CellId::new(first.sheet, (row + h - 1) as u32, (col + w - 1) as u32);
+    if a == b {
+        Ok(Expr::Reference(a))
+    } else {
+        expand_range(a, b)
+    }
+}
+
 const FUNCTION_REGISTRY: &[(&str, Function)] = &[
+    ("TODAY", Function::Today),
+    ("NOW", Function::Now),
+    ("RAND", Function::Rand),
+    ("OFFSET", Function::Offset),
+    ("INDIRECT", Function::Indirect),
     ("TRANSPOSE", Function::Transpose),
     ("MMULT", Function::MMult),
     ("DAVERAGE", Function::DAverage),
@@ -5494,6 +5680,60 @@ fn join_reference_range(left: Expr, right: Expr) -> Result<Expr, FormulaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_ticks_recalculate_clock_random_and_dependents() {
+        let mut w = Workbook::default();
+        assert!(w.set_formula(cell(0, 0), "=RAND()").is_err());
+        w.set_tick(1, 43_200_000);
+        w.set_formula(cell(0, 0), "=TODAY()").unwrap();
+        w.set_formula(cell(0, 1), "=NOW()").unwrap();
+        w.set_formula(cell(0, 2), "=RAND()").unwrap();
+        w.set_formula(cell(0, 3), "=C1+1").unwrap();
+        assert_eq!(w.value(cell(0, 0)), Value::Number(25569.0));
+        assert_eq!(w.value(cell(0, 1)), Value::Number(25569.5));
+        let initial = w.value(cell(0, 2));
+        w.set_number(cell(5, 5), 1.0);
+        assert_eq!(initial, w.value(cell(0, 2)));
+        w.set_tick(1, 43_200_000);
+        assert_eq!(initial, w.value(cell(0, 2)));
+        w.set_tick(2, 86_400_000);
+        assert_ne!(initial, w.value(cell(0, 2)));
+        assert_eq!(w.value(cell(0, 0)), Value::Number(25570.0));
+        let Value::Number(random) = w.value(cell(0, 2)) else {
+            panic!("number")
+        };
+        assert!((0.0..1.0).contains(&random));
+        assert_eq!(w.value(cell(0, 3)), Value::Number(random + 1.0));
+    }
+
+    #[test]
+    fn literal_reference_functions_track_dependencies_and_refuse_dynamic_inputs() {
+        let mut w = Workbook::default();
+        w.set_number(cell(1, 0), 7.0);
+        w.set_number(cell(2, 0), 9.0);
+        w.set_formula(cell(0, 2), "=SUM(OFFSET(A1,1,0,2,1))")
+            .unwrap();
+        w.set_formula(cell(1, 2), "=SUM(INDIRECT(\"A2:A3\"))")
+            .unwrap();
+        assert_eq!(w.value(cell(0, 2)), Value::Number(16.0));
+        assert_eq!(w.value(cell(1, 2)), Value::Number(16.0));
+        w.set_number(cell(1, 0), 10.0);
+        assert_eq!(w.value(cell(0, 2)), Value::Number(19.0));
+        assert_eq!(w.value(cell(1, 2)), Value::Number(19.0));
+        assert!(w.set_formula(cell(1, 0), "=INDIRECT(\"C1\")").is_err());
+        assert!(w.set_formula(cell(0, 3), "=INDIRECT(A1)").is_err());
+        assert!(w.set_formula(cell(0, 3), "=OFFSET(A1,B1,0)").is_err());
+        assert!(
+            w.set_formula(cell(0, 3), "=INDIRECT(\"[1]Other!A1\")")
+                .is_err()
+        );
+        w.set_formula(cell(0, 3), "=OFFSET(A1,-1,0)").unwrap();
+        assert_eq!(
+            w.value(cell(0, 3)),
+            Value::Error(CalcError::InvalidReference)
+        );
+    }
 
     #[test]
     fn rank_missing_targets_and_total_investment_loss() {

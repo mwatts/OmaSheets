@@ -1459,16 +1459,16 @@ mod tests {
         assert_eq!(report.engine, ENGINE_NAME);
         assert_eq!(report.date_system, "1900");
         assert_eq!(report.formula_cells_observed, 6);
-        assert_eq!(report.formula_cells_loaded, 1);
-        assert_eq!(report.unsupported_formulas, 5);
+        assert_eq!(report.formula_cells_loaded, 2);
+        assert_eq!(report.unsupported_formulas, 4);
         assert_eq!(
             report.unsupported_functions,
-            BTreeMap::from([("TODAY".to_string(), 2), ("OFFSET".to_string(), 1)])
+            BTreeMap::from([("TODAY".to_string(), 2)])
         );
         assert_eq!(
             report.unsupported_reasons,
             BTreeMap::from([
-                ("unsupported_function".to_string(), 3),
+                ("unsupported_function".to_string(), 2),
                 ("syntax".to_string(), 1),
                 ("unknown_sheet".to_string(), 1),
             ])

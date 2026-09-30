@@ -1259,6 +1259,9 @@ impl Document {
         }
         let mut document = Self::empty(snapshot.document);
         document.calc.begin_bulk();
+        if let Some((sequence, at)) = snapshot.last_tick {
+            document.calc.set_tick(sequence, at);
+        }
         document.name = snapshot.name.clone();
         document.branch = snapshot.branch;
         document.head = snapshot.head;
@@ -1349,6 +1352,7 @@ impl Document {
             };
             let bound = document.bind_formula(reference, formula)?;
             let engine = document.engine_cell(reference).expect("checked");
+            document.calc.set_random_key(engine, random_key(reference));
             document.calc.set_parsed_formula(engine, bound)?;
             document.attach_dependencies(reference, formula);
         }
@@ -3089,6 +3093,7 @@ impl Document {
                     return Err(ApplyError::TickNotMonotonic);
                 }
                 self.last_tick = Some((*tick, *at));
+                self.calc.set_tick(*tick, *at);
             }
             Operation::Propose {
                 proposal,
@@ -3425,6 +3430,7 @@ impl Document {
         let engine = self.engine_cell(cell).expect("checked");
         let previous = self.cell(cell).cloned();
         self.detach_dependencies(cell);
+        self.calc.set_random_key(engine, random_key(cell));
         if let Err(error) = self.calc.set_parsed_formula(engine, bound) {
             if let Some(CellState {
                 input: CellInput::Formula { formula: earlier },
@@ -3450,6 +3456,11 @@ impl Document {
             );
         Ok(())
     }
+}
+
+fn random_key(cell: CellRef) -> u64 {
+    let digest = Sha256::digest(format!("{}:{}:{}", cell.sheet, cell.row, cell.column).as_bytes());
+    u64::from_le_bytes(digest[..8].try_into().expect("eight digest bytes"))
 }
 
 fn check_name(name: &str) -> Result<(), ApplyError> {
@@ -3645,6 +3656,45 @@ mod tests {
             let cell = self.document.resolve_a1(self.sheet, a1).unwrap();
             self.document.value(cell)
         }
+    }
+
+    #[test]
+    fn tick_formulas_replay_and_snapshot_after_structural_moves() {
+        let mut f = Fixture::new();
+        f.run(human(), Command::Tick { at: 43_200_000 });
+        f.formula("A1", "=NOW()");
+        f.formula("A2", "=RAND()");
+        f.formula("A3", "=A2+1");
+        let random = f.value("A2");
+        let sheet = f.sheet;
+        f.run(
+            human(),
+            Command::AddRows {
+                sheet,
+                count: 1,
+                at: 0,
+                table: None,
+            },
+        );
+        assert_eq!(f.value("A3"), random);
+        let snapshot = Document::from_snapshot(&f.document.snapshot()).unwrap();
+        assert_eq!(snapshot.digest(), f.document.digest());
+        assert_eq!(
+            Document::replay(&f.events).unwrap().digest(),
+            f.document.digest()
+        );
+        f.run(human(), Command::Tick { at: 86_400_000 });
+        assert_ne!(f.value("A3"), random);
+        assert_eq!(
+            Document::from_snapshot(&f.document.snapshot())
+                .unwrap()
+                .digest(),
+            f.document.digest()
+        );
+        assert_eq!(
+            Document::replay(&f.events).unwrap().digest(),
+            f.document.digest()
+        );
     }
 
     #[test]

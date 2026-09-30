@@ -111,6 +111,7 @@ pub enum Action {
         header: bool,
     },
     ClearFilter,
+    RefreshCalculation,
     Deduplicate {
         range: Rect,
         #[serde(default)]
@@ -256,8 +257,13 @@ pub fn edit(
     let mut structural = false;
     let mut selected_sheet = sheet.to_string();
     let mut message = "Saved locally — Ctrl+Z to undo".to_string();
+    let refresh = matches!(&action, Action::RefreshCalculation);
     let duplicate = matches!(&action, Action::DuplicateSheet { .. });
     match action {
+        Action::RefreshCalculation => {
+            commands.push(Command::Tick { at: now });
+            structural = true;
+        }
         Action::SetCells {
             row,
             column,
@@ -757,6 +763,9 @@ pub fn edit(
     if structural {
         undo.clear();
         message = "Saved locally. Structural changes start a new undo history.".into();
+    }
+    if refresh {
+        message="Calculation time refreshed. Date and random formulas use this saved UTC tick; undo history was reset.".into();
     }
     Ok(EditResult {
         selected_sheet,

@@ -428,6 +428,46 @@ fn undo_restores_formula_bindings_after_rows_move() {
 }
 
 #[test]
+fn explicit_refresh_enables_clock_formulas_and_survives_reopen() {
+    let mut f = Fixture::new();
+    let result = f.edit(json!({"action":"refresh_calculation"}));
+    assert_eq!(result["structural"], true);
+    assert_eq!(result["undo"], json!([]));
+    f.formula("A1", "=NOW()");
+    f.formula("A2", "=RAND()");
+    f.formula("A3", "=A2+1");
+    let before = f.cell("A2")["value"].clone();
+    let digest = f.call(json!({"kind":"document"}))["digest"].clone();
+    f.reopen();
+    assert_eq!(f.cell("A2")["value"], before);
+    assert_eq!(f.call(json!({"kind":"document"}))["digest"], digest);
+    f.edit(json!({"action":"refresh_calculation"}));
+    assert_ne!(f.cell("A2")["value"], before);
+    let rand = f.cell("A2")["value"]["value"].as_f64().unwrap();
+    assert_eq!(f.cell("A3")["value"]["value"], rand + 1.0);
+}
+
+#[test]
+fn literal_reference_functions_preserve_binding_after_sort_and_export() {
+    let mut f = Fixture::new();
+    f.number("A1", 30.0);
+    f.number("A2", 10.0);
+    f.number("A3", 20.0);
+    f.formula("C5", "=OFFSET(A1,1,0)");
+    f.formula("C6", "=INDIRECT(\"A2\")");
+    f.edit(json!({"action":"sort","range":range(0,0,3,1),"column":0,"header":false,"descending":false}));
+    assert_eq!(f.cell("C5")["value"]["value"], 10.0);
+    assert_eq!(f.cell("C6")["value"]["value"], 10.0);
+    f.reopen();
+    assert_eq!(f.cell("C5")["value"]["value"], 10.0);
+    let exported = f.path.with_extension("references.xlsx");
+    let manifest = f.call(json!({"kind":"export_xlsx","output":exported}));
+    // INDIRECT's fixed text cannot be rewritten after movement: disclose flattening.
+    assert!(manifest["formula_cells_flattened"].as_u64().unwrap() >= 1);
+    let _ = std::fs::remove_file(exported);
+}
+
+#[test]
 #[ignore = "requires Python with openpyxl; independent interchange gate"]
 fn independent_reader_roundtrips_notes_charts_filters_and_conditional_rules() {
     let mut f = Fixture::new();
