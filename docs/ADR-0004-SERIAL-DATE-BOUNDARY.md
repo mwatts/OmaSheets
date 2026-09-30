@@ -43,9 +43,9 @@ calendar rule to `omasheets_calc::serial_date`:
 - Date functions accept numbers and blanks only. Booleans and text are
   `#VALUE!`; no text-to-date parsing is attempted, because that parse is
   locale-sensitive and belongs to an explicit `DATEVALUE` decision.
-- `TODAY` and `NOW` remain unsupported functions. They will only enter the
-  engine once tick events exist, so reopening or recalculating a workbook can
-  never silently change a stored value.
+- `TODAY` and `NOW` now consume explicit, persisted UTC tick events through
+  the same serial-date boundary. They remain refused until a tick exists;
+  reopening or ordinary recalculation cannot silently advance that tick.
 - The XLSX importer keeps date-formatted cells as the raw serial the file
   stores and refuses workbooks that declare the 1904 date system with an
   explicit `UnsupportedDateSystem` error. Shifting those serials by 1462 days

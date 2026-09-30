@@ -19,9 +19,8 @@
 //! - only the 1900 date system is supported; 1904-epoch workbooks are
 //!   rejected explicitly by the importer rather than silently offset.
 //!
-//! Nothing here reads a clock. `TODAY` and `NOW` stay out of the engine until
-//! explicit tick-event semantics exist, because reopening a workbook must not
-//! silently change its values.
+//! Nothing here reads a clock. `TODAY` and `NOW` use an explicitly persisted
+//! UTC tick, so reopening a workbook never changes its values.
 
 use crate::CalcError;
 
@@ -409,6 +408,17 @@ fn civil_from_days(days: i64) -> CivilDate {
         month: month as u32,
         day: day as u32,
     }
+}
+
+/// Convert an explicitly supplied UTC timestamp to an Excel 1900 serial.
+/// The caller owns tick persistence and timezone policy.
+pub fn from_unix_milliseconds(unix_ms: i64) -> Result<f64, CalcError> {
+    let mut serial = UNIX_EPOCH_SERIAL as f64 + unix_ms as f64 / 86_400_000.0;
+    if serial < 61.0 {
+        serial -= 1.0;
+    }
+    serial_from_number(serial)?;
+    Ok(serial)
 }
 
 #[cfg(test)]
