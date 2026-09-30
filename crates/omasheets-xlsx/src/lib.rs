@@ -2103,7 +2103,7 @@ fn import_ranges_with_names(
     {
         // Before formulas are installed, so TODAY() and NOW() replay this
         // serial instead of staying #N/A. Does not read the system clock.
-        workbook.set_tick(at);
+        workbook.advance_tick(at);
     }
     let mut unsupported = Vec::new();
     let mut compiled_cells = Vec::with_capacity(observed_formulas);
@@ -4064,7 +4064,7 @@ mod tests {
         workbook.set_number(CellId::new(0, 5, 0), 36982.0);
         workbook.set_number(CellId::new(0, 5, 8), 0.05);
         let at = omasheets_calc::serial_date::unix_millis_from_serial(41885.0).unwrap();
-        workbook.set_tick(at);
+        workbook.advance_tick(at);
         workbook
             .set_formula(CellId::new(0, 5, 9), "1/(1+I6)^YEARFRAC(TODAY(),A6,1)")
             .unwrap();

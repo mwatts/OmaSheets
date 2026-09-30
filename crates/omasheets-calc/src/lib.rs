@@ -520,12 +520,7 @@ enum Function {
     Rank,
     Text,
     Rri,
-    Today,
-    Now,
-    Rand,
     RandBetween,
-    Offset,
-    Indirect,
     DateValue,
     Rows,
     Cell,
@@ -2250,34 +2245,6 @@ impl Workbook {
     }
 
     fn evaluate_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
-        if matches!(function, Function::Today | Function::Now | Function::Rand) {
-            if !arguments.is_empty() {
-                return Value::Error(CalcError::InvalidArguments);
-            }
-            let Some((sequence, unix_ms)) = self.tick else {
-                return Value::Error(CalcError::NotAvailable);
-            };
-            if function == Function::Rand {
-                let cell = self.evaluating.get();
-                let key = self.random_keys.get(&cell).copied().unwrap_or_else(|| {
-                    mix64(u64::from(cell.sheet))
-                        ^ mix64(u64::from(cell.row))
-                        ^ u64::from(cell.column)
-                });
-                let slot = self.random_slot.get();
-                self.random_slot.set(slot.wrapping_add(1));
-                let bits = mix64(key ^ mix64(sequence) ^ mix64(unix_ms as u64) ^ mix64(slot));
-                return Value::Number((bits >> 11) as f64 / ((1_u64 << 53) as f64));
-            }
-            return match serial_date::from_unix_milliseconds(unix_ms) {
-                Ok(serial) => Value::Number(if function == Function::Today {
-                    serial.floor()
-                } else {
-                    serial
-                }),
-                Err(error) => Value::Error(error),
-            };
-        }
         if matches!(
             function,
             Function::Transpose
@@ -2707,11 +2674,6 @@ impl Workbook {
             | Function::DMin
             | Function::DStDev
             | Function::ReferenceSpan
-            | Function::Today
-            | Function::Now
-            | Function::Rand
-            | Function::Offset
-            | Function::Indirect
             | Function::Hyperlink
             | Function::Rank
             | Function::Text
@@ -8362,71 +8324,16 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
     }
 }
 
-/// Every function name the parser accepts, with its implementation. This
-/// table is the single registry: `parse_function_name` and
-/// [`supported_function_names`] both read it, and a test keeps
-/// `docs/FUNCTIONS.md` in step with it so documented counts cannot drift.
 fn mix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e3779b97f4a7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
     value ^ (value >> 31)
 }
-fn volatile_function<T>(e: &Expr<T>) -> Option<&'static str> {
-    match e {
-        Expr::Function(Function::Today, _) => Some("TODAY"),
-        Expr::Function(Function::Now, _) => Some("NOW"),
-        Expr::Function(Function::Rand, _) => Some("RAND"),
-        Expr::Function(_, args) => args.iter().find_map(volatile_function),
-        Expr::UnaryMinus(e) | Expr::Percent(e) => volatile_function(e),
-        Expr::Binary(_, a, b) => volatile_function(a).or_else(|| volatile_function(b)),
-        _ => None,
-    }
-}
-fn literal_integer(e: &Expr) -> Option<i64> {
-    match e {
-        Expr::Number(n) if n.is_finite() && n.abs() < 1.0e9 => Some(n.trunc() as i64),
-        Expr::UnaryMinus(e) => literal_integer(e).map(|n| -n),
-        Expr::Empty => Some(0),
-        _ => None,
-    }
-}
-fn literal_offset(args: &[Expr]) -> Result<Expr, FormulaError> {
-    if !(3..=5).contains(&args.len()) {
-        return Ok(Expr::Error(CalcError::InvalidArguments));
-    }
-    let Some((first, last)) = reference_bounds(&args[0]) else {
-        return Ok(Expr::Error(CalcError::InvalidReference));
-    };
-    let literal = |e: &Expr| {
-        literal_integer(e).ok_or_else(|| {
-            FormulaError::UnsupportedFunction(
-                "OFFSET requires literal offsets and dimensions".into(),
-            )
-        })
-    };
-    let row = i64::from(first.row) + literal(&args[1])?;
-    let col = i64::from(first.column) + literal(&args[2])?;
-    let h = match args.get(3) {
-        None | Some(Expr::Empty) => i64::from(last.row - first.row) + 1,
-        Some(e) => literal(e)?,
-    };
-    let w = match args.get(4) {
-        None | Some(Expr::Empty) => i64::from(last.column - first.column) + 1,
-        Some(e) => literal(e)?,
-    };
-    if row < 0 || col < 0 || h <= 0 || w <= 0 || row + h > 1_048_576 || col + w > 16_384 {
-        return Ok(Expr::Error(CalcError::InvalidReference));
-    }
-    let a = CellId::new(first.sheet, row as u32, col as u32);
-    let b = CellId::new(first.sheet, (row + h - 1) as u32, (col + w - 1) as u32);
-    if a == b {
-        Ok(Expr::Reference(a))
-    } else {
-        expand_range(a, b)
-    }
-}
-
+/// Every function name the parser accepts, with its implementation. This
+/// table is the single registry: `parse_function_name` and
+/// [`supported_function_names`] both read it, and a test keeps
+/// `docs/FUNCTIONS.md` in step with it so documented counts cannot drift.
 const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("TODAY", Function::Today),
     ("NOW", Function::Now),
@@ -8552,12 +8459,7 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("REPT", Function::Rept),
     ("ROW", Function::Row),
     ("COLUMN", Function::Column),
-    ("TODAY", Function::Today),
-    ("NOW", Function::Now),
-    ("RAND", Function::Rand),
     ("RANDBETWEEN", Function::RandBetween),
-    ("OFFSET", Function::Offset),
-    ("INDIRECT", Function::Indirect),
     ("DATEVALUE", Function::DateValue),
     ("ROWS", Function::Rows),
     ("CELL", Function::Cell),
@@ -9211,7 +9113,8 @@ mod tests {
     #[test]
     fn explicit_ticks_recalculate_clock_random_and_dependents() {
         let mut w = Workbook::default();
-        assert!(w.set_formula(cell(0, 0), "=RAND()").is_err());
+        w.set_formula(cell(0, 0), "=RAND()").unwrap();
+        assert_eq!(w.value(cell(0, 0)), Value::Error(CalcError::NotAvailable));
         w.set_tick(1, 43_200_000);
         w.set_formula(cell(0, 0), "=TODAY()").unwrap();
         w.set_formula(cell(0, 1), "=NOW()").unwrap();
@@ -9235,7 +9138,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_reference_functions_track_dependencies_and_refuse_dynamic_inputs() {
+    fn literal_reference_functions_track_dependencies_and_dynamic_errors() {
         let mut w = Workbook::default();
         w.set_number(cell(1, 0), 7.0);
         w.set_number(cell(2, 0), 9.0);
@@ -9249,11 +9152,18 @@ mod tests {
         assert_eq!(w.value(cell(0, 2)), Value::Number(19.0));
         assert_eq!(w.value(cell(1, 2)), Value::Number(19.0));
         assert!(w.set_formula(cell(1, 0), "=INDIRECT(\"C1\")").is_err());
-        assert!(w.set_formula(cell(0, 3), "=INDIRECT(A1)").is_err());
-        assert!(w.set_formula(cell(0, 3), "=OFFSET(A1,B1,0)").is_err());
-        assert!(
-            w.set_formula(cell(0, 3), "=INDIRECT(\"[1]Other!A1\")")
-                .is_err()
+        w.set_formula(cell(0, 3), "=INDIRECT(A1)").unwrap();
+        assert_eq!(
+            w.value(cell(0, 3)),
+            Value::Error(CalcError::InvalidReference)
+        );
+        w.set_formula(cell(0, 3), "=OFFSET(A1,B1,0)").unwrap();
+        assert_eq!(w.value(cell(0, 3)), Value::Number(0.0));
+        w.set_formula(cell(0, 3), "=INDIRECT(\"[1]Other!A1\")")
+            .unwrap();
+        assert_eq!(
+            w.value(cell(0, 3)),
+            Value::Error(CalcError::InvalidReference)
         );
         w.set_formula(cell(0, 3), "=OFFSET(A1,-1,0)").unwrap();
         assert_eq!(
@@ -11424,7 +11334,7 @@ mod tests {
                 "{formula}"
             );
         }
-        workbook.set_tick(0);
+        workbook.advance_tick(0);
         workbook
             .set_formula(CellId::new(0, 1, 0), "=TODAY()")
             .unwrap();
