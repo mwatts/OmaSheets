@@ -51,10 +51,10 @@ sheet whose refresh failed still returns the cells the cache lists; a cell
 that sheet does not list is `#REF!`. An unknown sheet or link is `#REF!`.
 A missing cell inside an external range on a sheet that refreshed is blank.
 `TODAY`, `NOW`, `RAND` and `RANDBETWEEN` read the stored tick and never the
-system clock. With no tick they are `#N/A`. Import sets that tick from the
-cached numeric value of a `TODAY()` or `NOW()` cell, as a 1900 serial read
-in UTC, before formulas are installed. `NOW()` keeps the time fraction when
-the cache has one. A workbook with no such cached cell stays at no tick.
+system clock. Without a tick or a valid imported random cache they are `#N/A`.
+Import sets that tick from the cached numeric value of a `TODAY()` or `NOW()`
+cell, read in the workbook's date system and UTC before formulas are installed.
+`NOW()` keeps the time fraction when the cache has one. A workbook with no such cached cell stays at no tick.
 `OFFSET` with constant arguments
 is an ordinary range; a dynamic shift keeps that shift's rectangle as its
 dependency envelope. `INDIRECT` accepts one A1 reference or range, optionally
@@ -82,21 +82,6 @@ arguments see those names. A stored name may be written `_xlpm.name`.
 A repeated or cell-like name is `#NAME?`.
 
 ## Registry
-
-### Explicit tick and bounded references
-
-`TODAY`, `NOW` and `RAND` require a persisted `Tick` event before a formula
-can be installed. Use Commands → Data → Refresh date and random formulas
-to create or update that tick. Tick timestamps are UTC Unix milliseconds. Recalculation and
-reopen reuse that tick; a new explicit tick updates the values and dependents.
-RAND uses a fixed deterministic mixing algorithm with the tick, stable native
-cell identity and call order. It is not cryptographic randomness.
-
-`OFFSET` accepts bounded reference arguments with literal numeric offsets and
-sizes. `INDIRECT` accepts literal A1 text within this workbook. They compile to
-normal tracked references and retain native stable-ID behavior after edits.
-Dynamic text/offset expressions and R1C1 mode are explicitly refused pending a
-bounded dynamic-dependency design.
 
 ### Matrices and databases
 
@@ -282,7 +267,9 @@ is `#NUM!` and a non-numeric argument is `#VALUE!`. Import replays a cached
 bare `RAND()` when the cache is in that half-open interval, and a cached bare
 `RANDBETWEEN` when the cache is an integer. Formulas that read those cells
 then see Excel's saved draw. The next tick discards the saved draws. A new
-draw is deterministic in the tick number and the calling cell. Excel does not
+draw is deterministic in the stored tick, stable native cell identity and call
+order. Use Commands → Data → Refresh date and random formulas to record a
+new tick. The random generator is not cryptographic. Excel does not
 publish the seed of a saved workbook, so a fresh draw is not Excel's next
 number. `OFFSET` refuses a result outside the grid with `#REF!` and
 a height or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of A1 text, including text a formula produces and a whole

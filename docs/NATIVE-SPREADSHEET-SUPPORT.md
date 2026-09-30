@@ -62,13 +62,12 @@ The width calculation follows the [SpreadsheetML column specification](https://l
 
 ## Formula and editing boundaries
 
-The parser registry contains 132 function names, including TEXTJOIN, TEXT,
+The parser registry contains 133 function names, including TEXTJOIN, TEXT,
 HYPERLINK, RANK, PV, IRR, RRI, covariance and standard-normal distribution
-functions. Bounded array constants work in aggregates and lookups without
-spilling into neighbouring cells. The registry and [function list](FUNCTIONS.md)
+functions. Bounded array constants work in aggregates and lookups with bounded spill support. The registry and [function list](FUNCTIONS.md)
 are checked together. TODAY/NOW/RAND consume persisted UTC tick events; they
 never read a hidden clock or change on reopen. OFFSET and INDIRECT support
-literal, bounded references; dynamic arguments remain explicitly refused.
+bounded references, including dynamic arguments with tracked dependencies.
 See FUNCTIONS.md for exact limits.
 
 Formula history retains the original text. Editable views and XLSX export

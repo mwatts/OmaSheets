@@ -2215,7 +2215,7 @@ impl Workbook {
         }
         match self.evaluate_array(expression) {
             Ok(array) if array.values.len() == 1 => {
-                Bound::Scalar(array.values.into_iter().next().unwrap_or(Value::Blank))
+                Bound::Scalar(array.values.first().cloned().unwrap_or(Value::Blank))
             }
             Ok(array) => Bound::Grid(array),
             Err(error) => Bound::Scalar(Value::Error(error)),
@@ -9157,7 +9157,8 @@ mod tests {
     #[test]
     fn explicit_ticks_recalculate_clock_random_and_dependents() {
         let mut w = Workbook::default();
-        assert!(w.set_formula(cell(0, 0), "=RAND()").is_err());
+        w.set_formula(cell(0, 0), "=RAND()").unwrap();
+        assert_eq!(w.value(cell(0, 0)), Value::Error(CalcError::NotAvailable));
         w.set_tick(1, 43_200_000);
         w.set_formula(cell(0, 0), "=TODAY()").unwrap();
         w.set_formula(cell(0, 1), "=NOW()").unwrap();
@@ -9181,7 +9182,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_reference_functions_track_dependencies_and_refuse_dynamic_inputs() {
+    fn literal_reference_functions_track_dependencies_and_dynamic_errors() {
         let mut w = Workbook::default();
         w.set_number(cell(1, 0), 7.0);
         w.set_number(cell(2, 0), 9.0);
@@ -9195,11 +9196,18 @@ mod tests {
         assert_eq!(w.value(cell(0, 2)), Value::Number(19.0));
         assert_eq!(w.value(cell(1, 2)), Value::Number(19.0));
         assert!(w.set_formula(cell(1, 0), "=INDIRECT(\"C1\")").is_err());
-        assert!(w.set_formula(cell(0, 3), "=INDIRECT(A1)").is_err());
-        assert!(w.set_formula(cell(0, 3), "=OFFSET(A1,B1,0)").is_err());
-        assert!(
-            w.set_formula(cell(0, 3), "=INDIRECT(\"[1]Other!A1\")")
-                .is_err()
+        w.set_formula(cell(0, 3), "=INDIRECT(A1)").unwrap();
+        assert_eq!(
+            w.value(cell(0, 3)),
+            Value::Error(CalcError::InvalidReference)
+        );
+        w.set_formula(cell(0, 3), "=OFFSET(A1,B1,0)").unwrap();
+        assert_eq!(w.value(cell(0, 3)), Value::Number(0.0));
+        w.set_formula(cell(0, 3), "=INDIRECT(\"[1]Other!A1\")")
+            .unwrap();
+        assert_eq!(
+            w.value(cell(0, 3)),
+            Value::Error(CalcError::InvalidReference)
         );
         w.set_formula(cell(0, 3), "=OFFSET(A1,-1,0)").unwrap();
         assert_eq!(

@@ -934,12 +934,7 @@ impl Workbook {
                     SpillPreview::Array(array)
                 }
                 Ok(array) => SpillPreview::Scalar(
-                    array
-                        .values
-                        .iter()
-                        .cloned()
-                        .next()
-                        .unwrap_or(Value::Blank),
+                    array.values.iter().cloned().next().unwrap_or(Value::Blank),
                 ),
                 Err(error) => SpillPreview::Scalar(Value::Error(error)),
             },
