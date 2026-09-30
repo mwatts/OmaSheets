@@ -1900,12 +1900,12 @@ impl Workbook {
             false
         };
         let mut rank = 1_usize;
-        let mut saw_number = false;
+        let mut found_target = false;
         for value in &values {
             let Value::Number(candidate) = value else {
                 continue;
             };
-            saw_number = true;
+            found_target |= compare_numbers(*candidate, target) == std::cmp::Ordering::Equal;
             let ahead = match compare_numbers(*candidate, target) {
                 std::cmp::Ordering::Greater => !ascending,
                 std::cmp::Ordering::Less => ascending,
@@ -1915,7 +1915,7 @@ impl Workbook {
                 rank += 1;
             }
         }
-        if saw_number {
+        if found_target {
             Value::Number(rank as f64)
         } else {
             Value::Error(CalcError::NotAvailable)
@@ -4234,7 +4234,7 @@ fn equivalent_interest_rate(periods: f64, present: f64, future: f64) -> Result<f
         return Err(CalcError::InvalidNumber);
     }
     let ratio = future / present;
-    if ratio <= 0.0 || !ratio.is_finite() {
+    if ratio < 0.0 || !ratio.is_finite() {
         return Err(CalcError::InvalidNumber);
     }
     let rate = ratio.powf(1.0 / periods) - 1.0;
@@ -5494,6 +5494,27 @@ fn join_reference_range(left: Expr, right: Expr) -> Result<Expr, FormulaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_missing_targets_and_total_investment_loss() {
+        let mut workbook = Workbook::default();
+        for (row, formula) in [
+            "=RANK(15,{10,20,30})",
+            "=RANK(40,{10,20,30},1)",
+            "=RANK(5,{10,20,30},1)",
+        ]
+        .iter()
+        .enumerate()
+        {
+            workbook.set_formula(cell(row as u32, 0), formula).unwrap();
+            assert_eq!(
+                workbook.value(cell(row as u32, 0)),
+                Value::Error(CalcError::NotAvailable)
+            );
+        }
+        workbook.set_formula(cell(3, 0), "=RRI(10,100,0)").unwrap();
+        assert_eq!(workbook.value(cell(3, 0)), Value::Number(-1.0));
+    }
 
     #[test]
     fn deleted_and_qualified_range_endpoints_follow_reference_semantics() {
@@ -7203,8 +7224,12 @@ mod tests {
             (24, "=RANK(20,A1:A7)", Value::Number(3.0)),
             (25, "=RANK(10,A1:A7,0)", Value::Number(4.0)),
             (26, "=RANK(10,A1:A7,1)", Value::Number(1.0)),
-            (27, "=RANK(0,A1:A7)", Value::Number(5.0)),
-            (28, "=RANK(2,{10,20,30})", Value::Number(4.0)),
+            (27, "=RANK(0,A1:A7)", Value::Error(CalcError::NotAvailable)),
+            (
+                28,
+                "=RANK(2,{10,20,30})",
+                Value::Error(CalcError::NotAvailable),
+            ),
             (29, "=RANK(0.3,A9:A10)", Value::Number(1.0)),
             (
                 30,
