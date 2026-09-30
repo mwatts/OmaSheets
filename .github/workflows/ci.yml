@@ -83,6 +83,8 @@ jobs:
       - name: Build and test the isolated corpus scorer
         run: |
           cargo test --workspace --locked --release
+          python -m pip install --disable-pip-version-check openpyxl==3.1.5
+          cargo test -p omasheets-service --locked --release --test native_controls independent_reader -- --ignored
           cargo build --locked --release -p omasheets-corpus
           cargo build --locked --release -p omasheets-calc --bin omasheets-calc-bench
           cargo build --locked --release -p omasheets-xlsx --bin omasheets-xlsx-score

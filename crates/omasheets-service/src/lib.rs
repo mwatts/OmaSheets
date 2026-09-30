@@ -1183,7 +1183,9 @@ fn export_xlsx(
             cell_styles.insert((sheet.id, entry.row, entry.column), id);
         }
     }
-    let styles_xml = interchange::export_styles(&styles)?;
+    let extras = interchange::extras::export(document)?;
+    let styles_xml = interchange::export_styles(&styles)?
+        .replace("</styleSheet>", &format!("{}</styleSheet>", extras.dxfs));
 
     let parent = output.parent().expect("canonical output has a parent");
     let file_name = output
@@ -1219,6 +1221,9 @@ fn export_xlsx(
         let mut writer = zip::ZipWriter::new(file);
         start_xlsx_file(&mut writer, "[Content_Types].xml")?;
         write!(writer, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>").map_err(export_io_error)?;
+        writer
+            .write_all(extras.content_types.as_bytes())
+            .map_err(export_io_error)?;
         for index in 1..=sheets.len() {
             write!(writer, "<Override PartName=\"/xl/worksheets/sheet{index}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>").map_err(export_io_error)?;
         }
@@ -1254,13 +1259,19 @@ fn export_xlsx(
         writer
             .write_all(styles_xml.as_bytes())
             .map_err(export_io_error)?;
+        for (name, content) in &extras.parts {
+            start_xlsx_file(&mut writer, name)?;
+            writer
+                .write_all(content.as_bytes())
+                .map_err(export_io_error)?;
+        }
         let mut stats = XlsxExportStats::default();
         for (sheet_index, sheet_manifest) in sheets.iter().enumerate() {
             start_xlsx_file(
                 &mut writer,
                 &format!("xl/worksheets/sheet{}.xml", sheet_index + 1),
             )?;
-            writer.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">").map_err(export_io_error)?;
+            writer.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">").map_err(export_io_error)?;
             let presentation = document
                 .presentation(sheet_manifest.id)
                 .expect("known sheet");
@@ -1308,15 +1319,21 @@ fn export_xlsx(
             let columns = document.columns(sheet_manifest.id).unwrap_or(&[]);
             for (row_index, row) in rows.iter().enumerate() {
                 let height = presentation.row_heights.get(row);
-                let mut row_open = height.is_some();
+                let hidden = extras.hidden_rows[sheet_index].contains(&row_index);
+                let mut row_open = height.is_some() || hidden;
                 if let Some(height) = height {
                     write!(
                         writer,
-                        "<row r=\"{}\" ht=\"{}\" customHeight=\"1\">",
+                        "<row r=\"{}\" ht=\"{}\" customHeight=\"1\" hidden=\"{}\">",
                         row_index + 1,
-                        height * 72.0 / 96.0
+                        height * 72.0 / 96.0,
+                        u8::from(hidden)
                     )
                     .map_err(export_io_error)?;
+                }
+                if height.is_none() && hidden {
+                    write!(writer, "<row r=\"{}\" hidden=\"1\">", row_index + 1)
+                        .map_err(export_io_error)?;
                 }
                 for (column_index, column) in columns.iter().enumerate() {
                     let cell = CellRef {
@@ -1363,6 +1380,9 @@ fn export_xlsx(
                 }
             }
             writer.write_all(b"</sheetData>").map_err(export_io_error)?;
+            writer
+                .write_all(extras.filters[sheet_index].as_bytes())
+                .map_err(export_io_error)?;
             if !presentation.merges.is_empty() {
                 write!(
                     writer,
@@ -1392,6 +1412,9 @@ fn export_xlsx(
                     .write_all(b"</mergeCells>")
                     .map_err(export_io_error)?;
             }
+            writer
+                .write_all(extras.suffixes[sheet_index].as_bytes())
+                .map_err(export_io_error)?;
             writer.write_all(b"</worksheet>").map_err(export_io_error)?;
         }
         let file = writer.finish().map_err(xlsx_error)?;
@@ -2439,7 +2462,7 @@ impl Service {
                     formula_cells_preserved: stats.formula_cells_preserved,
                     formula_cells_flattened: stats.formula_cells_flattened,
                     limitations: vec![
-                        "Cell notes, chart definitions, conditional formatting rules and filter criteria are omitted; all rows are exported.".into(),
+                        "Notes use the OmaSheets author; chart layout uses native defaults. Case-sensitive or headerless filter criteria are exported as row visibility only.".into(),
                         "tables_checks_watches_lineage_and_branch_history_omitted".into(),
                         "Formulas whose stable bindings cannot be expressed as a current A1 rectangle are exported as calculated values.".into(),
                         "Dates use the 1900 serial system; saved number formats are preserved. Font families use Calibri and border colours use automatic colour.".into(),

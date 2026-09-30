@@ -71,7 +71,7 @@ def main() -> None:
                 return call(kind, path=str(native), **arguments)
 
             imported = call("import_xlsx", source=str(source), output=str(native), actor=actor, name=None)
-            assert any("comments" in item for item in imported["limitations"])
+            assert any("author identity" in item for item in imported["limitations"])
             assert hashlib.sha256(source.read_bytes()).hexdigest() == original
             sheet = doc("document")["sheets"][0]["id"]
             assert doc("cell", sheet=sheet, a1="D3")["value"]["value"] == 25
@@ -94,6 +94,9 @@ def main() -> None:
             assert manifest["formula_cells_flattened"] == 0
             independent = load_workbook(exported)
             actual = independent["Plan"]
+            assert actual["B4"].comment.text == "Check this estimate"
+            assert len(actual._charts) == 1
+            assert actual._charts[0].ser[0].val.numRef.f == "'Plan'!B3:B4"
             assert actual["D3"].value == "=B3-C3"
             assert actual["B3"].number_format == "£#,##0.00"
             assert actual["A2"].font.bold and actual["A2"].font.sz == 12
