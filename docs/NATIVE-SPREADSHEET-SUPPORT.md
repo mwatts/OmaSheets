@@ -45,9 +45,15 @@ number-format strings use General in the grid and are preserved for XLSX.
 
 Import reports losses for theme/indexed colours, unsupported border layouts,
 font effects, row/column default styles, hidden rows/columns, split panes,
-source filters, comments and conditional formatting. Font families and default
-sheet dimensions use native defaults. Export reports omitted notes, chart
-definitions, conditional rules, filters, native checks, watches and history.
+unsupported filter and conditional-format rules, and unsupported charts/drawings.
+Plain comment text becomes native notes; authors and rich text are disclosed losses.
+One-column text-contains filters, numeric greater/less/equal highlights and bounded
+bar/line/pie charts with adjacent same-sheet data are imported and exported. Font families and default
+sheet dimensions use native defaults. Export preserves notes, native bar/line/pie charts, numeric conditional rules
+and case-insensitive filters with headers. Case-sensitive or headerless filters
+preserve row visibility with a disclosed criteria loss. Charts use default layout;
+notes use the OmaSheets author. Export still reports omitted native checks, watches
+and history.
 LibreOfficeKit remains the compatibility path for complex workbooks, legacy
 XLS and read-only XLSM. Conversion never overwrites an existing destination or
 changes the source file.
