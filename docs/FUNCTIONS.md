@@ -212,4 +212,5 @@ the fictitious 1900-02-29.
 `HYPERLINK` returns its friendly name, or the link when the name is omitted,
 and does not fetch the target. `RANK` is a competition rank over numbers in
 the reference (ties share a rank and the next rank is skipped); a zero or
-omitted order ranks the largest first. `RRI` is `(fv/pv)^(1/nper)-1`.
+omitted order ranks the largest first. An absent target returns `#N/A`.
+`RRI` is `(fv/pv)^(1/nper)-1`; a zero future value returns -1 (total loss).
