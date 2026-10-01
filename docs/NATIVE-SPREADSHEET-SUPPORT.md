@@ -62,12 +62,14 @@ The width calculation follows the [SpreadsheetML column specification](https://l
 
 ## Formula and editing boundaries
 
-The parser registry contains 119 function names, including TEXTJOIN, TEXT,
-HYPERLINK, RANK, PV, IRR, RRI, covariance and standard-normal distribution
-functions. Bounded array constants work in aggregates and lookups without
-spilling into neighbouring cells. The registry and [function list](FUNCTIONS.md)
-are checked together. TODAY/NOW/RAND consume persisted UTC tick events; they
-never read a hidden clock or change on reopen. OFFSET and INDIRECT support
+The parser registry contains 120 function names, including TEXTJOIN, TEXT,
+HYPERLINK, RANK, RANDBETWEEN, PV, IRR, RRI, covariance and standard-normal
+distribution functions. Bounded array constants work in aggregates and lookups
+without spilling into neighbouring cells. The registry and [function list](FUNCTIONS.md)
+are checked together. TODAY/NOW/RAND/RANDBETWEEN consume persisted UTC tick
+events; they never read a hidden clock or change on reopen. An imported bare
+RAND or RANDBETWEEN replays its cached draw until the next tick. OFFSET and
+INDIRECT support
 literal, bounded references; dynamic arguments remain explicitly refused.
 See FUNCTIONS.md for exact limits.
 

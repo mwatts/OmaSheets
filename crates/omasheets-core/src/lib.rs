@@ -17,6 +17,7 @@ mod formula_projection;
 pub mod presentation;
 pub use presentation::SheetPresentation;
 
+use omasheets_calc::serial_date::DateSystem;
 use omasheets_calc::{
     CalcError, CellId, FormulaError, ParsedFormula, ReferenceGroup, StructuredColumn,
     StructuredContext, StructuredTable, Value, Workbook,
@@ -495,6 +496,13 @@ pub enum Operation {
         import: ImportId,
         source_sha256: String,
         format: String,
+        /// `"1900"` or `"1904"`. Absent events are the 1900 system, so existing
+        /// import event ids stay valid.
+        #[serde(
+            default = "default_date_system",
+            skip_serializing_if = "is_default_date_system"
+        )]
+        date_system: String,
     },
     /// An explicit clock tick. Nothing in the core reads wall-clock time.
     Tick {
@@ -912,6 +920,12 @@ pub enum Command {
     Import {
         source_sha256: String,
         format: String,
+        /// `"1900"` or `"1904"`. Omitted commands use the 1900 system.
+        #[serde(
+            default = "default_date_system",
+            skip_serializing_if = "is_default_date_system"
+        )]
+        date_system: String,
     },
     Tick {
         at: i64,
@@ -1037,7 +1051,21 @@ pub struct Table {
 pub struct ImportRecord {
     pub source_sha256: String,
     pub format: String,
+    /// `"1900"` or `"1904"`. Absent records are the 1900 system.
+    #[serde(
+        default = "default_date_system",
+        skip_serializing_if = "is_default_date_system"
+    )]
+    pub date_system: String,
     pub provenance: Provenance,
+}
+
+fn default_date_system() -> String {
+    "1900".into()
+}
+
+fn is_default_date_system(value: &String) -> bool {
+    value == "1900"
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1258,6 +1286,11 @@ impl Document {
             return Err(ApplyError::UnsupportedSchema(snapshot.schema));
         }
         let mut document = Self::empty(snapshot.document);
+        for record in snapshot.imports.values() {
+            if let Some(system) = DateSystem::parse(&record.date_system) {
+                document.calc.set_date_system(system);
+            }
+        }
         document.calc.begin_bulk();
         if let Some((sequence, at)) = snapshot.last_tick {
             document.calc.set_tick(sequence, at);
@@ -1652,6 +1685,11 @@ impl Document {
         Some(format!("{}{}", column_letters(column), row + 1))
     }
 
+    /// Workbook epoch used by date formulas. `"1900"` when no import says otherwise.
+    pub fn date_system(&self) -> DateSystem {
+        self.calc.date_system()
+    }
+
     /// Canonical projection of the whole state.
     pub fn snapshot(&self) -> Snapshot {
         let sheets = self
@@ -1865,10 +1903,12 @@ impl Document {
             Command::Import {
                 source_sha256,
                 format,
+                date_system,
             } => Operation::Import {
                 import: ImportId::derive(&seed, 0),
                 source_sha256,
                 format,
+                date_system,
             },
             Command::Tick { at } => Operation::Tick {
                 tick: self.last_tick.map_or(1, |(tick, _)| tick + 1),
@@ -3072,17 +3112,21 @@ impl Document {
                 import,
                 source_sha256,
                 format,
+                date_system,
             } => {
                 self.check_fresh(import.0)?;
                 if decode_hex(source_sha256, 32).is_none() || format.is_empty() {
                     return Err(ApplyError::InvalidValue);
                 }
                 check_name(format)?;
+                let system = DateSystem::parse(date_system).ok_or(ApplyError::InvalidValue)?;
+                self.calc.set_date_system(system);
                 self.imports.insert(
                     *import,
                     ImportRecord {
                         source_sha256: source_sha256.clone(),
                         format: format.clone(),
+                        date_system: date_system.clone(),
                         provenance,
                     },
                 );
@@ -3545,6 +3589,7 @@ pub fn column_letters(mut column: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omasheets_calc::serial_date::DateSystem;
 
     fn human() -> Actor {
         Actor::new(ActorKind::Human, "tom")
@@ -3986,6 +4031,62 @@ mod tests {
     }
 
     #[test]
+    fn a_1900_import_omits_the_date_system_so_older_events_still_verify() {
+        let mut fixture = Fixture::new();
+        let event = fixture.run(
+            Actor::new(ActorKind::Import, "xlsx"),
+            Command::Import {
+                source_sha256: "a".repeat(64),
+                format: "xlsx".into(),
+                date_system: "1900".into(),
+            },
+        );
+        let json = serde_json::to_value(&event.operation).unwrap();
+        assert!(json.get("date_system").is_none());
+        let decoded: Operation = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, event.operation);
+        assert!(event.verify());
+    }
+
+    #[test]
+    fn an_import_can_select_the_1904_date_system_and_replay_keeps_it() {
+        let mut fixture = Fixture::new();
+        let sheet = fixture.sheet;
+        fixture.run(
+            Actor::new(ActorKind::Import, "xlsx"),
+            Command::Import {
+                source_sha256: "b".repeat(64),
+                format: "xlsx".into(),
+                date_system: "1904".into(),
+            },
+        );
+        assert_eq!(fixture.document.date_system(), DateSystem::Excel1904);
+        fixture.run(
+            human(),
+            Command::SetFormula {
+                sheet,
+                a1: "A1".into(),
+                source: "=DATE(1904,1,1)".into(),
+            },
+        );
+        assert_eq!(fixture.value("A1"), CellValue::Number(0.0));
+        let replayed = Document::replay(&fixture.events).unwrap();
+        assert_eq!(replayed.digest(), fixture.document.digest());
+        assert_eq!(replayed.date_system(), DateSystem::Excel1904);
+        assert_eq!(
+            fixture.fail(
+                Actor::new(ActorKind::Import, "xlsx"),
+                Command::Import {
+                    source_sha256: "c".repeat(64),
+                    format: "xlsx".into(),
+                    date_system: "1899".into(),
+                },
+            ),
+            ApplyError::InvalidValue
+        );
+    }
+
+    #[test]
     fn actors_ticks_imports_and_proposals_are_attributed() {
         let mut fixture = Fixture::new();
         let sheet = fixture.sheet;
@@ -3994,6 +4095,7 @@ mod tests {
             Command::Import {
                 source_sha256: "a".repeat(64),
                 format: "xlsx".into(),
+                date_system: "1900".into(),
             },
         );
         fixture.run(

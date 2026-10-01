@@ -16,20 +16,80 @@
 //!   behind the real calendar and serials `>= 61` are aligned with it;
 //! - serials below `0` or above `2_958_465` (9999-12-31) are `#NUM!` errors,
 //!   surfaced as [`CalcError::InvalidNumber`];
-//! - only the 1900 date system is supported; 1904-epoch workbooks are
-//!   rejected explicitly by the importer rather than silently offset.
+//! - a workbook is either the 1900 system or the 1904 system. The 1904
+//!   system has no fictitious 1900-02-29: serial `0` is 1904-01-01, which is
+//!   1900-system serial 1462. Import stores the file's own serials.
 //!
 //! Nothing here reads a clock. `TODAY` and `NOW` use an explicitly persisted
 //! UTC tick, so reopening a workbook never changes its values.
 
 use crate::CalcError;
 
-/// Name of the only date system the owned engine evaluates.
+/// Name of the 1900 date system. A workbook may instead use `"1904"`.
 pub const DATE_SYSTEM: &str = "1900";
 /// Excel's "1900-01-00".
 pub const MIN_SERIAL: i64 = 0;
 /// 9999-12-31 in the 1900 date system.
 pub const MAX_SERIAL: i64 = 2_958_465;
+/// Days from 1900-system serial 0 to 1904-01-01. Not applied at import.
+pub const EPOCH_SHIFT_1904: i64 = 1_462;
+/// 9999-12-31 in the 1904 date system.
+pub const MAX_SERIAL_1904: i64 = MAX_SERIAL - EPOCH_SHIFT_1904;
+
+/// Which Excel epoch a workbook uses. Serials are stored unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DateSystem {
+    #[default]
+    Excel1900,
+    Excel1904,
+}
+
+impl DateSystem {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Excel1900 => "1900",
+            Self::Excel1904 => "1904",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "1900" => Some(Self::Excel1900),
+            "1904" => Some(Self::Excel1904),
+            _ => None,
+        }
+    }
+
+    pub const fn max_serial(self) -> i64 {
+        match self {
+            Self::Excel1900 => MAX_SERIAL,
+            Self::Excel1904 => MAX_SERIAL_1904,
+        }
+    }
+
+    fn to_1900(self, serial: i64) -> Result<i64, CalcError> {
+        if !(MIN_SERIAL..=self.max_serial()).contains(&serial) {
+            return Err(CalcError::InvalidNumber);
+        }
+        match self {
+            Self::Excel1900 => Ok(serial),
+            Self::Excel1904 => Ok(serial + EPOCH_SHIFT_1904),
+        }
+    }
+
+    fn native_from_1900(self, serial: i64) -> Result<i64, CalcError> {
+        let serial = match self {
+            Self::Excel1900 => serial,
+            Self::Excel1904 => serial - EPOCH_SHIFT_1904,
+        };
+        if (MIN_SERIAL..=self.max_serial()).contains(&serial) {
+            Ok(serial)
+        } else {
+            Err(CalcError::InvalidNumber)
+        }
+    }
+}
+
 /// The fictitious 1900-02-29.
 pub const LEAP_BUG_SERIAL: i64 = 60;
 /// 1970-01-01 in the 1900 date system.
@@ -410,6 +470,180 @@ fn civil_from_days(days: i64) -> CivilDate {
     }
 }
 
+pub fn serial_from_number_in(system: DateSystem, value: f64) -> Result<i64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return serial_from_number(value);
+    }
+    let maximum = system.max_serial();
+    if !value.is_finite() || value < MIN_SERIAL as f64 || value >= (maximum + 1) as f64 {
+        return Err(CalcError::InvalidNumber);
+    }
+    Ok(value.trunc() as i64)
+}
+
+pub fn civil_from_serial_in(system: DateSystem, serial: i64) -> Result<CivilDate, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return civil_from_serial(serial);
+    }
+    civil_from_serial(system.to_1900(serial)?)
+}
+
+pub fn serial_from_civil_in(
+    system: DateSystem,
+    year: i64,
+    month: i64,
+    day: i64,
+) -> Result<i64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return serial_from_civil(year, month, day);
+    }
+    system.native_from_1900(serial_from_civil(year, month, day)?)
+}
+
+pub fn date_serial_in(
+    system: DateSystem,
+    year: f64,
+    month: f64,
+    day: f64,
+) -> Result<i64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return date_serial(year, month, day);
+    }
+    let year = component(year)?;
+    let month = component(month)?;
+    let day = component(day)?;
+    let year = match year {
+        0..=1899 => year + 1900,
+        1900..=9999 => year,
+        _ => return Err(CalcError::InvalidNumber),
+    };
+    serial_from_civil_in(system, year, month, day)
+}
+
+pub fn add_months_in(system: DateSystem, serial: i64, months: i64) -> Result<i64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return add_months(serial, months);
+    }
+    system.native_from_1900(add_months(system.to_1900(serial)?, months)?)
+}
+
+pub fn end_of_month_in(system: DateSystem, serial: i64, months: i64) -> Result<i64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return end_of_month(serial, months);
+    }
+    system.native_from_1900(end_of_month(system.to_1900(serial)?, months)?)
+}
+
+pub fn weekday_in(system: DateSystem, serial: i64, return_type: i64) -> Result<i64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return weekday(serial, return_type);
+    }
+    weekday(system.to_1900(serial)?, return_type)
+}
+
+pub fn year_fraction_in(
+    system: DateSystem,
+    start: i64,
+    end: i64,
+    basis: i64,
+) -> Result<f64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return year_fraction(start, end, basis);
+    }
+    year_fraction(system.to_1900(start)?, system.to_1900(end)?, basis)
+}
+
+pub fn days_360_in(
+    system: DateSystem,
+    start: i64,
+    end: i64,
+    european: bool,
+) -> Result<i64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return days_360(start, end, european);
+    }
+    days_360(system.to_1900(start)?, system.to_1900(end)?, european)
+}
+
+fn is_weekend_in(system: DateSystem, serial: i64) -> bool {
+    let serial = match system {
+        DateSystem::Excel1900 => serial,
+        DateSystem::Excel1904 => serial + EPOCH_SHIFT_1904,
+    };
+    is_weekend(serial)
+}
+
+pub fn network_days_in(
+    system: DateSystem,
+    start: i64,
+    end: i64,
+    holidays: &std::collections::HashSet<i64>,
+) -> i64 {
+    if system == DateSystem::Excel1900 {
+        return network_days(start, end, holidays);
+    }
+    let (low, high, sign) = if start <= end {
+        (start, end, 1)
+    } else {
+        (end, start, -1)
+    };
+    let span = high - low + 1;
+    let full_weeks = span / 7;
+    let mut count = full_weeks * 5;
+    for serial in low + full_weeks * 7..=high {
+        if !is_weekend_in(system, serial) {
+            count += 1;
+        }
+    }
+    let excluded = holidays
+        .iter()
+        .filter(|holiday| (low..=high).contains(holiday) && !is_weekend_in(system, **holiday))
+        .count() as i64;
+    sign * (count - excluded)
+}
+
+pub fn work_day_in(
+    system: DateSystem,
+    start: i64,
+    days: i64,
+    holidays: &std::collections::HashSet<i64>,
+) -> Result<i64, CalcError> {
+    if system == DateSystem::Excel1900 {
+        return work_day(start, days, holidays);
+    }
+    if days.abs() > 1_000_000 {
+        return Err(CalcError::InvalidNumber);
+    }
+    let step = days.signum();
+    let mut remaining = days.abs();
+    let mut serial = start;
+    let maximum = system.max_serial();
+    while remaining > 0 {
+        serial += step;
+        if !(MIN_SERIAL..=maximum).contains(&serial) {
+            return Err(CalcError::InvalidNumber);
+        }
+        if !is_weekend_in(system, serial) && !holidays.contains(&serial) {
+            remaining -= 1;
+        }
+    }
+    Ok(serial)
+}
+
+/// Excel serial for a UTC instant in the workbook's date system, including
+/// the time-of-day fraction. The 1900 path is [`from_unix_milliseconds`].
+pub fn serial_from_unix_millis_in(system: DateSystem, millis: i64) -> Result<f64, CalcError> {
+    let serial = from_unix_milliseconds(millis)?;
+    match system {
+        DateSystem::Excel1900 => Ok(serial),
+        DateSystem::Excel1904 => {
+            let shifted = serial - EPOCH_SHIFT_1904 as f64;
+            serial_from_number_in(system, shifted)?;
+            Ok(shifted)
+        }
+    }
+}
+
 /// Convert an explicitly supplied UTC timestamp to an Excel 1900 serial.
 /// The caller owns tick persistence and timezone policy.
 pub fn from_unix_milliseconds(unix_ms: i64) -> Result<f64, CalcError> {
@@ -560,6 +794,71 @@ mod tests {
         assert_eq!(
             serial_from_number(f64::INFINITY),
             Err(CalcError::InvalidNumber)
+        );
+    }
+
+    #[test]
+    fn interprets_1904_serials_from_january_1904_without_the_1900_leap_day() {
+        assert_eq!(DateSystem::parse("1900"), Some(DateSystem::Excel1900));
+        assert_eq!(DateSystem::parse("1904"), Some(DateSystem::Excel1904));
+        assert_eq!(DateSystem::parse("1899"), None);
+        assert_eq!(DateSystem::Excel1904.as_str(), "1904");
+        assert_eq!(DateSystem::Excel1904.max_serial(), MAX_SERIAL_1904);
+
+        let system = DateSystem::Excel1904;
+        assert_eq!(civil_from_serial_in(system, 0), Ok(civil(1904, 1, 1)));
+        assert_eq!(civil_from_serial_in(system, 59), Ok(civil(1904, 2, 29)));
+        assert_eq!(civil_from_serial_in(system, 60), Ok(civil(1904, 3, 1)));
+        assert_eq!(
+            civil_from_serial_in(system, MAX_SERIAL_1904),
+            Ok(civil(9999, 12, 31))
+        );
+        assert_eq!(
+            civil_from_serial_in(system, -1),
+            Err(CalcError::InvalidNumber)
+        );
+        assert_eq!(
+            civil_from_serial_in(system, MAX_SERIAL_1904 + 1),
+            Err(CalcError::InvalidNumber)
+        );
+        assert_eq!(
+            serial_from_number_in(system, MAX_SERIAL_1904 as f64 + 0.9),
+            Ok(MAX_SERIAL_1904)
+        );
+        assert_eq!(
+            serial_from_number_in(system, (MAX_SERIAL_1904 + 1) as f64),
+            Err(CalcError::InvalidNumber)
+        );
+        assert_eq!(date_serial_in(system, 4.0, 1.0, 1.0), Ok(0));
+        assert_eq!(
+            date_serial_in(system, 1900.0, 1.0, 1.0),
+            Err(CalcError::InvalidNumber)
+        );
+        assert_eq!(
+            date_serial_in(system, 9999.0, 12.0, 31.0),
+            Ok(MAX_SERIAL_1904)
+        );
+        assert_eq!(add_months_in(system, 0, 1), Ok(31));
+        assert_eq!(end_of_month_in(system, 0, 0), Ok(30));
+        assert_eq!(days_360_in(system, 0, 30, false), Ok(30));
+        assert_eq!(
+            year_fraction_in(system, 0, 30, 0).unwrap(),
+            year_fraction(EPOCH_SHIFT_1904, EPOCH_SHIFT_1904 + 30, 0).unwrap()
+        );
+        assert_eq!(
+            work_day_in(system, 0, 1, &std::collections::HashSet::new()),
+            Ok(3)
+        );
+        let start = date_serial_in(system, 2024.0, 1.0, 1.0).unwrap();
+        let end = date_serial_in(system, 2024.0, 1.0, 31.0).unwrap();
+        assert_eq!(
+            network_days_in(system, start, end, &std::collections::HashSet::new()),
+            23
+        );
+        assert_eq!(serial_from_unix_millis_in(system, 0), Ok(24_107.0));
+        assert_eq!(
+            civil_from_serial_in(DateSystem::Excel1900, 60),
+            civil_from_serial(60)
         );
     }
 }

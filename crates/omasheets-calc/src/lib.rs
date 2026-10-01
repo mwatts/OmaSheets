@@ -306,6 +306,7 @@ enum Function {
     Today,
     Now,
     Rand,
+    RandBetween,
     Offset,
     Indirect,
     Transpose,
@@ -721,6 +722,10 @@ pub struct Workbook {
     tick: Option<(u64, i64)>,
     random_keys: HashMap<CellId, u64>,
     random_slot: std::cell::Cell<u64>,
+    /// Excel epoch for date serials. Set before formulas are installed.
+    date_system: serial_date::DateSystem,
+    /// Saved `RAND` / `RANDBETWEEN` draws. The next tick discards them.
+    rand_replay: HashMap<CellId, f64>,
 }
 
 impl Default for Workbook {
@@ -742,13 +747,17 @@ impl Default for Workbook {
             tick: None,
             random_keys: HashMap::new(),
             random_slot: std::cell::Cell::new(0),
+            date_system: serial_date::DateSystem::Excel1900,
+            rand_replay: HashMap::new(),
         }
     }
 }
 
 impl Workbook {
     /// Set an explicit persisted tick (UTC Unix milliseconds). Never reads time.
+    /// A new tick discards saved random draws.
     pub fn set_tick(&mut self, sequence: u64, unix_ms: i64) -> RecalcReport {
+        self.rand_replay.clear();
         self.tick = Some((sequence, unix_ms));
         let seeds: Vec<_> = self
             .cells
@@ -770,6 +779,25 @@ impl Workbook {
     /// Native callers derive this key from stable cell identity for snapshot replay.
     pub fn set_random_key(&mut self, cell: CellId, key: u64) {
         self.random_keys.insert(cell, key);
+    }
+
+    /// Selects the workbook epoch. Call this before installing formulas.
+    /// Stored serials are not shifted.
+    pub fn set_date_system(&mut self, system: serial_date::DateSystem) {
+        self.date_system = system;
+    }
+
+    pub fn date_system(&self) -> serial_date::DateSystem {
+        self.date_system
+    }
+
+    /// Remembers one saved draw for `cell`. `RAND` uses it only when it is in
+    /// `[0, 1)`. `RANDBETWEEN` uses it only when it is an integer inside the
+    /// current bounds. The next tick drops every remembered draw.
+    pub fn replay_cached_random(&mut self, cell: CellId, value: f64) {
+        if value.is_finite() {
+            self.rand_replay.insert(cell, value);
+        }
     }
 
     pub fn define_sheet(&mut self, index: u32, name: impl Into<String>) {
@@ -855,8 +883,14 @@ impl Workbook {
         cell: CellId,
         formula: ParsedFormula,
     ) -> Result<RecalcReport, FormulaError> {
-        if self.tick.is_none() {
-            if let Some(name) = volatile_function(&formula.expression) {
+        if self.tick.is_none()
+            && let Some(name) = volatile_function(&formula.expression)
+        {
+            // A saved draw installs RAND or RANDBETWEEN without a tick.
+            // Evaluation replays that draw; the next tick replaces it.
+            let replayed =
+                matches!(name, "RAND" | "RANDBETWEEN") && self.rand_replay.contains_key(&cell);
+            if !replayed {
                 return Err(FormulaError::UnsupportedFunction(name.into()));
             }
         }
@@ -1510,26 +1544,28 @@ impl Workbook {
     }
 
     fn evaluate_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
+        if function == Function::RandBetween {
+            return self.evaluate_rand_between(arguments);
+        }
         if matches!(function, Function::Today | Function::Now | Function::Rand) {
             if !arguments.is_empty() {
                 return Value::Error(CalcError::InvalidArguments);
+            }
+            if function == Function::Rand {
+                let cell = self.evaluating.get();
+                if let Some(&cached) = self.rand_replay.get(&cell)
+                    && (0.0..1.0).contains(&cached)
+                {
+                    return Value::Number(cached);
+                }
             }
             let Some((sequence, unix_ms)) = self.tick else {
                 return Value::Error(CalcError::NotAvailable);
             };
             if function == Function::Rand {
-                let cell = self.evaluating.get();
-                let key = self.random_keys.get(&cell).copied().unwrap_or_else(|| {
-                    mix64(u64::from(cell.sheet))
-                        ^ mix64(u64::from(cell.row))
-                        ^ u64::from(cell.column)
-                });
-                let slot = self.random_slot.get();
-                self.random_slot.set(slot.wrapping_add(1));
-                let bits = mix64(key ^ mix64(sequence) ^ mix64(unix_ms as u64) ^ mix64(slot));
-                return Value::Number((bits >> 11) as f64 / ((1_u64 << 53) as f64));
+                return Value::Number(self.random_unit(sequence, unix_ms));
             }
-            return match serial_date::from_unix_milliseconds(unix_ms) {
+            return match serial_date::serial_from_unix_millis_in(self.date_system, unix_ms) {
                 Ok(serial) => Value::Number(if function == Function::Today {
                     serial.floor()
                 } else {
@@ -1924,6 +1960,7 @@ impl Workbook {
             | Function::Today
             | Function::Now
             | Function::Rand
+            | Function::RandBetween
             | Function::Offset
             | Function::Indirect
             | Function::Hyperlink
@@ -1997,6 +2034,66 @@ impl Workbook {
         }
     }
 
+    /// Uniform draw in `[0, 1)` from the persisted tick, stable cell key and
+    /// call order. Excel does not publish the seed of a saved workbook.
+    fn random_unit(&self, sequence: u64, unix_ms: i64) -> f64 {
+        let cell = self.evaluating.get();
+        let key = self.random_keys.get(&cell).copied().unwrap_or_else(|| {
+            mix64(u64::from(cell.sheet)) ^ mix64(u64::from(cell.row)) ^ u64::from(cell.column)
+        });
+        let slot = self.random_slot.get();
+        self.random_slot.set(slot.wrapping_add(1));
+        let bits = mix64(key ^ mix64(sequence) ^ mix64(unix_ms as u64) ^ mix64(slot));
+        (bits >> 11) as f64 / ((1_u64 << 53) as f64)
+    }
+
+    /// `RANDBETWEEN(bottom, top)` truncates both bounds toward zero and
+    /// returns an integer from that bottom through that top.
+    fn evaluate_rand_between(&self, arguments: &[Expr<usize>]) -> Value {
+        if arguments.len() != 2 {
+            return Value::Error(CalcError::InvalidArguments);
+        }
+        let bottom = match excel_number(self.evaluate(&arguments[0])) {
+            Ok(value) => value,
+            Err(error) => return Value::Error(error),
+        };
+        let top = match excel_number(self.evaluate(&arguments[1])) {
+            Ok(value) => value,
+            Err(error) => return Value::Error(error),
+        };
+        let bottom_i = match serial_offset(bottom) {
+            Ok(value) => value,
+            Err(error) => return Value::Error(error),
+        };
+        let top_i = match serial_offset(top) {
+            Ok(value) => value,
+            Err(error) => return Value::Error(error),
+        };
+        if bottom_i > top_i {
+            return Value::Error(CalcError::InvalidNumber);
+        }
+        let cell = self.evaluating.get();
+        if let Some(&cached) = self.rand_replay.get(&cell)
+            && let Some(integer) = excel_integer(cached)
+            && (bottom_i..=top_i).contains(&integer)
+        {
+            return Value::Number(integer as f64);
+        }
+        let Some((sequence, unix_ms)) = self.tick else {
+            return Value::Error(CalcError::NotAvailable);
+        };
+        let unit = self.random_unit(sequence, unix_ms);
+        let span = top_i as f64 - bottom_i as f64 + 1.0;
+        if !span.is_finite() || span <= 0.0 {
+            return Value::Error(CalcError::InvalidNumber);
+        }
+        let picked = bottom_i as f64 + (unit * span).floor();
+        if !picked.is_finite() {
+            return Value::Error(CalcError::InvalidNumber);
+        }
+        number_value(picked.min(top_i as f64))
+    }
+
     /// `TEXT(value, format)` for the locale-free codes listed in
     /// `docs/FUNCTIONS.md`. Any other code is `#VALUE!`.
     fn evaluate_text(&self, arguments: &[Expr<usize>]) -> Value {
@@ -2011,7 +2108,7 @@ impl Workbook {
             Ok(format) => format,
             Err(error) => return Value::Error(error),
         };
-        match format_text_value(&value, &format) {
+        match format_text_value(self.date_system, &value, &format) {
             Ok(text) => Value::Text(text),
             Err(error) => Value::Error(error),
         }
@@ -2215,11 +2312,14 @@ impl Workbook {
                 Err(error) => return Value::Error(error),
             }
         }
+        let system = self.date_system;
         let result = match function {
-            Function::Date => serial_date::date_serial(numbers[0], numbers[1], numbers[2]),
+            Function::Date => {
+                serial_date::date_serial_in(system, numbers[0], numbers[1], numbers[2])
+            }
             Function::Year | Function::Month | Function::Day => {
-                serial_date::serial_from_number(numbers[0])
-                    .and_then(serial_date::civil_from_serial)
+                serial_date::serial_from_number_in(system, numbers[0])
+                    .and_then(|serial| serial_date::civil_from_serial_in(system, serial))
                     .map(|date| match function {
                         Function::Year => date.year,
                         Function::Month => i64::from(date.month),
@@ -2228,22 +2328,24 @@ impl Workbook {
             }
             Function::EDate | Function::EoMonth => {
                 match (
-                    serial_date::serial_from_number(numbers[0]),
+                    serial_date::serial_from_number_in(system, numbers[0]),
                     serial_offset(numbers[1]),
                 ) {
                     (Ok(start), Ok(months)) if function == Function::EDate => {
-                        serial_date::add_months(start, months)
+                        serial_date::add_months_in(system, start, months)
                     }
-                    (Ok(start), Ok(months)) => serial_date::end_of_month(start, months),
+                    (Ok(start), Ok(months)) => serial_date::end_of_month_in(system, start, months),
                     (Err(error), _) | (_, Err(error)) => Err(error),
                 }
             }
             Function::Weekday => {
                 match (
-                    serial_date::serial_from_number(numbers[0]),
+                    serial_date::serial_from_number_in(system, numbers[0]),
                     numbers.get(1).copied().map_or(Ok(1), serial_offset),
                 ) {
-                    (Ok(serial), Ok(return_type)) => serial_date::weekday(serial, return_type),
+                    (Ok(serial), Ok(return_type)) => {
+                        serial_date::weekday_in(system, serial, return_type)
+                    }
                     (Err(error), _) | (_, Err(error)) => Err(error),
                 }
             }
@@ -2265,7 +2367,10 @@ impl Workbook {
             match value {
                 Value::Blank => {}
                 Value::Number(number) => {
-                    serials.insert(serial_date::serial_from_number(number)?);
+                    serials.insert(serial_date::serial_from_number_in(
+                        self.date_system,
+                        number,
+                    )?);
                 }
                 Value::Error(error) => return Err(error),
                 Value::Text(_) | Value::Boolean(_) => return Err(CalcError::InvalidValue),
@@ -2275,7 +2380,7 @@ impl Workbook {
     }
 
     /// `YEARFRAC`, `DAYS360`, `NETWORKDAYS` and `WORKDAY`: day-count and
-    /// working-day arithmetic on the 1900 serial system.
+    /// working-day arithmetic in the workbook's date system.
     fn evaluate_calendar_function(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
         let expected_arity: &[usize] = match function {
             Function::YearFrac | Function::Days360 | Function::NetworkDays | Function::WorkDay => {
@@ -2286,8 +2391,9 @@ impl Workbook {
         if !expected_arity.contains(&arguments.len()) {
             return Value::Error(CalcError::InvalidArguments);
         }
+        let system = self.date_system;
         let first = match date_number(self.evaluate(&arguments[0]))
-            .and_then(serial_date::serial_from_number)
+            .and_then(|number| serial_date::serial_from_number_in(system, number))
         {
             Ok(serial) => serial,
             Err(error) => return Value::Error(error),
@@ -2301,9 +2407,11 @@ impl Workbook {
                 let basis = arguments.get(2).map_or(Ok(0), |argument| {
                     number(self.evaluate(argument)).and_then(serial_offset)
                 });
-                serial_date::serial_from_number(second)
+                serial_date::serial_from_number_in(system, second)
                     .and_then(|end| {
-                        basis.and_then(|basis| serial_date::year_fraction(first, end, basis))
+                        basis.and_then(|basis| {
+                            serial_date::year_fraction_in(system, first, end, basis)
+                        })
                     })
                     .map(Value::Number)
             }
@@ -2311,9 +2419,11 @@ impl Workbook {
                 let european = arguments
                     .get(2)
                     .map_or(Ok(false), |argument| truthy(self.evaluate(argument)));
-                serial_date::serial_from_number(second)
+                serial_date::serial_from_number_in(system, second)
                     .and_then(|end| {
-                        european.and_then(|european| serial_date::days_360(first, end, european))
+                        european.and_then(|european| {
+                            serial_date::days_360_in(system, first, end, european)
+                        })
                     })
                     .map(|days| Value::Number(days as f64))
             }
@@ -2321,9 +2431,11 @@ impl Workbook {
                 let holidays = arguments.get(2).map_or(Ok(HashSet::new()), |argument| {
                     self.holiday_serials(argument)
                 });
-                serial_date::serial_from_number(second).and_then(|end| {
+                serial_date::serial_from_number_in(system, second).and_then(|end| {
                     holidays.map(|holidays| {
-                        Value::Number(serial_date::network_days(first, end, &holidays) as f64)
+                        Value::Number(
+                            serial_date::network_days_in(system, first, end, &holidays) as f64
+                        )
                     })
                 })
             }
@@ -2333,7 +2445,9 @@ impl Workbook {
                 });
                 serial_offset(second)
                     .and_then(|days| {
-                        holidays.and_then(|holidays| serial_date::work_day(first, days, &holidays))
+                        holidays.and_then(|holidays| {
+                            serial_date::work_day_in(system, first, days, &holidays)
+                        })
                     })
                     .map(|serial| Value::Number(serial as f64))
             }
@@ -2476,7 +2590,7 @@ impl Workbook {
                 self.flatten_values(values_argument, &mut values);
                 let mut dates = Vec::new();
                 self.flatten_values(dates_argument, &mut dates);
-                let cash_flows = match dated_cash_flows(&values, &dates) {
+                let cash_flows = match dated_cash_flows(self.date_system, &values, &dates) {
                     Ok(cash_flows) => cash_flows,
                     Err(error) => return Value::Error(error),
                 };
@@ -3255,6 +3369,7 @@ fn is_elementwise(function: Function) -> bool {
             | Function::Text
             | Function::Hyperlink
             | Function::Rri
+            | Function::RandBetween
     )
 }
 
@@ -3342,6 +3457,27 @@ fn serial_offset(value: f64) -> Result<i64, CalcError> {
         return Err(CalcError::InvalidNumber);
     }
     Ok(value.trunc() as i64)
+}
+
+fn excel_number(value: Value) -> Result<f64, CalcError> {
+    match value {
+        Value::Text(text) => text
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| CalcError::InvalidValue),
+        other => number(other),
+    }
+}
+
+fn excel_integer(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let rounded = value.round();
+    if (value - rounded).abs() > 1e-9 || rounded.abs() > i64::MAX as f64 {
+        return None;
+    }
+    Some(rounded as i64)
 }
 
 fn number(value: Value) -> Result<f64, CalcError> {
@@ -3726,7 +3862,11 @@ fn net_present_value(rate: f64, values: &[f64]) -> Result<f64, CalcError> {
 /// Cash flows paired with the number of days from the first date, as `XNPV`
 /// and `XIRR` read them: both lists numeric and the same length, no date
 /// before the first.
-fn dated_cash_flows(values: &[Value], dates: &[Value]) -> Result<Vec<(f64, f64)>, CalcError> {
+fn dated_cash_flows(
+    system: serial_date::DateSystem,
+    values: &[Value],
+    dates: &[Value],
+) -> Result<Vec<(f64, f64)>, CalcError> {
     if let Some(error) = first_error(values).or_else(|| first_error(dates)) {
         return Err(error);
     }
@@ -3737,7 +3877,10 @@ fn dated_cash_flows(values: &[Value], dates: &[Value]) -> Result<Vec<(f64, f64)>
     for (value, date) in values.iter().zip(dates) {
         match (value, date) {
             (Value::Number(value), Value::Number(date)) => {
-                cash_flows.push((*value, serial_date::serial_from_number(*date)? as f64));
+                cash_flows.push((
+                    *value,
+                    serial_date::serial_from_number_in(system, *date)? as f64,
+                ));
             }
             _ => return Err(CalcError::InvalidValue),
         }
@@ -4119,7 +4262,11 @@ fn text_format(code: &str) -> Option<TextFormat> {
     }
 }
 
-fn format_text_value(value: &Value, format: &str) -> Result<String, CalcError> {
+fn format_text_value(
+    system: serial_date::DateSystem,
+    value: &Value,
+    format: &str,
+) -> Result<String, CalcError> {
     let format = text_format(format).ok_or(CalcError::InvalidValue)?;
     let number = match value {
         Value::Number(number) => *number,
@@ -4141,13 +4288,17 @@ fn format_text_value(value: &Value, format: &str) -> Result<String, CalcError> {
         TextFormat::Percent { decimals } => {
             format_scaled(number * 100.0, i32::from(decimals), false, false, "%")
         }
-        TextFormat::DateIso | TextFormat::DateUs => format_text_date(number, format),
+        TextFormat::DateIso | TextFormat::DateUs => format_text_date(system, number, format),
     }
 }
 
-fn format_text_date(number: f64, format: TextFormat) -> Result<String, CalcError> {
-    let serial = serial_date::serial_from_number(number)?;
-    let date = serial_date::civil_from_serial(serial)?;
+fn format_text_date(
+    system: serial_date::DateSystem,
+    number: f64,
+    format: TextFormat,
+) -> Result<String, CalcError> {
+    let serial = serial_date::serial_from_number_in(system, number)?;
+    let date = serial_date::civil_from_serial_in(system, serial)?;
     Ok(match format {
         TextFormat::DateIso => format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
         _ => format!("{:02}/{:02}/{:04}", date.month, date.day, date.year),
@@ -5261,6 +5412,7 @@ fn volatile_function<T>(e: &Expr<T>) -> Option<&'static str> {
         Expr::Function(Function::Today, _) => Some("TODAY"),
         Expr::Function(Function::Now, _) => Some("NOW"),
         Expr::Function(Function::Rand, _) => Some("RAND"),
+        Expr::Function(Function::RandBetween, _) => Some("RANDBETWEEN"),
         Expr::Function(_, args) => args.iter().find_map(volatile_function),
         Expr::UnaryMinus(e) | Expr::Percent(e) => volatile_function(e),
         Expr::Binary(_, a, b) => volatile_function(a).or_else(|| volatile_function(b)),
@@ -5315,6 +5467,7 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("TODAY", Function::Today),
     ("NOW", Function::Now),
     ("RAND", Function::Rand),
+    ("RANDBETWEEN", Function::RandBetween),
     ("OFFSET", Function::Offset),
     ("INDIRECT", Function::Indirect),
     ("TRANSPOSE", Function::Transpose),
@@ -5685,6 +5838,7 @@ mod tests {
     fn explicit_ticks_recalculate_clock_random_and_dependents() {
         let mut w = Workbook::default();
         assert!(w.set_formula(cell(0, 0), "=RAND()").is_err());
+        assert!(w.set_formula(cell(0, 0), "=RANDBETWEEN(1,2)").is_err());
         w.set_tick(1, 43_200_000);
         w.set_formula(cell(0, 0), "=TODAY()").unwrap();
         w.set_formula(cell(0, 1), "=NOW()").unwrap();
@@ -5705,6 +5859,134 @@ mod tests {
         };
         assert!((0.0..1.0).contains(&random));
         assert_eq!(w.value(cell(0, 3)), Value::Number(random + 1.0));
+    }
+
+    #[test]
+    fn evaluates_the_1904_date_system_from_its_own_epoch() {
+        let mut workbook = Workbook::default();
+        workbook.set_date_system(serial_date::DateSystem::Excel1904);
+        let cases = [
+            (0, "=DATE(1904,1,1)", Value::Number(0.0)),
+            (1, "=YEAR(0)", Value::Number(1904.0)),
+            (2, "=MONTH(0)", Value::Number(1.0)),
+            (3, "=DAY(0)", Value::Number(1.0)),
+            (4, "=DATE(1904,3,1)", Value::Number(60.0)),
+            (5, "=WEEKDAY(0)", Value::Number(6.0)),
+            (
+                6,
+                "=TEXT(0,\"yyyy-mm-dd\")",
+                Value::Text("1904-01-01".into()),
+            ),
+            (7, "=DATE(1900,1,1)", Value::Error(CalcError::InvalidNumber)),
+            (
+                8,
+                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,31))",
+                Value::Number(23.0),
+            ),
+            (9, "=EDATE(0,1)", Value::Number(31.0)),
+            (10, "=EOMONTH(0,0)", Value::Number(30.0)),
+            (11, "=WORKDAY(0,1)", Value::Number(3.0)),
+            (12, "=DAYS360(0,30)", Value::Number(30.0)),
+        ];
+        for (column, formula, expected) in cases {
+            workbook.set_formula(cell(0, column), formula).unwrap();
+            assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
+        }
+        workbook.set_tick(1, 0);
+        workbook.set_formula(cell(1, 0), "=TODAY()").unwrap();
+        assert_eq!(workbook.value(cell(1, 0)), Value::Number(24_107.0));
+    }
+
+    #[test]
+    fn cached_rand_draws_replay_until_the_next_tick() {
+        let mut workbook = Workbook::default();
+        let draw = cell(0, 0);
+        workbook.replay_cached_random(draw, 0.25);
+        workbook.replay_cached_random(cell(1, 0), 4.0);
+        workbook.set_formula(draw, "=RAND()").unwrap();
+        workbook.set_formula(cell(0, 1), "=A1*4").unwrap();
+        workbook
+            .set_formula(cell(1, 0), "=RANDBETWEEN(1,6)")
+            .unwrap();
+        workbook.set_formula(cell(1, 1), "=A2*2").unwrap();
+        assert_eq!(workbook.value(draw), Value::Number(0.25));
+        assert_eq!(workbook.value(cell(0, 1)), Value::Number(1.0));
+        assert_eq!(workbook.value(cell(1, 0)), Value::Number(4.0));
+        assert_eq!(workbook.value(cell(1, 1)), Value::Number(8.0));
+        workbook.replay_cached_random(cell(2, 0), 1.0);
+        workbook.set_formula(cell(2, 0), "=RAND()").unwrap();
+        assert_eq!(
+            workbook.value(cell(2, 0)),
+            Value::Error(CalcError::NotAvailable)
+        );
+        workbook.replay_cached_random(cell(2, 1), 9.0);
+        workbook
+            .set_formula(cell(2, 1), "=RANDBETWEEN(1,6)")
+            .unwrap();
+        assert_eq!(
+            workbook.value(cell(2, 1)),
+            Value::Error(CalcError::NotAvailable)
+        );
+        workbook.set_tick(1, 0);
+        assert_ne!(workbook.value(draw), Value::Number(0.25));
+        match workbook.value(draw) {
+            Value::Number(value) => assert!((0.0..1.0).contains(&value)),
+            other => panic!("fresh rand {other:?}"),
+        }
+        match workbook.value(cell(1, 0)) {
+            Value::Number(value) => assert!(value.fract() == 0.0 && (1.0..=6.0).contains(&value)),
+            other => panic!("fresh randbetween {other:?}"),
+        }
+    }
+
+    #[test]
+    fn randbetween_truncates_bounds_and_rejects_inverted_or_non_numeric_arguments() {
+        let mut workbook = Workbook::default();
+        workbook.set_tick(1, 0);
+        workbook
+            .set_formula(cell(0, 0), "=RANDBETWEEN(1.9,3.2)")
+            .unwrap();
+        match workbook.value(cell(0, 0)) {
+            Value::Number(value) => assert!(
+                value.fract() == 0.0 && (1.0..=3.0).contains(&value),
+                "{value}"
+            ),
+            other => panic!("truncated randbetween {other:?}"),
+        }
+        workbook
+            .set_formula(cell(0, 1), "=RANDBETWEEN(\"1\",\"3\")")
+            .unwrap();
+        match workbook.value(cell(0, 1)) {
+            Value::Number(value) => {
+                assert!(value.fract() == 0.0 && (1.0..=3.0).contains(&value))
+            }
+            other => panic!("numeric text randbetween {other:?}"),
+        }
+        assert_eq!(
+            workbook
+                .set_formula(cell(0, 2), "=RANDBETWEEN(\"x\",1)")
+                .map(|_| workbook.value(cell(0, 2))),
+            Ok(Value::Error(CalcError::InvalidValue))
+        );
+        assert_eq!(
+            workbook
+                .set_formula(cell(0, 3), "=RANDBETWEEN(3,1)")
+                .map(|_| workbook.value(cell(0, 3))),
+            Ok(Value::Error(CalcError::InvalidNumber))
+        );
+        workbook
+            .set_formula(cell(1, 0), "=RANDBETWEEN(-1.9,0.2)")
+            .unwrap();
+        for step in 0..40_i64 {
+            workbook.set_tick((step + 1) as u64, step * 86_400_000);
+            match workbook.value(cell(1, 0)) {
+                Value::Number(value) => assert!(
+                    value.fract() == 0.0 && (-1.0..=0.0).contains(&value),
+                    "{value}"
+                ),
+                other => panic!("negative truncation {other:?}"),
+            }
+        }
     }
 
     #[test]

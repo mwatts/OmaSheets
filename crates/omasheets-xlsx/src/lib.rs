@@ -1,13 +1,13 @@
 //! Bounded `.xlsx` import into the owned OmaSheets M0 calculation engine.
 //!
 //! Date-formatted cells are imported as the raw serial numbers the file stores,
-//! matching `omasheets_calc::serial_date`; workbooks that declare the 1904 date
-//! system are rejected rather than silently offset by 1462 days.
+//! matching `omasheets_calc::serial_date`. A workbook that declares the 1904
+//! date system keeps those serials and evaluates dates from 1904-01-01.
 
 #[cfg(test)]
 use calamine::Range;
 use calamine::{Cell, CellErrorType, Data, DataType, Reader, Xlsx, XlsxFormulaMetadata};
-use omasheets_calc::serial_date::DATE_SYSTEM;
+use omasheets_calc::serial_date::DateSystem;
 use omasheets_calc::{CalcError, CellId, FormulaError, Value, Workbook};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -142,7 +142,7 @@ pub struct ImportedWorkbook {
     pub workbook: Workbook,
     pub sheets: Vec<SheetInfo>,
     pub source_sha256: String,
-    /// Always `"1900"`: the importer refuses every other date system.
+    /// `"1900"` or `"1904"`. Serials are the file's own numbers.
     pub date_system: &'static str,
     pub unsupported: Vec<UnsupportedFormula>,
     /// Sheets named in `xl/workbook.xml` without a worksheet part, skipped by
@@ -310,7 +310,6 @@ pub enum ImportError {
     TooManySheets { observed: usize, maximum: usize },
     TooManyCells { observed: usize, maximum: usize },
     TooManyFormulas { observed: usize, maximum: usize },
-    UnsupportedDateSystem { observed: &'static str },
 }
 
 impl fmt::Display for ImportError {
@@ -336,12 +335,6 @@ impl fmt::Display for ImportError {
                     "workbook has {observed} formulas; limit is {maximum}"
                 )
             }
-            Self::UnsupportedDateSystem { observed } => {
-                write!(
-                    formatter,
-                    "workbook uses the {observed} date system; only the {DATE_SYSTEM} date system is supported"
-                )
-            }
         }
     }
 }
@@ -351,7 +344,11 @@ impl std::error::Error for ImportError {}
 pub fn import_xlsx(path: &Path, limits: ImportLimits) -> Result<ImportedWorkbook, ImportError> {
     let source_sha256 = hash_file(path)?;
     let (mut source, skipped_sheets) = open_repaired(path)?;
-    check_date_system(source.has_1904_epoch())?;
+    let date_system = if source.has_1904_epoch() {
+        DateSystem::Excel1904
+    } else {
+        DateSystem::Excel1900
+    };
     let sheet_names = source.sheet_names();
     if sheet_names.len() > limits.max_sheets {
         return Err(ImportError::TooManySheets {
@@ -375,7 +372,8 @@ pub fn import_xlsx(path: &Path, limits: ImportLimits) -> Result<ImportedWorkbook
             &mut observed_formulas,
         )?);
     }
-    let mut imported = import_ranges_with_names(sheets, defined_names, source_sha256, limits)?;
+    let mut imported =
+        import_ranges_with_names(sheets, defined_names, source_sha256, date_system, limits)?;
     imported.skipped_sheets = skipped_sheets;
     Ok(imported)
 }
@@ -758,14 +756,6 @@ fn drop_dangling_sheets(
     (output, skipped)
 }
 
-fn check_date_system(has_1904_epoch: bool) -> Result<(), ImportError> {
-    if has_1904_epoch {
-        Err(ImportError::UnsupportedDateSystem { observed: "1904" })
-    } else {
-        Ok(())
-    }
-}
-
 fn hash_file(path: &Path) -> Result<String, ImportError> {
     let mut source = File::open(path).map_err(|error| ImportError::Open(error.to_string()))?;
     let mut digest = Sha256::new();
@@ -792,6 +782,7 @@ fn import_ranges(
         ranges.into_iter().map(occupied_from_ranges).collect(),
         Vec::new(),
         source_sha256,
+        DateSystem::Excel1900,
         limits,
     )
 }
@@ -800,6 +791,7 @@ fn import_ranges_with_names(
     ranges: Vec<OccupiedSheet>,
     defined_names: Vec<DefinedName>,
     source_sha256: String,
+    date_system: DateSystem,
     limits: ImportLimits,
 ) -> Result<ImportedWorkbook, ImportError> {
     if ranges.len() > limits.max_sheets {
@@ -852,6 +844,7 @@ fn import_ranges_with_names(
         })
         .collect();
     let mut workbook = Workbook::default();
+    workbook.set_date_system(date_system);
     // One recalculation for the whole import instead of one per cell.
     workbook.begin_bulk();
     for sheet in &sheets {
@@ -909,6 +902,9 @@ fn import_ranges_with_names(
     }
 
     let source_cells: Vec<_> = source_cells.into_values().collect();
+    // Install saved draws before compiling, so a bare random formula can be
+    // loaded without a tick and still reproduce the cached number.
+    replay_cached_randoms(&mut workbook, &source_cells);
     let mut unsupported = Vec::new();
     let mut compiled_cells = Vec::with_capacity(observed_formulas);
     for (index, source) in source_cells.iter().enumerate() {
@@ -931,7 +927,7 @@ fn import_ranges_with_names(
         workbook,
         sheets,
         source_sha256,
-        date_system: DATE_SYSTEM,
+        date_system: date_system.as_str(),
         unsupported,
         skipped_sheets: Vec::new(),
         source_cells,
@@ -1012,8 +1008,7 @@ fn set_source_value(workbook: &mut Workbook, cell: CellId, value: &Data) {
             workbook.set_text(cell, value.clone());
         }
         Data::DateTime(value) => {
-            // The raw 1900-system serial; `check_date_system` has already
-            // rejected 1904 workbooks, so no epoch shift is applied.
+            // The file's own serial. A 1904 workbook is not shifted by 1462.
             workbook.set_number(cell, value.as_f64());
         }
         Data::Error(error) => {
@@ -1048,6 +1043,102 @@ fn source_value(value: &Data) -> Value {
         Data::DateTime(value) => Value::Number(value.as_f64()),
         Data::Error(error) => Value::Error(source_error(error)),
         Data::Empty => Value::Blank,
+    }
+}
+
+/// Bare `RAND()` or `RANDBETWEEN(bottom, top)`, ignoring `=` and unary `+`.
+/// A draw nested inside another formula is not replayed: the cache would be
+/// the outer result, not the random number.
+fn replay_cached_randoms(workbook: &mut Workbook, cells: &[ImportedCell]) {
+    for cell in cells {
+        let Some(formula) = cell.formula.as_deref() else {
+            continue;
+        };
+        let Value::Number(value) = cell.stored else {
+            continue;
+        };
+        match cached_random_formula(formula) {
+            Some(CachedRandom::Rand) if (0.0..1.0).contains(&value) => {
+                workbook.replay_cached_random(cell.cell, value);
+            }
+            Some(CachedRandom::RandBetween) if (value - value.round()).abs() <= 1e-9 => {
+                workbook.replay_cached_random(cell.cell, value);
+            }
+            _ => {}
+        }
+    }
+}
+
+enum CachedRandom {
+    Rand,
+    RandBetween,
+}
+
+fn cached_random_formula(formula: &str) -> Option<CachedRandom> {
+    let compact = compact_formula(formula)?;
+    if compact.eq_ignore_ascii_case("RAND()") {
+        return Some(CachedRandom::Rand);
+    }
+    let inner = compact
+        .get(.."RANDBETWEEN(".len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case("RANDBETWEEN("))
+        .and_then(|_| compact.get("RANDBETWEEN(".len()..))
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    if top_level_commas(inner) == Some(1) {
+        Some(CachedRandom::RandBetween)
+    } else {
+        None
+    }
+}
+
+fn compact_formula(formula: &str) -> Option<String> {
+    let mut text = formula.trim();
+    if let Some(rest) = text.strip_prefix('=') {
+        text = rest.trim_start();
+    }
+    while text.starts_with('+') {
+        text = text[1..].trim_start();
+    }
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if compact.is_empty() {
+        None
+    } else {
+        Some(compact)
+    }
+}
+
+/// Commas that separate arguments, not commas inside strings or calls.
+fn top_level_commas(text: &str) -> Option<usize> {
+    let mut commas = 0;
+    let mut depth = 0_i32;
+    let mut quoted = false;
+    for character in text.chars() {
+        if quoted {
+            if character == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => quoted = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            ',' if depth == 0 => commas += 1,
+            _ => {}
+        }
+    }
+    if quoted || depth != 0 {
+        None
+    } else {
+        Some(commas)
     }
 }
 
@@ -1911,6 +2002,7 @@ mod tests {
                 workbook_name("Broken", "[2]External!A1"),
             ],
             "j".repeat(64),
+            DateSystem::Excel1900,
             ImportLimits::default(),
         )
         .unwrap();
@@ -1940,17 +2032,69 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_1904_date_system_before_reading_any_cell() {
-        assert_eq!(check_date_system(false), Ok(()));
-        let error = check_date_system(true).unwrap_err();
+    fn imports_a_1904_workbook_without_shifting_serials() {
+        let path = std::env::temp_dir().join(format!("omasheets-1904-{}.xlsx", std::process::id()));
+        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><workbookPr date1904="1"/><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f>DATE(1904,1,1)</f><v>0</v></c><c r="B1"><v>0</v></c></row></sheetData></worksheet>"#;
+        write_owned(
+            &path,
+            &[
+                ("[Content_Types].xml", content_types("")),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/workbook.xml", workbook.to_string()),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_string(),
+                ),
+                ("xl/worksheets/sheet1.xml", sheet.to_string()),
+            ],
+        );
+        let imported = import_xlsx(&path, ImportLimits::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(imported.date_system, "1904");
         assert_eq!(
-            error,
-            ImportError::UnsupportedDateSystem { observed: "1904" }
+            imported.workbook.value(CellId::new(0, 0, 0)),
+            Value::Number(0.0)
         );
         assert_eq!(
-            error.to_string(),
-            "workbook uses the 1904 date system; only the 1900 date system is supported"
+            imported.workbook.value(CellId::new(0, 0, 1)),
+            Value::Number(0.0)
         );
+        assert_eq!(imported.parity().stored_values_matched, 1);
+    }
+
+    #[test]
+    fn replays_cached_rand_draws_into_the_formulas_that_read_them() {
+        let path = std::env::temp_dir().join(format!("omasheets-rand-{}.xlsx", std::process::id()));
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f t="shared" ref="A1:B1" si="0">RAND()</f><v>0.25</v></c><c r="B1"><f t="shared" si="0"/><v>0.5</v></c><c r="C1"><f>A1+B1</f><v>0.75</v></c></row><row r="2"><c r="A2"><f>RANDBETWEEN(1,6)</f><v>4</v></c><c r="B2"><f>A2*2</f><v>8</v></c></row></sheetData></worksheet>"#;
+        write_plain_workbook_xml(&path, sheet);
+        let imported = import_xlsx(&path, ImportLimits::default()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 0)),
+            Value::Number(0.25)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 1)),
+            Value::Number(0.5)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 0, 2)),
+            Value::Number(0.75)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 1, 0)),
+            Value::Number(4.0)
+        );
+        assert_eq!(
+            imported.workbook.value(CellId::new(0, 1, 1)),
+            Value::Number(8.0)
+        );
+        assert_eq!(imported.parity().stored_values_mismatched, 0);
+        assert_eq!(imported.parity().stored_values_matched, 5);
     }
 
     #[test]
