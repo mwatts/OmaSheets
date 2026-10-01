@@ -192,23 +192,7 @@ fn formula_needs_dynamic(expression: &Expr<usize>) -> bool {
     }
 }
 
-/// Uniform draw in `[0, 1)`, the range Microsoft documents for `RAND`.
-/// Excel does not publish the seed of a saved workbook, so a new tick uses
-/// this per-cell value. The same tick and cell replay it.
-fn volatile_unit(tick: u64, cell: CellId) -> f64 {
-    let mut z = tick.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ u64::from(cell.row).wrapping_mul(0xBF58_476D_1CE4_E5B9)
-        ^ u64::from(cell.column).wrapping_mul(0x94D0_49BB_1331_11EB)
-        ^ u64::from(cell.sheet).wrapping_mul(0xD1B5_4A32_D192_E40F);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    z ^= tick.rotate_left(17);
-    ((z >> 11) as f64) / ((1_u64 << 53) as f64)
-}
-
-/// `RANDBETWEEN`: both bounds truncate toward zero, then the result is an
-/// integer from `bottom` through `top`. `bottom > top` is `#NUM!`.
+/// Both bounds truncate toward zero; the resulting integer is in the inclusive range.
 fn rand_between(unit: f64, bottom: f64, top: f64) -> Result<f64, CalcError> {
     let bottom = trunc_offset(bottom)? as f64;
     let top = trunc_offset(top)? as f64;
@@ -240,7 +224,7 @@ fn excel_integer(value: f64) -> Option<i64> {
 impl Workbook {
     /// Records the next tick at Unix millisecond `at` and recalculates every
     /// formula that reads the tick. Does not read the system clock.
-    pub fn set_tick(&mut self, at: i64) -> RecalcReport {
+    pub fn advance_tick(&mut self, at: i64) -> RecalcReport {
         let tick = self
             .tick
             .map(|(tick, _)| tick.saturating_add(1))
@@ -285,6 +269,18 @@ impl Workbook {
         node
     }
 
+    fn random_unit(&self, sequence: u64) -> f64 {
+        let cell = self.evaluating.get();
+        let key = self.random_keys.get(&cell).copied().unwrap_or_else(|| {
+            mix64(u64::from(cell.sheet)) ^ mix64(u64::from(cell.row)) ^ u64::from(cell.column)
+        });
+        let slot = self.random_slot.get();
+        self.random_slot.set(slot.wrapping_add(1));
+        let unix_ms = self.tick.map_or(0, |(_, at)| at);
+        let bits = mix64(key ^ mix64(sequence) ^ mix64(unix_ms as u64) ^ mix64(slot));
+        (bits >> 11) as f64 / ((1_u64 << 53) as f64)
+    }
+
     pub(crate) fn evaluate_volatile(&self, function: Function, arguments: &[Expr<usize>]) -> Value {
         let arity = match function {
             Function::RandBetween => 2,
@@ -325,7 +321,7 @@ impl Workbook {
             let Some((tick, _)) = self.tick else {
                 return Value::Error(CalcError::NotAvailable);
             };
-            return match rand_between(volatile_unit(tick, cell), bottom, top) {
+            return match rand_between(self.random_unit(tick), bottom, top) {
                 Ok(value) => number_value(value),
                 Err(error) => Value::Error(error),
             };
@@ -342,16 +338,17 @@ impl Workbook {
             return Value::Error(CalcError::NotAvailable);
         };
         match function {
-            Function::Today => match serial_date::serial_from_unix_millis_in(self.date_system, at)
-            {
-                Ok(serial) => Value::Number(serial.trunc()),
-                Err(error) => Value::Error(error),
-            },
+            Function::Today => {
+                match serial_date::serial_from_unix_millis_in(self.date_system, at) {
+                    Ok(serial) => Value::Number(serial.trunc()),
+                    Err(error) => Value::Error(error),
+                }
+            }
             Function::Now => match serial_date::serial_from_unix_millis_in(self.date_system, at) {
                 Ok(serial) => number_value(serial),
                 Err(error) => Value::Error(error),
             },
-            Function::Rand => Value::Number(volatile_unit(tick, self.evaluating.get())),
+            Function::Rand => Value::Number(self.random_unit(tick)),
             _ => Value::Error(CalcError::InvalidArguments),
         }
     }
@@ -492,12 +489,9 @@ impl Workbook {
         let Ok(view) = self.reference_span(arguments) else {
             return;
         };
-        binding.ranges.push(range_key(
-            view.anchor,
-            None,
-            view.rows,
-            view.columns,
-        ));
+        binding
+            .ranges
+            .push(range_key(view.anchor, None, view.rows, view.columns));
     }
 
     fn note_parsed_offset(&self, arguments: &[Expr<CellId>], binding: &mut Binding) {
@@ -590,6 +584,7 @@ impl Workbook {
             Class::Spill(anchor) => StepResult::Value(self.spill_member_value(index, anchor)),
             Class::Formula(dynamic) => {
                 self.evaluating.set(self.cells[index].id);
+                self.random_slot.set(0);
                 if dynamic && self.sync_dynamic(index, generation) {
                     StepResult::Deferred
                 } else {
@@ -677,11 +672,12 @@ impl Workbook {
         };
         match self.cells[node].input {
             Input::Range {
-                shape: RangeShape::Rectangle {
-                    anchor,
-                    rows,
-                    columns,
-                },
+                shape:
+                    RangeShape::Rectangle {
+                        anchor,
+                        rows,
+                        columns,
+                    },
             } => {
                 let mut count = 0;
                 self.for_each_rectangle_cell(anchor, rows, columns, |_position, index| {
@@ -699,14 +695,15 @@ impl Workbook {
                 .filter(|index| still_due(**index))
                 .count(),
             Input::Range {
-                shape: RangeShape::Stack {
-                    first_sheet,
-                    last_sheet,
-                    row,
-                    column,
-                    rows,
-                    columns,
-                },
+                shape:
+                    RangeShape::Stack {
+                        first_sheet,
+                        last_sheet,
+                        row,
+                        column,
+                        rows,
+                        columns,
+                    },
             } => {
                 let mut count = 0;
                 self.for_each_stack_cell(
@@ -1139,7 +1136,9 @@ mod tests {
         workbook.replay_cached_random(cell(1, 0), 4.0);
         workbook.set_formula(draw, "=RAND()").unwrap();
         workbook.set_formula(cell(0, 1), "=A1*4").unwrap();
-        workbook.set_formula(cell(1, 0), "=RANDBETWEEN(1,6)").unwrap();
+        workbook
+            .set_formula(cell(1, 0), "=RANDBETWEEN(1,6)")
+            .unwrap();
         workbook.set_formula(cell(1, 1), "=A2*2").unwrap();
         assert_eq!(workbook.value(draw), Value::Number(0.25));
         assert_eq!(workbook.value(cell(0, 1)), Value::Number(1.0));
@@ -1152,12 +1151,14 @@ mod tests {
             Value::Error(CalcError::NotAvailable)
         );
         workbook.replay_cached_random(cell(2, 1), 9.0);
-        workbook.set_formula(cell(2, 1), "=RANDBETWEEN(1,6)").unwrap();
+        workbook
+            .set_formula(cell(2, 1), "=RANDBETWEEN(1,6)")
+            .unwrap();
         assert_eq!(
             workbook.value(cell(2, 1)),
             Value::Error(CalcError::NotAvailable)
         );
-        workbook.set_tick(0);
+        workbook.advance_tick(0);
         assert_ne!(workbook.value(draw), Value::Number(0.25));
         match workbook.value(draw) {
             Value::Number(value) => assert!((0.0..1.0).contains(&value)),
@@ -1186,7 +1187,7 @@ mod tests {
             workbook.value(cell(0, 2)),
             Value::Error(CalcError::NotAvailable)
         );
-        workbook.set_tick(0);
+        workbook.advance_tick(0);
         assert_eq!(workbook.value(cell(0, 0)), Value::Number(25_569.0));
         assert_eq!(workbook.value(cell(0, 1)), Value::Number(25_569.0));
         let first_rand = workbook.value(cell(0, 2));
@@ -1196,7 +1197,7 @@ mod tests {
         assert_eq!(workbook.value(cell(0, 3)), first_between);
         workbook.set_formula(cell(1, 2), "=RAND()").unwrap();
         assert_ne!(workbook.value(cell(1, 2)), first_rand);
-        workbook.set_tick(43_200_000);
+        workbook.advance_tick(43_200_000);
         assert_eq!(workbook.value(cell(0, 0)), Value::Number(25_569.0));
         assert_eq!(workbook.value(cell(0, 1)), Value::Number(25_569.5));
         assert_ne!(workbook.value(cell(0, 2)), first_rand);
@@ -1210,7 +1211,9 @@ mod tests {
                 .map(|_| workbook.value(cell(2, 3))),
             Ok(Value::Error(CalcError::InvalidNumber))
         );
-        workbook.set_formula(cell(3, 3), "=RANDBETWEEN(1.9,3.2)").unwrap();
+        workbook
+            .set_formula(cell(3, 3), "=RANDBETWEEN(1.9,3.2)")
+            .unwrap();
         match workbook.value(cell(3, 3)) {
             Value::Number(value) => assert!(
                 value.fract() == 0.0 && (1.0..=3.0).contains(&value),
@@ -1235,7 +1238,7 @@ mod tests {
             .set_formula(cell(4, 0), "=RANDBETWEEN(-1.9,0.2)")
             .unwrap();
         for step in 0..40 {
-            workbook.set_tick(step * 86_400_000);
+            workbook.advance_tick(step * 86_400_000);
             match workbook.value(cell(4, 0)) {
                 Value::Number(value) => assert!(
                     value.fract() == 0.0 && (-1.0..=0.0).contains(&value),

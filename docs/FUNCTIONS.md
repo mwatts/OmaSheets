@@ -36,10 +36,10 @@ whose current A1 spelling cannot preserve those identities reports a projection
 refusal instead of exporting different references.
 
 `TODAY`, `NOW`, `RAND` and `RANDBETWEEN` read the stored tick and never the
-system clock. With no tick they are `#N/A`. Import sets that tick from the
-cached numeric value of a `TODAY()` or `NOW()` cell, as a 1900 serial read
-in UTC, before formulas are installed. `NOW()` keeps the time fraction when
-the cache has one. A workbook with no such cached cell stays at no tick.
+system clock. Without a tick or a valid imported random cache they are `#N/A`.
+Import sets that tick from the cached numeric value of a `TODAY()` or `NOW()`
+cell, read in the workbook's date system and UTC before formulas are installed.
+`NOW()` keeps the time fraction when the cache has one. A workbook with no such cached cell stays at no tick.
 `OFFSET` with constant arguments
 is an ordinary range; a dynamic shift keeps that shift's rectangle as its
 dependency envelope. `INDIRECT` accepts one A1 reference or range, optionally
@@ -77,6 +77,7 @@ arguments see those names. A stored name may be written `_xlpm.name`.
 A repeated or cell-like name is `#NAME?`.
 
 ## Registry
+
 
 ### Matrices and databases
 
@@ -262,7 +263,9 @@ is `#NUM!` and a non-numeric argument is `#VALUE!`. Import replays a cached
 bare `RAND()` when the cache is in that half-open interval, and a cached bare
 `RANDBETWEEN` when the cache is an integer. Formulas that read those cells
 then see Excel's saved draw. The next tick discards the saved draws. A new
-draw is deterministic in the tick number and the calling cell. Excel does not
+draw is deterministic in the stored tick, stable native cell identity and call
+order. Use Commands → Data → Refresh date and random formulas to record a
+new tick. The random generator is not cryptographic. Excel does not
 publish the seed of a saved workbook, so a fresh draw is not Excel's next
 number. `OFFSET` refuses a result outside the grid with `#REF!` and
 a height or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of A1 text, including text a formula produces and a whole
@@ -285,10 +288,12 @@ and empty strings, propagates errors, and refuses output beyond 32,767 UTF-16 un
 
 `TEXT` formats a number with one code, compared without regard to case:
 `General`, `0`, `0.00`, `#`, `#,##0`, `#,##0.00`, `0%`, `0.00%`, `yyyy-mm-dd`,
-or `mm/dd/yyyy`, or `mm/dd/yy`. Any other code, including a literal suffix such as `0.0x`,
-is `#VALUE!`. `#` rounds half away from zero to an integer and shows nothing
-for zero. Date codes use the 1900 serial, including the fictitious 1900-02-29.
+`mm/dd/yyyy`, or `mm/dd/yy`. Any other code, including surrounding whitespace or a literal
+suffix such as `0.0x`, is `#VALUE!`. `#` rounds half away from zero to an
+integer and shows nothing for zero. Date codes use the 1900 serial, including
+the fictitious 1900-02-29.
 `HYPERLINK` returns its friendly name, or the link when the name is omitted,
 and does not fetch the target. `RANK` is a competition rank over numbers in
 the reference (ties share a rank and the next rank is skipped); a zero or
-omitted order ranks the largest first. `RRI` is `(fv/pv)^(1/nper)-1`.
+omitted order ranks the largest first. An absent target returns `#N/A`.
+`RRI` is `(fv/pv)^(1/nper)-1`; a zero future value returns -1 (total loss).

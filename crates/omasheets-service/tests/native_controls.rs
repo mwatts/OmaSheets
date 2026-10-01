@@ -426,3 +426,124 @@ fn undo_restores_formula_bindings_after_rows_move() {
     assert_eq!(f.cell("B3")["state"]["input"], before);
     assert_eq!(f.cell("B3")["value"]["value"], 40.0);
 }
+
+#[test]
+fn explicit_refresh_enables_clock_formulas_and_survives_reopen() {
+    let mut f = Fixture::new();
+    let result = f.edit(json!({"action":"refresh_calculation"}));
+    assert_eq!(result["structural"], true);
+    assert_eq!(result["undo"], json!([]));
+    f.formula("A1", "=NOW()");
+    f.formula("A2", "=RAND()");
+    f.formula("A3", "=A2+1");
+    let before = f.cell("A2")["value"].clone();
+    let digest = f.call(json!({"kind":"document"}))["digest"].clone();
+    f.reopen();
+    assert_eq!(f.cell("A2")["value"], before);
+    assert_eq!(f.call(json!({"kind":"document"}))["digest"], digest);
+    f.edit(json!({"action":"refresh_calculation"}));
+    assert_ne!(f.cell("A2")["value"], before);
+    let rand = f.cell("A2")["value"]["value"].as_f64().unwrap();
+    assert_eq!(f.cell("A3")["value"]["value"], rand + 1.0);
+}
+
+#[test]
+fn literal_reference_functions_preserve_binding_after_sort_and_export() {
+    let mut f = Fixture::new();
+    f.number("A1", 30.0);
+    f.number("A2", 10.0);
+    f.number("A3", 20.0);
+    f.formula("C5", "=OFFSET(A1,1,0)");
+    f.formula("C6", "=INDIRECT(\"A2\")");
+    f.edit(json!({"action":"sort","range":range(0,0,3,1),"column":0,"header":false,"descending":false}));
+    assert_eq!(f.cell("C5")["value"]["value"], 10.0);
+    assert_eq!(f.cell("C6")["value"]["value"], 10.0);
+    f.reopen();
+    assert_eq!(f.cell("C5")["value"]["value"], 10.0);
+    let exported = f.path.with_extension("references.xlsx");
+    let manifest = f.call(json!({"kind":"export_xlsx","output":exported}));
+    // INDIRECT's fixed text cannot be rewritten after movement: disclose flattening.
+    assert!(manifest["formula_cells_flattened"].as_u64().unwrap() >= 1);
+    let _ = std::fs::remove_file(exported);
+}
+
+#[test]
+#[ignore = "requires Python with openpyxl; independent interchange gate"]
+fn independent_reader_roundtrips_notes_charts_filters_and_conditional_rules() {
+    let mut f = Fixture::new();
+    let source = f.path.with_extension("extras-source.xlsx");
+    let imported = f.path.with_extension("extras.omasheets");
+    let exported = f.path.with_extension("extras-export.xlsx");
+    let python = |code: &str, path: &std::path::Path| {
+        let output = std::process::Command::new("python")
+            .args(["-c", code])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    python(
+        r#"
+from openpyxl import Workbook
+from openpyxl.chart import BarChart,LineChart,PieChart,Reference
+from openpyxl.comments import Comment
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import PatternFill
+from openpyxl.worksheet.filters import FilterColumn,CustomFilter,CustomFilters
+import sys
+w=Workbook();s=w.active;s.title='Plan'
+for row in [['Name','Score'],['North',5],['South',12]]:s.append(row)
+s['A2'].comment=Comment('Check <this> & that\nNext line','Tom')
+s['F9'].comment=Comment('Blank cell note','Tom')
+s.conditional_formatting.add('B2:B3',CellIsRule(operator='greaterThan',formula=['10'],fill=PatternFill('solid',fgColor='FFFF0000')))
+s.auto_filter.ref='A1:B3'
+s.auto_filter.filterColumn.append(FilterColumn(colId=0,customFilters=CustomFilters(customFilter=[CustomFilter(operator='equal',val='*North*')])))
+for i,cls in enumerate([BarChart,LineChart,PieChart]):
+ c=cls();c.title='Scores & forecast';c.add_data(Reference(s,min_col=2,min_row=1,max_row=3),titles_from_data=True);c.set_categories(Reference(s,min_col=1,min_row=2,max_row=3));s.add_chart(c,'D'+str(1+i*18))
+w.save(sys.argv[1])
+"#,
+        &source,
+    );
+    f.service.handle(serde_json::from_value(json!({"kind":"import_xlsx","source":source,"output":imported,"actor":{"kind":"human","id":"test"}})).unwrap()).unwrap();
+    f.call(json!({"kind":"close"}));
+    std::fs::remove_file(&f.path).unwrap();
+    f.path = imported;
+    f.sheet = f.call(json!({"kind":"document"}))["sheets"][0]["id"]
+        .as_str()
+        .unwrap()
+        .into();
+    assert_eq!(f.view()["charts"].as_array().unwrap().len(), 3);
+    assert_eq!(f.view()["hidden_rows"], json!([2]));
+    let digest = f.call(json!({"kind":"document"}))["digest"].clone();
+    f.reopen();
+    assert_eq!(f.call(json!({"kind":"document"}))["digest"], digest);
+    f.call(json!({"kind":"export_xlsx","output":exported}));
+    python(
+        r#"
+from openpyxl import load_workbook
+import sys
+s=load_workbook(sys.argv[1])['Plan']
+assert s['A2'].comment.text=='Check <this> & that\nNext line'
+assert s['F9'].comment.text=='Blank cell note'
+assert len(s._charts)==3
+assert s._charts[0].ser[0].val.numRef.f=="'Plan'!B2:B3"
+assert s._charts[0].ser[0].val.numRef.numCache.pt[1].v==12
+assert s.auto_filter.ref=='A1:B3'
+assert s.auto_filter.filterColumn[0].customFilters.customFilter[0].val=='*North*'
+assert s.row_dimensions[3].hidden and not s.row_dimensions[2].hidden
+rules=list(s.conditional_formatting['B2:B3'])
+assert len(rules)==1 and rules[0].operator=='greaterThan' and rules[0].formula==['10']
+assert rules[0].dxf.fill.fgColor.rgb.upper()=='FFFF0000'
+"#,
+        &exported,
+    );
+    let again = f.path.with_extension("again.omasheets");
+    f.service.handle(serde_json::from_value(json!({"kind":"import_xlsx","source":exported,"output":again,"actor":{"kind":"human","id":"test"}})).unwrap()).unwrap();
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(exported);
+    let _ = std::fs::remove_file(again);
+}

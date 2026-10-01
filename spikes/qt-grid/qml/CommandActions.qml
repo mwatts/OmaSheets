@@ -89,6 +89,7 @@ Item {
         command("format.merge", "Merge selection", "", sheetAvailable, () => tools.run({action:"merge",range:tools.selection})),
         command("format.unmerge", "Unmerge selection", "", sheetAvailable, () => tools.run({action:"merge",range:tools.selection,unmerge:true})),
 
+        command("data.refresh-calculation", "Refresh date and random formulas…", "", sheetAvailable, () => tools.confirm({action:"refresh_calculation"},"Refresh calculation time?","Use the current UTC time for TODAY, NOW and RAND. This saves a new calculation tick and starts a new undo history.")),
         command("data.sort", "Sort selected rows…", "", sheetAvailable, () => tools.showSort()),
         command("data.filter", "Filter by current cell", "", sheetAvailable, () => tools.filterCurrent(), "Filter the selection using the current value"),
         command("data.clear-filter", "Clear filter", "", sheetAvailable && !!tools.sheetView.filter_active, () => tools.run({action:"clear_filter"})),

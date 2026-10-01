@@ -5,6 +5,7 @@ import QtQuick.Layouts
 
 Dialog {
     id: dialog
+    objectName: "proposalReviewDialog"
     required property var gridModel
     property var branches: JSON.parse(gridModel.proposalsJson || "[]")
     property var review: gridModel.reviewJson.length ? JSON.parse(gridModel.reviewJson) : null
@@ -95,9 +96,11 @@ Dialog {
             Layout.fillWidth: true
             Layout.fillHeight: true
             contentWidth: availableWidth
+            contentHeight: details.implicitHeight
             clip: true
             visible: dialog.review !== null
             ColumnLayout {
+                id: details
                 width: scroll.availableWidth
                 spacing: 12
                 Label {

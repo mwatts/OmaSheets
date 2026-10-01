@@ -403,6 +403,11 @@ enum BinaryOp {
 enum Function {
     /// Internal reference operator; deliberately absent from the function registry.
     ReferenceSpan,
+    Today,
+    Now,
+    Rand,
+    Offset,
+    Indirect,
     Transpose,
     MMult,
     DAverage,
@@ -515,12 +520,7 @@ enum Function {
     Rank,
     Text,
     Rri,
-    Today,
-    Now,
-    Rand,
     RandBetween,
-    Offset,
-    Indirect,
     DateValue,
     Rows,
     Cell,
@@ -717,7 +717,8 @@ fn visit_references(expression: &Expr<CellId>, visit: &mut impl FnMut(CellId)) {
             columns,
         } => {
             for sheet in *first_sheet..=*last_sheet {
-                rectangle_cells(CellId::new(sheet, *row, *column), *rows, *columns).for_each(&mut *visit);
+                rectangle_cells(CellId::new(sheet, *row, *column), *rows, *columns)
+                    .for_each(&mut *visit);
             }
         }
         Expr::Function(_, items) => {
@@ -930,6 +931,8 @@ pub struct Workbook {
     /// Set by `set_parsed_formula` for the `commit` that installs it.
     pending_dynamic: Option<Vec<usize>>,
     eval_marks: Vec<u64>,
+    random_keys: HashMap<CellId, u64>,
+    random_slot: std::cell::Cell<u64>,
     /// Range barriers created while a pass is already running. They are not
     /// in that pass's dirty list, but they still step once their cells do.
     late_range_barriers: usize,
@@ -964,6 +967,8 @@ impl Default for Workbook {
             bulk: None,
             evaluating: std::cell::Cell::new(CellId::new(0, 0, 0)),
             tick: None,
+            random_keys: HashMap::new(),
+            random_slot: std::cell::Cell::new(0),
             tick_node: None,
             spills: HashMap::new(),
             spill_followups: Vec::new(),
@@ -999,6 +1004,16 @@ impl Drop for LetFrame<'_> {
 }
 
 impl Workbook {
+    /// Set an explicit persisted tick (UTC Unix milliseconds). Never reads time.
+    pub fn set_tick(&mut self, sequence: u64, unix_ms: i64) -> RecalcReport {
+        self.install_tick(sequence, unix_ms)
+    }
+
+    /// Native callers derive this key from stable cell identity for snapshot replay.
+    pub fn set_random_key(&mut self, cell: CellId, key: u64) {
+        self.random_keys.insert(cell, key);
+    }
+
     /// Selects the workbook epoch. Call this before installing formulas.
     /// Stored serials are not shifted.
     pub fn set_date_system(&mut self, system: serial_date::DateSystem) {
@@ -1424,11 +1439,7 @@ impl Workbook {
                 columns,
             } => {
                 for sheet in first_sheet..=last_sheet {
-                    self.unregister_range_bands(
-                        node,
-                        CellId::new(sheet, row, column),
-                        rows,
-                    );
+                    self.unregister_range_bands(node, CellId::new(sheet, row, column), rows);
                 }
                 RangeKey::Stack {
                     first_sheet,
@@ -1480,15 +1491,7 @@ impl Workbook {
                 column,
                 rows,
                 columns,
-            } => stack_covers(
-                first_sheet,
-                last_sheet,
-                row,
-                column,
-                rows,
-                columns,
-                cell,
-            ),
+            } => stack_covers(first_sheet, last_sheet, row, column, rows, columns, cell),
         }
     }
 
@@ -1595,11 +1598,13 @@ impl Workbook {
                 }
                 let sheet = first_sheet + (index / per) as u32;
                 let within = index % per;
-                self.indices.get(&CellId::new(
-                    sheet,
-                    row + (within / columns.max(1)) as u32,
-                    column + (within % columns.max(1)) as u32,
-                )).copied()
+                self.indices
+                    .get(&CellId::new(
+                        sheet,
+                        row + (within / columns.max(1)) as u32,
+                        column + (within % columns.max(1)) as u32,
+                    ))
+                    .copied()
             }
         }
     }
@@ -2732,12 +2737,12 @@ impl Workbook {
             false
         };
         let mut rank = 1_usize;
-        let mut saw_number = false;
+        let mut found_target = false;
         for value in &values {
             let Value::Number(candidate) = value else {
                 continue;
             };
-            saw_number = true;
+            found_target |= compare_numbers(*candidate, target) == std::cmp::Ordering::Equal;
             let ahead = match compare_numbers(*candidate, target) {
                 std::cmp::Ordering::Greater => !ascending,
                 std::cmp::Ordering::Less => ascending,
@@ -2747,7 +2752,7 @@ impl Workbook {
                 rank += 1;
             }
         }
-        if saw_number {
+        if found_target {
             Value::Number(rank as f64)
         } else {
             Value::Error(CalcError::NotAvailable)
@@ -3027,7 +3032,10 @@ impl Workbook {
             match value {
                 Value::Blank => {}
                 Value::Number(number) => {
-                    serials.insert(serial_date::serial_from_number_in(self.date_system, number)?);
+                    serials.insert(serial_date::serial_from_number_in(
+                        self.date_system,
+                        number,
+                    )?);
                 }
                 Value::Error(error) => return Err(error),
                 Value::Text(_) | Value::Boolean(_) => return Err(CalcError::InvalidValue),
@@ -3105,7 +3113,7 @@ impl Workbook {
                 serial_date::serial_from_number_in(system, second).and_then(|end| {
                     holidays.map(|holidays| {
                         Value::Number(
-                            serial_date::network_days_in(system, first, end, &holidays) as f64,
+                            serial_date::network_days_in(system, first, end, &holidays) as f64
                         )
                     })
                 })
@@ -3207,12 +3215,7 @@ impl Workbook {
                     principal_payment
                 };
                 calculate(
-                    numbers[0],
-                    numbers[1],
-                    numbers[2],
-                    numbers[3],
-                    future,
-                    at_start,
+                    numbers[0], numbers[1], numbers[2], numbers[3], future, at_start,
                 )
             }
             Function::Pmt | Function::Pv => {
@@ -3969,7 +3972,9 @@ impl Workbook {
                     Err(error) => Value::Error(error),
                 }
             }
-            Function::XLookup if matches!(arguments.len(), 3..=6) => self.evaluate_xlookup(arguments),
+            Function::XLookup if matches!(arguments.len(), 3..=6) => {
+                self.evaluate_xlookup(arguments)
+            }
             _ => Value::Error(CalcError::InvalidArguments),
         }
     }
@@ -4250,7 +4255,8 @@ fn xlookup_linear(
                 let replace = match best {
                     None => true,
                     Some(chosen) => {
-                        typed_compare(candidate, &candidates[chosen])? == std::cmp::Ordering::Greater
+                        typed_compare(candidate, &candidates[chosen])?
+                            == std::cmp::Ordering::Greater
                     }
                 };
                 if replace {
@@ -4274,7 +4280,11 @@ fn xlookup_linear(
     best.ok_or(CalcError::NotAvailable)
 }
 
-fn xlookup_wildcard(pattern: &str, candidates: &[Value], reverse: bool) -> Result<usize, CalcError> {
+fn xlookup_wildcard(
+    pattern: &str,
+    candidates: &[Value],
+    reverse: bool,
+) -> Result<usize, CalcError> {
     for step in 0..candidates.len() {
         let index = if reverse {
             candidates.len() - 1 - step
@@ -5138,11 +5148,7 @@ fn payment_rounded(
     if grown.is_zero() {
         return Some(Err(CalcError::InvalidNumber));
     }
-    let timing = if at_start {
-        one.add(rate)?
-    } else {
-        one
-    };
+    let timing = if at_start { one.add(rate)? } else { one };
     let result = present
         .mul(growth)?
         .add(future)?
@@ -5919,11 +5925,12 @@ enum TextFormat {
     DateUsShort,
 }
 
-/// Locale-free `TEXT` codes. `#` is the optional integer digit the sample
-/// uses; a rounded zero is an empty string. Anything else, including
-/// literals such as `0.0x`, is refused.
+/// Locale-free `TEXT` codes. Comparison ignores ASCII case and keeps
+/// surrounding whitespace, so `" 0 "` is not `"0"`. `#` is the optional
+/// integer digit the sample uses; a rounded zero is an empty string.
+/// Anything else, including literals such as `0.0x`, is refused.
 fn text_format(code: &str) -> Option<TextFormat> {
-    match code.trim().to_ascii_lowercase().as_str() {
+    match code.to_ascii_lowercase().as_str() {
         "general" => Some(TextFormat::General),
         "0" => Some(TextFormat::Integer {
             group: false,
@@ -6005,6 +6012,18 @@ fn format_text_date(
     })
 }
 
+/// `magnitude / 10^exponent` for a positive finite magnitude. Direct powers
+/// of ten underflow to zero below `1e-308`, which would turn a subnormal
+/// into an infinite mantissa.
+fn decimal_mantissa(magnitude: f64, exponent: i32) -> f64 {
+    let power = 10_f64.powi(exponent);
+    if power.is_finite() && power != 0.0 {
+        magnitude / power
+    } else {
+        (magnitude.ln() - f64::from(exponent) * std::f64::consts::LN_10).exp()
+    }
+}
+
 fn format_general(value: f64) -> Result<String, CalcError> {
     if !value.is_finite() {
         return Err(CalcError::InvalidNumber);
@@ -6016,7 +6035,10 @@ fn format_general(value: f64) -> Result<String, CalcError> {
     let magnitude = value.abs();
     let exponent = magnitude.log10().floor() as i32;
     let body = if exponent >= 11 || exponent <= -10 {
-        let mut mantissa = magnitude / 10_f64.powi(exponent);
+        let mut mantissa = decimal_mantissa(magnitude, exponent);
+        if !mantissa.is_finite() || mantissa <= 0.0 {
+            return Err(CalcError::InvalidNumber);
+        }
         let mut exponent = exponent;
         if mantissa >= 10.0 {
             mantissa /= 10.0;
@@ -6094,7 +6116,9 @@ fn format_scaled(
         return Err(CalcError::InvalidNumber);
     }
     let scaled = (value * factor).round();
-    if !scaled.is_finite() || scaled.abs() > u128::MAX as f64 {
+    // `u128::MAX as f64` is 2^128. That value does not fit in `u128`, and the
+    // cast saturates to `u128::MAX`.
+    if !scaled.is_finite() || scaled.abs() >= u128::MAX as f64 {
         return Err(CalcError::InvalidNumber);
     }
     let negative = scaled.is_sign_negative() && scaled != 0.0;
@@ -6143,7 +6167,7 @@ fn equivalent_interest_rate(periods: f64, present: f64, future: f64) -> Result<f
         return Err(CalcError::InvalidNumber);
     }
     let ratio = future / present;
-    if ratio <= 0.0 || !ratio.is_finite() {
+    if ratio < 0.0 || !ratio.is_finite() {
         return Err(CalcError::InvalidNumber);
     }
     let rate = ratio.powf(1.0 / periods) - 1.0;
@@ -7961,11 +7985,7 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
                 members: None,
             } => (anchor.row, anchor.column, rows, columns),
             Expr::Error(error) => return Ok(Expr::Error(error)),
-            _ => {
-                return Err(FormulaError::InvalidReference(
-                    "3D reference".into(),
-                ))
-            }
+            _ => return Err(FormulaError::InvalidReference("3D reference".into())),
         };
         if low == high {
             return if rows == 1 && columns == 1 {
@@ -7973,11 +7993,7 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             } else {
                 expand_range(
                     CellId::new(low, row, column),
-                    CellId::new(
-                        low,
-                        row + rows as u32 - 1,
-                        column + columns as u32 - 1,
-                    ),
+                    CellId::new(low, row + rows as u32 - 1, column + columns as u32 - 1),
                 )
             };
         }
@@ -7996,9 +8012,10 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
             return self.parse_row_range_on(sheet);
         }
         let start = self.offset;
-        while self.peek().is_some_and(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'_' | b'.')
-        }) {
+        while self
+            .peek()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'_' | b'.'))
+        {
             self.offset += 1;
         }
         if self.offset == start {
@@ -8307,11 +8324,22 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
     }
 }
 
+fn mix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
 /// Every function name the parser accepts, with its implementation. This
 /// table is the single registry: `parse_function_name` and
 /// [`supported_function_names`] both read it, and a test keeps
 /// `docs/FUNCTIONS.md` in step with it so documented counts cannot drift.
 const FUNCTION_REGISTRY: &[(&str, Function)] = &[
+    ("TODAY", Function::Today),
+    ("NOW", Function::Now),
+    ("RAND", Function::Rand),
+    ("OFFSET", Function::Offset),
+    ("INDIRECT", Function::Indirect),
     ("TRANSPOSE", Function::Transpose),
     ("MMULT", Function::MMult),
     ("DAVERAGE", Function::DAverage),
@@ -8431,12 +8459,7 @@ const FUNCTION_REGISTRY: &[(&str, Function)] = &[
     ("REPT", Function::Rept),
     ("ROW", Function::Row),
     ("COLUMN", Function::Column),
-    ("TODAY", Function::Today),
-    ("NOW", Function::Now),
-    ("RAND", Function::Rand),
     ("RANDBETWEEN", Function::RandBetween),
-    ("OFFSET", Function::Offset),
-    ("INDIRECT", Function::Indirect),
     ("DATEVALUE", Function::DateValue),
     ("ROWS", Function::Rows),
     ("CELL", Function::Cell),
@@ -8931,9 +8954,7 @@ fn stays_in_row(expression: &Expr) -> bool {
 /// AA; `reference_bounds` of the call itself does not see that origin.
 fn span_line_anchor(expression: &Expr) -> Option<CellId> {
     match expression {
-        Expr::Function(Function::Offset, arguments) => {
-            arguments.first().and_then(span_line_anchor)
-        }
+        Expr::Function(Function::Offset, arguments) => arguments.first().and_then(span_line_anchor),
         other => reference_bounds(other).map(|(start, _)| start),
     }
 }
@@ -8941,9 +8962,7 @@ fn span_line_anchor(expression: &Expr) -> Option<CellId> {
 fn dynamic_span_envelope(sheet: u32, left: &Expr, right: &Expr) -> Result<Expr, FormulaError> {
     let left_at = span_line_anchor(left);
     let right_at = span_line_anchor(right);
-    let anchor = left_at
-        .or(right_at)
-        .unwrap_or(CellId::new(sheet, 0, 0));
+    let anchor = left_at.or(right_at).unwrap_or(CellId::new(sheet, 0, 0));
     if stays_in_column(left) && stays_in_column(right) {
         let (first, last) = match (left_at, right_at) {
             (Some(left_at), Some(right_at)) => (
@@ -9090,6 +9109,89 @@ fn join_reference_range(left: Expr, right: Expr) -> Result<Expr, FormulaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_ticks_recalculate_clock_random_and_dependents() {
+        let mut w = Workbook::default();
+        w.set_formula(cell(0, 0), "=RAND()").unwrap();
+        assert_eq!(w.value(cell(0, 0)), Value::Error(CalcError::NotAvailable));
+        w.set_tick(1, 43_200_000);
+        w.set_formula(cell(0, 0), "=TODAY()").unwrap();
+        w.set_formula(cell(0, 1), "=NOW()").unwrap();
+        w.set_formula(cell(0, 2), "=RAND()").unwrap();
+        w.set_formula(cell(0, 3), "=C1+1").unwrap();
+        assert_eq!(w.value(cell(0, 0)), Value::Number(25569.0));
+        assert_eq!(w.value(cell(0, 1)), Value::Number(25569.5));
+        let initial = w.value(cell(0, 2));
+        w.set_number(cell(5, 5), 1.0);
+        assert_eq!(initial, w.value(cell(0, 2)));
+        w.set_tick(1, 43_200_000);
+        assert_eq!(initial, w.value(cell(0, 2)));
+        w.set_tick(2, 86_400_000);
+        assert_ne!(initial, w.value(cell(0, 2)));
+        assert_eq!(w.value(cell(0, 0)), Value::Number(25570.0));
+        let Value::Number(random) = w.value(cell(0, 2)) else {
+            panic!("number")
+        };
+        assert!((0.0..1.0).contains(&random));
+        assert_eq!(w.value(cell(0, 3)), Value::Number(random + 1.0));
+    }
+
+    #[test]
+    fn literal_reference_functions_track_dependencies_and_dynamic_errors() {
+        let mut w = Workbook::default();
+        w.set_number(cell(1, 0), 7.0);
+        w.set_number(cell(2, 0), 9.0);
+        w.set_formula(cell(0, 2), "=SUM(OFFSET(A1,1,0,2,1))")
+            .unwrap();
+        w.set_formula(cell(1, 2), "=SUM(INDIRECT(\"A2:A3\"))")
+            .unwrap();
+        assert_eq!(w.value(cell(0, 2)), Value::Number(16.0));
+        assert_eq!(w.value(cell(1, 2)), Value::Number(16.0));
+        w.set_number(cell(1, 0), 10.0);
+        assert_eq!(w.value(cell(0, 2)), Value::Number(19.0));
+        assert_eq!(w.value(cell(1, 2)), Value::Number(19.0));
+        assert!(w.set_formula(cell(1, 0), "=INDIRECT(\"C1\")").is_err());
+        w.set_formula(cell(0, 3), "=INDIRECT(A1)").unwrap();
+        assert_eq!(
+            w.value(cell(0, 3)),
+            Value::Error(CalcError::InvalidReference)
+        );
+        w.set_formula(cell(0, 3), "=OFFSET(A1,B1,0)").unwrap();
+        assert_eq!(w.value(cell(0, 3)), Value::Number(0.0));
+        w.set_formula(cell(0, 3), "=INDIRECT(\"[1]Other!A1\")")
+            .unwrap();
+        assert_eq!(
+            w.value(cell(0, 3)),
+            Value::Error(CalcError::InvalidReference)
+        );
+        w.set_formula(cell(0, 3), "=OFFSET(A1,-1,0)").unwrap();
+        assert_eq!(
+            w.value(cell(0, 3)),
+            Value::Error(CalcError::InvalidReference)
+        );
+    }
+
+    #[test]
+    fn rank_missing_targets_and_total_investment_loss() {
+        let mut workbook = Workbook::default();
+        for (row, formula) in [
+            "=RANK(15,{10,20,30})",
+            "=RANK(40,{10,20,30},1)",
+            "=RANK(5,{10,20,30},1)",
+        ]
+        .iter()
+        .enumerate()
+        {
+            workbook.set_formula(cell(row as u32, 0), formula).unwrap();
+            assert_eq!(
+                workbook.value(cell(row as u32, 0)),
+                Value::Error(CalcError::NotAvailable)
+            );
+        }
+        workbook.set_formula(cell(3, 0), "=RRI(10,100,0)").unwrap();
+        assert_eq!(workbook.value(cell(3, 0)), Value::Number(-1.0));
+    }
 
     #[test]
     fn deleted_and_qualified_range_endpoints_follow_reference_semantics() {
@@ -9534,10 +9636,18 @@ mod tests {
         let mut workbook = Workbook::default();
         for (column, formula, expected) in [
             (0, "=PROPER(\"don't\")", Value::Text("Don'T".into())),
-            (1, "=PROPER(\"hello world\")", Value::Text("Hello World".into())),
+            (
+                1,
+                "=PROPER(\"hello world\")",
+                Value::Text("Hello World".into()),
+            ),
             (2, "=PROPER(\"o'reilly\")", Value::Text("O'Reilly".into())),
             (3, "=PROPER(\"123abc\")", Value::Text("123Abc".into())),
-            (4, "=PROPER(\"hELLo wORLD\")", Value::Text("Hello World".into())),
+            (
+                4,
+                "=PROPER(\"hELLo wORLD\")",
+                Value::Text("Hello World".into()),
+            ),
         ] {
             workbook.set_formula(cell(0, column), formula).unwrap();
             assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
@@ -9589,7 +9699,10 @@ mod tests {
             ("=SUMIF(A1:B2,1,A4:B5)", Value::Number(40.0)),
             // Same flattened length, different shape: Excel reads A8:B8, not A8:A9.
             ("=SUMIF(A7:B7,1,A8:A9)", Value::Number(107.0)),
-            ("=SUMIF(A12:B12,1,XFD1)", Value::Error(CalcError::InvalidReference)),
+            (
+                "=SUMIF(A12:B12,1,XFD1)",
+                Value::Error(CalcError::InvalidReference),
+            ),
         ];
         for (column, (formula, expected)) in cases.into_iter().enumerate() {
             let target = cell(14, column as u32);
@@ -10250,10 +10363,7 @@ mod tests {
             .unwrap();
         assert_eq!(workbook.value(CellId::new(0, 1, 0)), Value::Number(65.0));
         workbook
-            .set_formula(
-                CellId::new(0, 2, 0),
-                "=SUM('Brownsville:New Albany'!A1:B1)",
-            )
+            .set_formula(CellId::new(0, 2, 0), "=SUM('Brownsville:New Albany'!A1:B1)")
             .unwrap();
         assert_eq!(workbook.value(CellId::new(0, 2, 0)), Value::Number(3.0));
         workbook
@@ -10266,10 +10376,7 @@ mod tests {
         workbook.set_number(CellId::new(4, 38, 6), 40.0);
         assert_eq!(workbook.value(CellId::new(0, 0, 0)), Value::Number(75.0));
         let cycle = workbook.set_formula(CellId::new(2, 38, 6), "=SUM(Brownsville:Wilton!G39)");
-        assert!(
-            matches!(cycle, Err(FormulaError::Cycle(_))),
-            "{cycle:?}"
-        );
+        assert!(matches!(cycle, Err(FormulaError::Cycle(_))), "{cycle:?}");
         assert!(matches!(
             workbook.set_formula(CellId::new(0, 4, 0), "=SUM(Brownsville:Missing!A1)"),
             Err(FormulaError::UnknownSheet(_))
@@ -10977,8 +11084,12 @@ mod tests {
             (24, "=RANK(20,A1:A7)", Value::Number(3.0)),
             (25, "=RANK(10,A1:A7,0)", Value::Number(4.0)),
             (26, "=RANK(10,A1:A7,1)", Value::Number(1.0)),
-            (27, "=RANK(0,A1:A7)", Value::Number(5.0)),
-            (28, "=RANK(2,{10,20,30})", Value::Number(4.0)),
+            (27, "=RANK(0,A1:A7)", Value::Error(CalcError::NotAvailable)),
+            (
+                28,
+                "=RANK(2,{10,20,30})",
+                Value::Error(CalcError::NotAvailable),
+            ),
             (29, "=RANK(0.3,A9:A10)", Value::Number(1.0)),
             (
                 30,
@@ -11042,10 +11153,64 @@ mod tests {
                 Value::Error(CalcError::InvalidValue),
             ),
             (45, "=RRI(1,2)", Value::Error(CalcError::InvalidArguments)),
+            (
+                46,
+                "=TEXT(1,\" 0 \")",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (47, "=TEXT(1,\"0 \")", Value::Error(CalcError::InvalidValue)),
+            (
+                48,
+                "=TEXT(1,\" general\")",
+                Value::Error(CalcError::InvalidValue),
+            ),
+            (
+                49,
+                "=TEXT(2^128,\"0\")",
+                Value::Error(CalcError::InvalidNumber),
+            ),
+            (
+                50,
+                "=TEXT(-(2^128),\"0\")",
+                Value::Error(CalcError::InvalidNumber),
+            ),
+            (
+                51,
+                "=TEXT(1E-309,\"General\")",
+                Value::Text("1E-309".into()),
+            ),
+            (
+                52,
+                "=TEXT(2^-1074,\"General\")",
+                Value::Text("4.94066E-324".into()),
+            ),
+            (
+                53,
+                "=TEXT(-(2^-1074),\"General\")",
+                Value::Text("-4.94066E-324".into()),
+            ),
         ] {
             workbook.set_formula(cell(0, column), formula).unwrap();
             assert_eq!(workbook.value(cell(0, column)), expected, "{formula}");
         }
+    }
+
+    #[test]
+    fn text_scaled_formats_the_largest_exact_f64_integer_below_two_pow_128() {
+        let boundary = u128::MAX as f64;
+        assert_eq!(
+            format_scaled(boundary, 0, false, false, ""),
+            Err(CalcError::InvalidNumber)
+        );
+        let below = f64::from_bits(boundary.to_bits() - 1);
+        assert_eq!(
+            format_scaled(below, 0, false, false, "").as_deref(),
+            Ok("340282366920938425684442744474606501888")
+        );
+        assert_eq!(
+            format_scaled(-below, 0, false, false, "").as_deref(),
+            Ok("-340282366920938425684442744474606501888")
+        );
     }
 
     #[test]
@@ -11071,6 +11236,15 @@ mod tests {
             "docs/FUNCTIONS.md must list exactly the parser registry"
         );
         assert!(documented.contains(&format!("{} function names", registry.len())));
+        let support = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/NATIVE-SPREADSHEET-SUPPORT.md"
+        ))
+        .expect("docs/NATIVE-SPREADSHEET-SUPPORT.md exists");
+        assert!(
+            support.contains(&format!("contains {} function names", registry.len())),
+            "docs/NATIVE-SPREADSHEET-SUPPORT.md must report the parser registry count"
+        );
     }
 
     #[test]
@@ -11138,12 +11312,12 @@ mod tests {
             (3, "=DAY(0)", Value::Number(1.0)),
             (4, "=DATE(1904,3,1)", Value::Number(60.0)),
             (5, "=WEEKDAY(0)", Value::Number(6.0)),
-            (6, "=TEXT(0,\"yyyy-mm-dd\")", Value::Text("1904-01-01".into())),
             (
-                7,
-                "=DATE(1900,1,1)",
-                Value::Error(CalcError::InvalidNumber),
+                6,
+                "=TEXT(0,\"yyyy-mm-dd\")",
+                Value::Text("1904-01-01".into()),
             ),
+            (7, "=DATE(1900,1,1)", Value::Error(CalcError::InvalidNumber)),
             (
                 8,
                 "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,31))",
@@ -11154,13 +11328,20 @@ mod tests {
             workbook
                 .set_formula(CellId::new(0, 0, column), formula)
                 .unwrap();
-            assert_eq!(workbook.value(CellId::new(0, 0, column)), expected, "{formula}");
+            assert_eq!(
+                workbook.value(CellId::new(0, 0, column)),
+                expected,
+                "{formula}"
+            );
         }
-        workbook.set_tick(0);
+        workbook.advance_tick(0);
         workbook
             .set_formula(CellId::new(0, 1, 0), "=TODAY()")
             .unwrap();
-        assert_eq!(workbook.value(CellId::new(0, 1, 0)), Value::Number(24_107.0));
+        assert_eq!(
+            workbook.value(CellId::new(0, 1, 0)),
+            Value::Number(24_107.0)
+        );
     }
 
     fn assert_close(actual: Value, expected: f64, tolerance: f64, label: &str) {
@@ -11286,10 +11467,7 @@ mod tests {
                 "=LET(v,A1:C1,d,A2:C2,vnz,FILTER(v,v<>0),dnz,FILTER(d,v<>0),SUM(dnz))",
                 Value::Number(40.0),
             ),
-            (
-                "=LET(x,1,x,2,x)",
-                Value::Error(CalcError::InvalidName),
-            ),
+            ("=LET(x,1,x,2,x)", Value::Error(CalcError::InvalidName)),
             ("=1*\"NaN\"", Value::Error(CalcError::InvalidValue)),
             ("=1*\"inf\"", Value::Error(CalcError::InvalidValue)),
         ];
@@ -11349,7 +11527,9 @@ mod tests {
         workbook.set_text(cell(2, 0), "x");
         workbook.set_number(cell(0, 4), 1.0);
         workbook.set_number(cell(0, 6), 9.0);
-        workbook.set_formula(cell(0, 3), "=LOOKUP(2,1/(A1:A4<>\"\"),A1:A4)").unwrap();
+        workbook
+            .set_formula(cell(0, 3), "=LOOKUP(2,1/(A1:A4<>\"\"),A1:A4)")
+            .unwrap();
         assert_eq!(workbook.value(cell(0, 3)), Value::Text("x".into()));
         workbook.set_text(cell(3, 0), "last");
         assert_eq!(workbook.value(cell(0, 3)), Value::Text("last".into()));
@@ -11357,7 +11537,9 @@ mod tests {
             .set_formula(cell(1, 3), "=LOOKUP(2,1/(E1:G1<>\"\"),E1:G1)")
             .unwrap();
         assert_eq!(workbook.value(cell(1, 3)), Value::Number(9.0));
-        workbook.set_formula(cell(2, 3), "=LOOKUP(2,1/(A6:A8<>\"\"),A6:A8)").unwrap();
+        workbook
+            .set_formula(cell(2, 3), "=LOOKUP(2,1/(A6:A8<>\"\"),A6:A8)")
+            .unwrap();
         assert_eq!(
             workbook.value(cell(2, 3)),
             Value::Error(CalcError::NotAvailable)
@@ -11369,7 +11551,10 @@ mod tests {
         let mut workbook = Workbook::default();
         let cases = [
             ("=XLOOKUP(2.5,{1,2,3},{10,20,30},,-1)", Value::Number(20.0)),
-            ("=XLOOKUP(4,{1,3,3,8},{10,30,31,80},,-1)", Value::Number(30.0)),
+            (
+                "=XLOOKUP(4,{1,3,3,8},{10,30,31,80},,-1)",
+                Value::Number(30.0),
+            ),
             (
                 "=XLOOKUP(4,{1,3,3,8},{10,30,31,80},,-1,-1)",
                 Value::Number(31.0),
@@ -11388,7 +11573,10 @@ mod tests {
             ),
             ("=XLOOKUP(4,{1,3,8},{10,30,80},,1)", Value::Number(80.0)),
             ("=XLOOKUP(3,{1,3,8},{10,30,80},,1)", Value::Number(30.0)),
-            ("=XLOOKUP(9,{1,3,8},{10,30,80},,1)", Value::Error(CalcError::NotAvailable)),
+            (
+                "=XLOOKUP(9,{1,3,8},{10,30,80},,1)",
+                Value::Error(CalcError::NotAvailable),
+            ),
             (
                 "=XLOOKUP(1,{1,3,8},{10,30,80},,3)",
                 Value::Error(CalcError::InvalidValue),
@@ -11408,13 +11596,22 @@ mod tests {
                 Value::Error(CalcError::NotAvailable),
             ),
             // Binary search on an ascending vector stops on the last equal key.
-            ("=XLOOKUP(3,{1,3,3,8},{10,30,31,80},,0,2)", Value::Number(31.0)),
-            ("=XLOOKUP(\"b*\",{\"bat\",\"car\",\"bag\"},{1,2,3},,2)", Value::Number(1.0)),
+            (
+                "=XLOOKUP(3,{1,3,3,8},{10,30,31,80},,0,2)",
+                Value::Number(31.0),
+            ),
+            (
+                "=XLOOKUP(\"b*\",{\"bat\",\"car\",\"bag\"},{1,2,3},,2)",
+                Value::Number(1.0),
+            ),
             (
                 "=XLOOKUP(\"b*\",{\"bat\",\"car\",\"bag\"},{1,2,3},,2,-1)",
                 Value::Number(3.0),
             ),
-            ("=XLOOKUP(\"c?r\",{\"bat\",\"car\",\"bag\"},{1,2,3},,2)", Value::Number(2.0)),
+            (
+                "=XLOOKUP(\"c?r\",{\"bat\",\"car\",\"bag\"},{1,2,3},,2)",
+                Value::Number(2.0),
+            ),
             (
                 "=XLOOKUP(1,{\"a\",\"b\"},{1,2},,2)",
                 Value::Error(CalcError::InvalidValue),
@@ -11423,7 +11620,10 @@ mod tests {
                 "=XLOOKUP(\"b\",{1,2,3},{10,20,30},,-1)",
                 Value::Error(CalcError::NotAvailable),
             ),
-            ("=XLOOKUP(2,{1,\"b\",3},{10,20,30},,-1)", Value::Number(10.0)),
+            (
+                "=XLOOKUP(2,{1,\"b\",3},{10,20,30},,-1)",
+                Value::Number(10.0),
+            ),
             ("=XLOOKUP(1,{1},{10},1/0)", Value::Number(10.0)),
             (
                 "=XLOOKUP(0,{1},{10},1/0,-1)",
@@ -11475,11 +11675,7 @@ mod tests {
         workbook.set_boolean(cell(2, 4), true);
         for (formula, expected, tolerance) in [
             ("=PMT(0.08/12,10,10000)", -1037.0320893, 1e-9),
-            (
-                "=PMT(0.06/12,7*12,50000000)",
-                -730427.72418903944,
-                0.0,
-            ),
+            ("=PMT(0.06/12,7*12,50000000)", -730427.72418903944, 0.0),
             (
                 "=PMT(0.08/12,10,10000,0,1)",
                 -1037.0320893 / (1.0 + 0.08 / 12.0),
@@ -11631,10 +11827,7 @@ mod tests {
         assert_eq!(workbook.value(round_trip), Value::Number(serial));
         // TEXT of a blank is "01/00/00". Day 0 is not a DATEVALUE date.
         workbook
-            .set_formula(
-                CellId::new(1, 13, 0),
-                "=DATEVALUE(TEXT(B20,\"mm/dd/yy\"))",
-            )
+            .set_formula(CellId::new(1, 13, 0), "=DATEVALUE(TEXT(B20,\"mm/dd/yy\"))")
             .unwrap();
         assert_eq!(
             workbook.value(CellId::new(1, 13, 0)),

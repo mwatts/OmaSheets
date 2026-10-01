@@ -111,6 +111,7 @@ pub enum Action {
         header: bool,
     },
     ClearFilter,
+    RefreshCalculation,
     Deduplicate {
         range: Rect,
         #[serde(default)]
@@ -256,8 +257,13 @@ pub fn edit(
     let mut structural = false;
     let mut selected_sheet = sheet.to_string();
     let mut message = "Saved locally — Ctrl+Z to undo".to_string();
+    let refresh = matches!(&action, Action::RefreshCalculation);
     let duplicate = matches!(&action, Action::DuplicateSheet { .. });
     match action {
+        Action::RefreshCalculation => {
+            commands.push(Command::Tick { at: now });
+            structural = true;
+        }
         Action::SetCells {
             row,
             column,
@@ -371,8 +377,8 @@ pub fn edit(
                                 &effective_style(document, cell),
                                 document.date_system(),
                             )
-                                .chars()
-                                .count(),
+                            .chars()
+                            .count(),
                         );
                     }
                     presentation
@@ -762,6 +768,9 @@ pub fn edit(
         undo.clear();
         message = "Saved locally. Structural changes start a new undo history.".into();
     }
+    if refresh {
+        message="Calculation time refreshed. Date and random formulas use this saved UTC tick; undo history was reset.".into();
+    }
     Ok(EditResult {
         selected_sheet,
         revision: revision(store.document(main)?),
@@ -892,8 +901,7 @@ pub fn display(
     if matches!(
         format,
         "yyyy-mm-dd" | "dd/mm/yyyy" | "mm/dd/yyyy" | "m/d/yy"
-    ) && let Ok(serial) =
-        omasheets_calc::serial_date::serial_from_number_in(date_system, number)
+    ) && let Ok(serial) = omasheets_calc::serial_date::serial_from_number_in(date_system, number)
         && let Ok(date) = omasheets_calc::serial_date::civil_from_serial_in(date_system, serial)
     {
         return match format {
