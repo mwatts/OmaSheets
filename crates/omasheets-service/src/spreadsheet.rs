@@ -372,9 +372,13 @@ pub fn edit(
                             ));
                         }
                         longest = longest.max(
-                            display(document.value(cell), &effective_style(document, cell))
-                                .chars()
-                                .count(),
+                            display(
+                                document.value(cell),
+                                &effective_style(document, cell),
+                                document.date_system(),
+                            )
+                            .chars()
+                            .count(),
                         );
                     }
                     presentation
@@ -885,7 +889,11 @@ pub fn effective_style(document: &Document, cell: CellRef) -> CellStyle {
     style
 }
 
-pub fn display(value: CellValue, style: &CellStyle) -> String {
+pub fn display(
+    value: CellValue,
+    style: &CellStyle,
+    date_system: omasheets_calc::serial_date::DateSystem,
+) -> String {
     let CellValue::Number(number) = value else {
         return plain(&value);
     };
@@ -893,8 +901,8 @@ pub fn display(value: CellValue, style: &CellStyle) -> String {
     if matches!(
         format,
         "yyyy-mm-dd" | "dd/mm/yyyy" | "mm/dd/yyyy" | "m/d/yy"
-    ) && let Ok(serial) = omasheets_calc::serial_date::serial_from_number(number)
-        && let Ok(date) = omasheets_calc::serial_date::civil_from_serial(serial)
+    ) && let Ok(serial) = omasheets_calc::serial_date::serial_from_number_in(date_system, number)
+        && let Ok(date) = omasheets_calc::serial_date::civil_from_serial_in(date_system, serial)
     {
         return match format {
             "yyyy-mm-dd" => format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
@@ -1073,4 +1081,31 @@ pub fn view(document: &Document, sheet: SheetId) -> Result<Value, ServiceError> 
         "merges":presentation.merges.iter().map(rect).collect::<Vec<_>>(),"frozen_rows":presentation.frozen_rows,"frozen_columns":presentation.frozen_columns,
         "show_grid_lines":presentation.show_grid_lines,"hidden_rows":hidden,"filter_active":presentation.filter.is_some(),"charts":charts}),
     )
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use omasheets_calc::serial_date::DateSystem;
+
+    #[test]
+    fn date_formats_follow_the_workbook_epoch() {
+        let mut style = CellStyle {
+            number_format: "yyyy-mm-dd".into(),
+            ..CellStyle::default()
+        };
+        assert_eq!(
+            display(CellValue::Number(0.0), &style, DateSystem::Excel1900),
+            "1900-01-00"
+        );
+        assert_eq!(
+            display(CellValue::Number(0.0), &style, DateSystem::Excel1904),
+            "1904-01-01"
+        );
+        style.number_format = "m/d/yy".into();
+        assert_eq!(
+            display(CellValue::Number(0.0), &style, DateSystem::Excel1904),
+            "1/1/04"
+        );
+    }
 }

@@ -1233,7 +1233,11 @@ fn export_xlsx(
         writer.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>").map_err(export_io_error)?;
 
         start_xlsx_file(&mut writer, "xl/workbook.xml")?;
-        writer.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><workbookPr date1904=\"0\"/><sheets>").map_err(export_io_error)?;
+        let date1904 = match document.date_system() {
+            omasheets_calc::serial_date::DateSystem::Excel1904 => "1",
+            omasheets_calc::serial_date::DateSystem::Excel1900 => "0",
+        };
+        write!(writer, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><workbookPr date1904=\"{date1904}\"/><sheets>").map_err(export_io_error)?;
         for (index, sheet) in sheets.iter().enumerate() {
             write!(
                 writer,
@@ -1630,6 +1634,7 @@ fn import_native_xlsx(
         Command::Import {
             source_sha256: imported.source_sha256.clone(),
             format: "xlsx".into(),
+            date_system: imported.date_system.into(),
         },
     )?;
 
@@ -2113,7 +2118,11 @@ impl Service {
                                     (column_start + column_offset) as u32,
                                 )),
                                 value: document.value(cell),
-                                display: spreadsheet::display(document.value(cell), &style),
+                                display: spreadsheet::display(
+                                    document.value(cell),
+                                    &style,
+                                    document.date_system(),
+                                ),
                                 style,
                                 note: presented
                                     .map(|entry| entry.note.clone())
@@ -2465,7 +2474,7 @@ impl Service {
                         "Notes use the OmaSheets author; chart layout uses native defaults. Case-sensitive or headerless filter criteria are exported as row visibility only.".into(),
                         "tables_checks_watches_lineage_and_branch_history_omitted".into(),
                         "Formulas whose stable bindings cannot be expressed as a current A1 rectangle are exported as calculated values.".into(),
-                        "Dates use the 1900 serial system; saved number formats are preserved. Font families use Calibri and border colours use automatic colour.".into(),
+                        "The workbook date system is written as date1904; saved number formats are preserved. Font families use Calibri and border colours use automatic colour.".into(),
                     ],
                 }))
             }

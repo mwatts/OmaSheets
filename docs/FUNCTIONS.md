@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-119 function names listed below, grouped for reading.
+120 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -36,7 +36,8 @@ refusal instead of exporting different references.
 Deliberately unsupported: clock/random evaluation without an explicit tick,
 external workbook references, 3D references, spilling array formulas,
 dynamic `INDIRECT`/`OFFSET` arguments, `CELL`, add-in (`_xll.`) calls,
-locale-sensitive parsing such as `DATEVALUE`, and the 1904 date system.
+locale-sensitive parsing such as `DATEVALUE`. A workbook uses either the
+1900 or the 1904 date system, and serials stay in that file's own epoch.
 `TEXT` accepts only the locale-free codes listed with the text functions below.
 
 Approximate lookups (`VLOOKUP`/`HLOOKUP` without `FALSE`, `MATCH` types 1 and
@@ -50,15 +51,25 @@ unsorted keys are undefined in Excel and are not promised here.
 - `TODAY`
 - `NOW`
 - `RAND`
+- `RANDBETWEEN`
 - `OFFSET`
 - `INDIRECT`
 
-`TODAY`, `NOW` and `RAND` require a persisted `Tick` event before a formula
-can be installed. Use Commands → Data → Refresh date and random formulas
-to create or update that tick. Tick timestamps are UTC Unix milliseconds. Recalculation and
-reopen reuse that tick; a new explicit tick updates the values and dependents.
-RAND uses a fixed deterministic mixing algorithm with the tick, stable native
-cell identity and call order. It is not cryptographic randomness.
+`TODAY`, `NOW`, `RAND` and `RANDBETWEEN` require a persisted `Tick` event
+before a formula can be installed. Use Commands → Data → Refresh date and
+random formulas to create or update that tick. Tick timestamps are UTC Unix
+milliseconds. Recalculation and reopen reuse that tick; a new explicit tick
+updates the values and dependents. `TODAY` is the serial of that instant's
+UTC date in the workbook's date system. `NOW` adds the time-of-day fraction.
+`RAND` returns a number greater than or equal to 0 and less than 1.
+`RANDBETWEEN(bottom, top)` truncates both arguments toward zero and returns
+an integer from that bottom through that top; `bottom > top` is `#NUM!` and
+a non-numeric argument is `#VALUE!`. Import replays a cached bare `RAND()`
+when the cache is in that half-open interval, and a cached bare `RANDBETWEEN`
+when the cache is an integer. The next tick discards those saved draws. A
+fresh draw uses a fixed deterministic mixing algorithm with the tick, stable
+native cell identity and call order. It is not cryptographic randomness, and
+Excel does not publish the seed of a saved workbook.
 
 `OFFSET` accepts bounded reference arguments with literal numeric offsets and
 sizes. `INDIRECT` accepts literal A1 text within this workbook. They compile to
@@ -195,7 +206,7 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `COLUMN`
 - `LOOKUP`
 
-### Dates (1900 serial system)
+### Dates (1900 or 1904 serial system)
 
 - `DATE`
 - `YEAR`
