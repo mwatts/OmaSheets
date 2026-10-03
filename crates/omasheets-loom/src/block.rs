@@ -109,7 +109,14 @@ struct Leaf {
     state: LeafState,
     /// The version the next commit expects; `None` until the workbook opens.
     version: Option<WorkbookVersion>,
-    dirty: bool,
+    /// Edits since the workbook opened, and how many of them are saved.
+    edits: u64,
+    saved: u64,
+    /// A save is waiting on its timer or in flight.
+    saving: bool,
+    /// A save conflicted; nothing more saves until the note reopens.
+    stopped: bool,
+    timer: Option<Task<()>>,
     commit: Option<Task<()>>,
     _open: Option<Task<()>>,
     _ui: Vec<Subscription>,
@@ -136,7 +143,11 @@ impl Leaf {
             reference: String::new(),
             state: LeafState::Idle,
             version: None,
-            dirty: false,
+            edits: 0,
+            saved: 0,
+            saving: false,
+            stopped: false,
+            timer: None,
             commit: None,
             _open: None,
             _ui: Vec::new(),
@@ -151,8 +162,7 @@ impl Leaf {
         }
         self.reference = reference;
         self.version = None;
-        self.dirty = false;
-        self.commit = None;
+        self.reset_saves();
         self._open = None;
         self._ui.clear();
         if self.reference.is_empty() {
@@ -231,18 +241,33 @@ impl Leaf {
         let readonly = self.readonly;
         view.update(cx, |view, cx| view.set_readonly(readonly, cx));
         self._ui = vec![cx.subscribe(&view, |leaf, _view, event, cx| {
-            if matches!(event, SpreadsheetUiEvent::EditCommitted { .. }) && !leaf.dirty {
-                leaf.dirty = true;
+            if matches!(event, SpreadsheetUiEvent::EditCommitted { .. }) {
+                leaf.edits += 1;
                 leaf.schedule_commit(cx);
             }
         })];
-        self.dirty = false;
+        self.reset_saves();
         self.state = LeafState::Open(view);
         cx.notify();
     }
 
+    fn reset_saves(&mut self) {
+        self.edits = 0;
+        self.saved = 0;
+        self.saving = false;
+        self.stopped = false;
+        self.timer = None;
+        self.commit = None;
+    }
+
+    /// Save 1.5 s from now unless a save is already pending; a save that
+    /// finishes with newer edits schedules the next one.
     fn schedule_commit(&mut self, cx: &mut Context<Self>) {
-        self.commit = Some(cx.spawn(async move |this, cx| {
+        if self.saving || self.stopped || self.readonly || self.edits == self.saved {
+            return;
+        }
+        self.saving = true;
+        self.timer = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(1500))
                 .await;
@@ -252,21 +277,22 @@ impl Leaf {
 
     /// Save the workbook File the block hosts, as the File page control does.
     fn flush_commit(&mut self, cx: &mut Context<Self>) {
-        if !self.dirty || self.readonly {
-            return;
-        }
         let reference = self.reference.clone();
         let (Some(expected), LeafState::Open(view)) = (self.version.clone(), &self.state) else {
+            self.saving = false;
             return;
         };
+        let edits = self.edits;
         let bytes = match view.update(cx, |view, _cx| view.session_mut().durable_bytes()) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 eprintln!("omasheets-block: {reference} has no native bytes to save");
+                self.saving = false;
                 return;
             }
             Err(error) => {
                 eprintln!("omasheets-block: {reference} did not encode: {error}");
+                self.saving = false;
                 return;
             }
         };
@@ -277,19 +303,25 @@ impl Leaf {
         };
         self.commit = Some(cx.spawn(async move |this, cx| {
             let outcome = port.commit(&reference, draft).await;
-            let _ = this.update(cx, |leaf, _cx| match outcome {
-                Ok(version) => {
-                    leaf.version = Some(version);
-                    leaf.dirty = false;
+            let _ = this.update(cx, |leaf, cx| {
+                if leaf.reference != reference {
+                    return;
                 }
-                Err(PortError::Conflict { current }) => {
-                    eprintln!("omasheets-block: {reference} changed elsewhere; not saved");
-                    leaf.version = Some(current);
-                }
-                Err(error) => {
+                leaf.saving = false;
+                match outcome {
+                    Ok(version) => {
+                        leaf.version = Some(version);
+                        leaf.saved = edits;
+                        leaf.schedule_commit(cx);
+                    }
+                    Err(PortError::Conflict { .. }) => {
+                        eprintln!(
+                            "omasheets-block: {reference} changed elsewhere; edits here are not saved until the note reopens"
+                        );
+                        leaf.stopped = true;
+                    }
                     // The next edit tries again.
-                    eprintln!("omasheets-block: {reference} did not save: {error}");
-                    leaf.dirty = false;
+                    Err(error) => eprintln!("omasheets-block: {reference} did not save: {error}"),
                 }
             });
         }));
