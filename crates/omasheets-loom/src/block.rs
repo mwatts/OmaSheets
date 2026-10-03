@@ -57,6 +57,7 @@ fn compose(block: &BlockSnapshot, window: &mut Window, cx: &mut App) -> AnyEleme
         .try_global::<BlockPort>()
         .map(|installed| installed.0.clone())
     else {
+        eprintln!("omasheets-block: no workbook port; block {key} paints a placeholder");
         return placeholder("spreadsheet port unavailable");
     };
     if !cx.has_global::<LeafCache>() {
@@ -169,6 +170,9 @@ impl Leaf {
                                 match session {
                                     Ok(session) => leaf.show(session, window, cx),
                                     Err(error) => {
+                                        eprintln!(
+                                            "omasheets-block: {reference} did not open as a workbook: {error}"
+                                        );
                                         leaf.state = LeafState::Failed(error.to_string());
                                         cx.notify();
                                     }
