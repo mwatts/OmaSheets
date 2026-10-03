@@ -114,7 +114,7 @@ struct Leaf {
     saved: u64,
     /// A save is waiting on its timer or in flight.
     saving: bool,
-    /// A save conflicted; nothing more saves until the note reopens.
+    /// A save conflicted; nothing more saves while this leaf lives (until the app restarts).
     stopped: bool,
     timer: Option<Task<()>>,
     commit: Option<Task<()>>,
@@ -316,7 +316,7 @@ impl Leaf {
                     }
                     Err(PortError::Conflict { .. }) => {
                         eprintln!(
-                            "omasheets-block: {reference} changed elsewhere; edits here are not saved until the note reopens"
+                            "omasheets-block: {reference} changed elsewhere; edits here are not saved until the app restarts"
                         );
                         leaf.stopped = true;
                     }
