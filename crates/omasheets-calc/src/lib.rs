@@ -13,8 +13,10 @@ mod matrix;
 mod reference;
 pub mod serial_date;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 /// Defined names may refer to other names; deeper chains are rejected.
 const MAX_NAME_DEPTH: usize = 8;
@@ -844,11 +846,13 @@ impl Workbook {
 
     /// Records one external cell. `link_index` is the 1-based order of
     /// `externalReferences`. `book_file` is that link's target file name, so
-    /// `[Book.xlsx]Sheet!A1` finds the same cell as `[1]Sheet!A1`. The value
-    /// is copied into a formula when the formula is compiled. The xlsx
-    /// importer fills this from the target workbook when that file is next
-    /// to the source, and from the external-link part only when the file is
-    /// absent. A later write does not recalculate formulas already compiled.
+    /// `[Book.xlsx]Sheet!A1` finds the same cell as `[1]Sheet!A1`. A scalar
+    /// is copied into a formula when the formula is compiled; a range shares
+    /// one interned array among every formula and defined name that names it.
+    /// The xlsx importer fills this from the target workbook when that file
+    /// is next to the source, and from the external-link part only when the
+    /// file is absent. A later write does not recalculate formulas already
+    /// compiled.
     pub fn cache_external_cell(
         &mut self,
         link_index: u32,
@@ -1677,7 +1681,7 @@ impl Workbook {
         }
         if matches!(function, Function::Transpose | Function::MMult) {
             return match self.matrix_array(function, arguments) {
-                Ok(array) => array.values.into_iter().next().unwrap_or(Value::Blank),
+                Ok(array) => array.values.first().cloned().unwrap_or(Value::Blank),
                 Err(error) => Value::Error(error),
             };
         }
@@ -2339,7 +2343,7 @@ impl Workbook {
         }
         let mut products = vec![1.0; expected.0 * expected.1];
         for array in &arrays {
-            for (product, value) in products.iter_mut().zip(&array.values) {
+            for (product, value) in products.iter_mut().zip(array.values.iter()) {
                 *product *= match value {
                     Value::Number(number) => *number,
                     Value::Error(error) => return Value::Error(error.clone()),
@@ -2780,7 +2784,7 @@ impl Workbook {
             Expr::RangeNode { node, .. } => output.extend(self.range_values(*node)),
             Expr::Empty => {}
             other if contains_array_operand(other) => match self.evaluate_array(other) {
-                Ok(array) => output.extend(array.values),
+                Ok(array) => output.extend(array.values.iter().cloned()),
                 Err(error) => output.push(Value::Error(error)),
             },
             other => output.push(self.evaluate(other)),
@@ -2815,11 +2819,7 @@ impl Workbook {
                 } else {
                     (values.len(), 1)
                 };
-                Ok(ArrayValue {
-                    rows,
-                    columns,
-                    values,
-                })
+                Ok(ArrayValue::from_parts(rows, columns, values))
             }
             Expr::UnaryMinus(inner) | Expr::Percent(inner) if contains_array_operand(inner) => {
                 let inner = self.evaluate_array(inner)?;
@@ -2829,14 +2829,11 @@ impl Workbook {
                 };
                 let values = inner
                     .values
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(|value| self.evaluate(&rebuild(value)))
                     .collect();
-                Ok(ArrayValue {
-                    rows: inner.rows,
-                    columns: inner.columns,
-                    values,
-                })
+                Ok(ArrayValue::from_parts(inner.rows, inner.columns, values))
             }
             Expr::Binary(operator, left, right)
                 if contains_array_operand(left) || contains_array_operand(right) =>
@@ -2854,11 +2851,7 @@ impl Workbook {
                         ));
                     }
                 }
-                Ok(ArrayValue {
-                    rows,
-                    columns,
-                    values,
-                })
+                Ok(ArrayValue::from_parts(rows, columns, values))
             }
             Expr::Function(function, arguments)
                 if (*function == Function::If || is_elementwise(*function))
@@ -2879,11 +2872,7 @@ impl Workbook {
                         values.push(self.evaluate_function(*function, &literals));
                     }
                 }
-                Ok(ArrayValue {
-                    rows,
-                    columns,
-                    values,
-                })
+                Ok(ArrayValue::from_parts(rows, columns, values))
             }
             other => Ok(ArrayValue::scalar(self.evaluate(other))),
         }
@@ -3215,11 +3204,12 @@ fn typed_compare(left: &Value, right: &Value) -> Result<std::cmp::Ordering, Calc
 }
 
 /// An intermediate array inside an aggregate argument, row-major.
+/// `values` is shared so cloning an array expression does not copy cells.
 #[derive(Clone, Debug, PartialEq)]
 struct ArrayValue {
     rows: usize,
     columns: usize,
-    values: Vec<Value>,
+    values: Arc<[Value]>,
 }
 
 /// Lookup inputs borrow constants and retain the existing range fast path.
@@ -3289,20 +3279,24 @@ impl<'a> ArrayInput<'a> {
     fn values(&self, workbook: &Workbook) -> Vec<Value> {
         match self {
             Self::Range { node, .. } => workbook.range_values(*node),
-            Self::Constant(array) => array.values.clone(),
-            Self::Selection(reference) => reference.array(workbook).values,
-            Self::Computed(array) => array.values.clone(),
+            Self::Constant(array) => array.values.to_vec(),
+            Self::Selection(reference) => reference.array(workbook).values.to_vec(),
+            Self::Computed(array) => array.values.to_vec(),
         }
     }
 }
 
 impl ArrayValue {
-    fn scalar(value: Value) -> Self {
+    fn from_parts(rows: usize, columns: usize, values: Vec<Value>) -> Self {
         Self {
-            rows: 1,
-            columns: 1,
-            values: vec![value],
+            rows,
+            columns,
+            values: Arc::from(values),
         }
+    }
+
+    fn scalar(value: Value) -> Self {
+        Self::from_parts(1, 1, vec![value])
     }
 
     fn shape(&self) -> (usize, usize) {
@@ -4763,18 +4757,28 @@ fn collect_dependencies(
 }
 
 /// One external cell addressed by link index or workbook file name.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum ExternalBook {
     Index(u32),
     File(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ExternalAddress {
     book: ExternalBook,
     sheet: String,
     row: u32,
     column: u32,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ExternalRangeKey {
+    book: ExternalBook,
+    sheet: String,
+    row: u32,
+    column: u32,
+    rows: usize,
+    columns: usize,
 }
 
 /// External cells keyed by the 1-based link index and the target file name,
@@ -4785,6 +4789,10 @@ struct ExternalAddress {
 struct ExternalCache {
     by_index: HashMap<(u32, String, u32, u32), Value>,
     by_file: HashMap<(String, String, u32, u32), Value>,
+    /// Distinct external rectangles, each stored once for every formula and
+    /// defined name that names the same cells.
+    interned: RefCell<HashMap<ExternalRangeKey, ArrayValue>>,
+    interned_cells: std::cell::Cell<usize>,
 }
 
 impl ExternalCache {
@@ -4942,8 +4950,33 @@ fn lower_external_range(
     anchor: &ExternalAddress,
     rows: usize,
     columns: usize,
-) -> Expr {
-    let mut values = Vec::with_capacity(rows * columns);
+) -> Result<Expr, FormulaError> {
+    let count = rows
+        .checked_mul(columns)
+        .ok_or(FormulaError::RangeTooLarge)?;
+    if count > MAX_RANGE_CELLS {
+        return Err(FormulaError::RangeTooLarge);
+    }
+    let key = ExternalRangeKey {
+        book: anchor.book.clone(),
+        sheet: anchor.sheet.trim().to_lowercase(),
+        row: anchor.row,
+        column: anchor.column,
+        rows,
+        columns,
+    };
+    if let Some(array) = cache.interned.borrow().get(&key).cloned() {
+        return Ok(Expr::Array(array));
+    }
+    let observed = cache
+        .interned_cells
+        .get()
+        .checked_add(count)
+        .ok_or(FormulaError::RangeTooLarge)?;
+    if observed > MAX_RANGE_CELLS {
+        return Err(FormulaError::RangeTooLarge);
+    }
+    let mut values = Vec::with_capacity(count);
     for row in 0..rows {
         for column in 0..columns {
             let value = cache
@@ -4958,11 +4991,10 @@ fn lower_external_range(
             values.push(value);
         }
     }
-    Expr::Array(ArrayValue {
-        rows,
-        columns,
-        values,
-    })
+    let array = ArrayValue::from_parts(rows, columns, values);
+    cache.interned.borrow_mut().insert(key, array.clone());
+    cache.interned_cells.set(observed);
+    Ok(Expr::Array(array))
 }
 
 fn lower_external_expressions(
@@ -4975,7 +5007,7 @@ fn lower_external_expressions(
             anchor,
             rows,
             columns,
-        } => lower_external_range(cache, &anchor, rows, columns),
+        } => lower_external_range(cache, &anchor, rows, columns)?,
         Expr::UnaryMinus(inner) => {
             Expr::UnaryMinus(Box::new(lower_external_expressions(*inner, cache)?))
         }
@@ -5317,11 +5349,11 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
                     let finished = self.peek() == Some(b'}');
                     self.offset += 1;
                     if finished {
-                        return Ok(Expr::Array(ArrayValue {
+                        return Ok(Expr::Array(ArrayValue::from_parts(
                             rows,
-                            columns: columns.expect("completed row"),
+                            columns.expect("completed row"),
                             values,
-                        }));
+                        )));
                     }
                 }
                 _ => return Err(FormulaError::UnexpectedToken(self.offset)),
@@ -5534,8 +5566,9 @@ impl<'source, 'sheets> Parser<'source, 'sheets> {
     }
 
     /// `[n]Sheet!A1`, `[Book.xlsx]Sheet!A1`, and the same forms with a range
-    /// endpoint. The cached value is copied now; a missing single cell is
-    /// `#REF!` and a missing cell inside a range is blank.
+    /// endpoint. A scalar is copied now; a range shares interned cells. A
+    /// missing single cell is `#REF!` and a missing cell inside a range is
+    /// blank.
     fn parse_external_reference(&mut self) -> Result<Expr, FormulaError> {
         let start = self.offset;
         let (book, sheet, cell) = self.parse_bare_external_address(start)?;
@@ -7650,6 +7683,57 @@ mod tests {
             .set_formula(cell(1, 0), "=SUM([1]Inputs!A1:[1]Inputs!A3)")
             .unwrap();
         assert_eq!(cached.value(cell(1, 0)), Value::Number(15.0));
+    }
+
+    #[test]
+    fn interned_external_ranges_share_storage_and_an_aggregate_budget() {
+        let mut workbook = Workbook::default();
+        workbook.cache_external_cell(1, None, "Inputs", 0, 0, Value::Number(1.0));
+        workbook.cache_external_cell(1, None, "Inputs", 1, 0, Value::Number(2.0));
+        workbook.cache_external_cell(1, None, "Rates", 0, 0, Value::Number(3.0));
+        workbook.define_name("Block", "[1]Inputs!A1:A2");
+
+        workbook
+            .set_formula(cell(0, 0), "=SUM([1]Inputs!A1:A2)+SUM([1]Inputs!A1:A2)")
+            .unwrap();
+        assert_eq!(workbook.value(cell(0, 0)), Value::Number(6.0));
+        workbook.set_formula(cell(0, 1), "=SUM(Block)").unwrap();
+        assert_eq!(workbook.value(cell(0, 1)), Value::Number(3.0));
+        workbook
+            .set_formula(cell(0, 2), "=SUM([1]Rates!A1:A2)")
+            .unwrap();
+        assert_eq!(workbook.value(cell(0, 2)), Value::Number(3.0));
+        for row in 3..203 {
+            workbook
+                .set_formula(cell(row, 0), "=SUM([1]Inputs!A1:A2)")
+                .unwrap();
+            assert_eq!(workbook.value(cell(row, 0)), Value::Number(3.0));
+        }
+        assert_eq!(workbook.external.interned.borrow().len(), 2);
+        assert_eq!(workbook.external.interned_cells.get(), 4);
+
+        let mut exact = Workbook::default();
+        exact.cache_external_cell(1, None, "Grid", 0, 0, Value::Number(4.0));
+        exact
+            .set_formula(cell(0, 0), &format!("=SUM([1]Grid!A1:A{MAX_RANGE_CELLS})"))
+            .unwrap();
+        assert_eq!(exact.value(cell(0, 0)), Value::Number(4.0));
+        assert_eq!(
+            exact.set_formula(cell(0, 1), "=SUM([1]Grid!B1:B2)"),
+            Err(FormulaError::RangeTooLarge)
+        );
+
+        let mut over = Workbook::default();
+        over.cache_external_cell(1, None, "Grid", 0, 0, Value::Number(1.0));
+        over.set_formula(cell(0, 0), "=SUM([1]Grid!A1:A2)").unwrap();
+        assert_eq!(
+            over.set_formula(
+                cell(0, 1),
+                &format!("=SUM([1]Grid!A1:A{})", MAX_RANGE_CELLS - 1)
+            ),
+            Err(FormulaError::RangeTooLarge)
+        );
+        assert_eq!(over.value(cell(0, 0)), Value::Number(1.0));
     }
 
     /// Graph vertices beyond the cells that exist: the shared range nodes.

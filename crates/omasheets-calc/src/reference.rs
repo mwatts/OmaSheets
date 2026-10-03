@@ -207,13 +207,13 @@ impl ReferenceView {
     }
 
     pub(super) fn array(self, workbook: &Workbook) -> ArrayValue {
-        ArrayValue {
-            rows: self.rows,
-            columns: self.columns,
-            values: (0..self.rows * self.columns)
+        ArrayValue::from_parts(
+            self.rows,
+            self.columns,
+            (0..self.rows * self.columns)
                 .map(|index| self.value(workbook, index))
                 .collect(),
-        }
+        )
     }
 
     pub(super) fn scalar(self, workbook: &Workbook) -> Value {
@@ -435,11 +435,7 @@ impl Workbook {
                 values.push(input.value(self, r * input_columns + c));
             }
         }
-        Ok(ArrayValue {
-            rows,
-            columns,
-            values,
-        })
+        Ok(ArrayValue::from_parts(rows, columns, values))
     }
 }
 
