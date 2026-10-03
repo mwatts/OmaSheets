@@ -603,3 +603,32 @@ fn crc32(data: &[u8]) -> u32 {
     }
     !crc
 }
+
+/// A spreadsheet embedded in a note must not pull the keyboard out of the
+/// paragraph being typed in when it finishes opening; a standalone File page
+/// still focuses its grid.
+#[gpui_kit::test]
+fn autofocus_off_leaves_focus_where_it_was(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let focused = |autofocus: bool, cx: &mut TestAppContext| {
+        let window = cx.open_window(size(px(800.), px(600.)), move |window, cx| {
+            let spreadsheet = cx.new(|cx| {
+                let mut view = SpreadsheetView::new(
+                    SpreadsheetSession::open("book").expect("session opens"),
+                    window,
+                    cx,
+                );
+                view.set_autofocus(autofocus);
+                view
+            });
+            let host = cx.new(|cx| Host::new(spreadsheet, Rc::default(), cx));
+            Root::new(host, window, cx)
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, cx| window.focused(cx).is_some())
+            .expect("window open")
+    };
+    assert!(focused(true, cx), "a File page focuses its grid");
+    assert!(!focused(false, cx), "an embed does not take focus on open");
+}
