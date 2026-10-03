@@ -36,11 +36,14 @@ refusal instead of exporting different references.
 An external workbook reference (`[1]Sheet!A1`, `[Book.xlsx]Sheet!A1`, or
 `'[Book.xlsx]Sheet 1'!A1`) compiles. Import opens a linked file when it is a
 relative path under the source workbook's directory, or when an absolute or
-`file://` target names a file sitting next to the source. Network targets and
-`..` are not opened. A workbook already being imported keeps the stored link
-cache, and that cache is also used when the file is not opened. A single cell
-with no value in the opened file or the cache is `#REF!`. A missing cell inside
-an external range is blank.
+`file://` target names a file sitting next to the source. Network targets,
+`..`, and a symlink that escapes that directory are not opened. A workbook
+already being imported keeps the stored link cache, and that cache is also
+used when the file is not opened. Cached external strings keep their decoded
+whitespace, including empty values. Occupied cells, cached link records and
+opened targets share the importer's cell budget. A single cell with no value
+in the opened file or the cache is `#REF!`. A missing cell inside an external
+range is blank.
 Deliberately unsupported: clock/random evaluation without an explicit tick,
 3D references, spilling array formulas, dynamic `INDIRECT`/`OFFSET` arguments,
 `CELL`, add-in (`_xll.`) calls, locale-sensitive parsing such as `DATEVALUE`,
