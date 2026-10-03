@@ -88,6 +88,14 @@ jobs:
           cargo build --locked --release -p omasheets-corpus
           cargo build --locked --release -p omasheets-calc --bin omasheets-calc-bench
           cargo build --locked --release -p omasheets-xlsx --bin omasheets-xlsx-score
+      - name: Check the reproducible sparse import corpus
+        run: |
+          pip install --disable-pip-version-check uv==0.12.20
+          mkdir -p "$RUNNER_TEMP/omasheets-m0"
+          uv run --no-project --with openpyxl==3.1.5 python -m scripts.check_import_corpus \
+            "$RUNNER_TEMP/omasheets-m0/import-corpus" \
+            --corpus-bin target/release/omasheets-corpus --independent-reader \
+            > "$RUNNER_TEMP/omasheets-m0/import-corpus-summary.json"
       - name: Record an owned calculation smoke benchmark
         run: |
           mkdir -p "$RUNNER_TEMP/omasheets-m0"
@@ -234,6 +242,9 @@ jobs:
         with:
           name: omasheets-m0-corpus-smoke-linux-x86_64
           path: |
+            ${{ runner.temp }}/omasheets-m0/import-corpus-summary.json
+            ${{ runner.temp }}/omasheets-m0/import-corpus/manifest.jsonl
+            ${{ runner.temp }}/omasheets-m0/import-corpus/score.json
             ${{ runner.temp }}/omasheets-m0/fixture.json
             ${{ runner.temp }}/omasheets-m0/calc-benchmark.json
             ${{ runner.temp }}/omasheets-m0/manifest.jsonl
