@@ -236,7 +236,12 @@ impl Leaf {
                 });
                 existing.clone()
             }
-            _ => cx.new(|cx| SpreadsheetView::new(session, window, cx)),
+            // A note embed never takes focus on open; a click or Tab puts it there.
+            _ => cx.new(|cx| {
+                let mut view = SpreadsheetView::new(session, window, cx);
+                view.set_autofocus(false);
+                view
+            }),
         };
         let readonly = self.readonly;
         view.update(cx, |view, cx| view.set_readonly(readonly, cx));

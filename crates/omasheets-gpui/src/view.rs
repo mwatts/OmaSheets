@@ -53,6 +53,8 @@ pub struct SpreadsheetView {
     chrome_epoch: u64,
     resize: Option<SizeDrag>,
     readonly: bool,
+    /// Focus the grid when a document is shown (off for a leaf embedded in a note).
+    autofocus: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -89,10 +91,13 @@ impl SpreadsheetView {
             chrome_epoch: 0,
             resize: None,
             readonly: false,
+            autofocus: true,
             _subscriptions: subscriptions,
         };
         cx.defer_in(window, |this, window, cx| {
-            this.grid_focus.focus(window, cx);
+            if this.autofocus {
+                this.grid_focus.focus(window, cx);
+            }
         });
         view
     }
@@ -117,7 +122,13 @@ impl SpreadsheetView {
         self.readonly
     }
 
-    /// Replaces the document the grid is showing and focuses the grid.
+    /// Whether showing a document takes keyboard focus. A host that embeds the
+    /// view among other controls turns this off so opening never steals focus.
+    pub fn set_autofocus(&mut self, autofocus: bool) {
+        self.autofocus = autofocus;
+    }
+
+    /// Replaces the document the grid is showing and, with autofocus on, focuses the grid.
     pub fn show_session(
         &mut self,
         session: SpreadsheetSession,
@@ -131,7 +142,9 @@ impl SpreadsheetView {
         self.sync_formula(window, cx);
         self.request_chrome(window, cx);
         cx.defer_in(window, |this, window, cx| {
-            this.grid_focus.focus(window, cx);
+            if this.autofocus {
+                this.grid_focus.focus(window, cx);
+            }
         });
         cx.notify();
     }
