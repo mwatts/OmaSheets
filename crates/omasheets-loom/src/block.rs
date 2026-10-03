@@ -5,20 +5,24 @@
 //! [`WorkbookPort`] so note compositions can embed a workbook by reference
 //! without forking block-view.
 
-use crate::WorkbookPort;
+use crate::{PortError, WorkbookDraft, WorkbookPort, WorkbookVersion};
 use gpui_component_block_view::{BlockSnapshot, register_custom_block};
 use gpui_shell::gpui::{
     AnyElement, App, AppContext as _, Context, Entity, Global, IntoElement as _,
     ParentElement as _, SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
-use omasheets_gpui::{SpreadsheetSession, SpreadsheetView};
+use omasheets_gpui::{SpreadsheetSession, SpreadsheetUiEvent, SpreadsheetView};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// `BlockType::Custom` name for an embedded workbook leaf.
 pub const SPREADSHEET_BLOCK: &str = "spreadsheet";
 
-struct BlockPort(Arc<dyn WorkbookPort>);
+struct BlockPort {
+    port: Arc<dyn WorkbookPort>,
+    readonly: bool,
+}
 
 impl Global for BlockPort {}
 
@@ -32,7 +36,17 @@ impl Global for LeafCache {}
 ///
 /// Safe to call more than once; later calls replace the port and composer.
 pub fn install(cx: &mut App, port: Arc<dyn WorkbookPort>) {
-    cx.set_global(BlockPort(port));
+    install_with(cx, port, false);
+}
+
+/// Like [`install`], but every leaf shows its workbook read-only and never
+/// commits (a host whose note bodies are read-only, such as Ashlar's phone).
+pub fn install_read_only(cx: &mut App, port: Arc<dyn WorkbookPort>) {
+    install_with(cx, port, true);
+}
+
+fn install_with(cx: &mut App, port: Arc<dyn WorkbookPort>, readonly: bool) {
+    cx.set_global(BlockPort { port, readonly });
     if !cx.has_global::<LeafCache>() {
         cx.set_global(LeafCache {
             leaves: HashMap::new(),
@@ -53,9 +67,9 @@ fn compose(block: &BlockSnapshot, window: &mut Window, cx: &mut App) -> AnyEleme
         .filter(|url| !url.is_empty())
         .or_else(|| block.props.get("url").cloned())
         .unwrap_or_default();
-    let Some(port) = cx
+    let Some((port, readonly)) = cx
         .try_global::<BlockPort>()
-        .map(|installed| installed.0.clone())
+        .map(|installed| (installed.port.clone(), installed.readonly))
     else {
         eprintln!("omasheets-block: no workbook port; block {key} paints a placeholder");
         return placeholder("spreadsheet port unavailable");
@@ -71,7 +85,7 @@ fn compose(block: &BlockSnapshot, window: &mut Window, cx: &mut App) -> AnyEleme
         });
         return existing.into_any_element();
     }
-    let leaf = cx.new(|cx| Leaf::new(port, reference, window, cx));
+    let leaf = cx.new(|cx| Leaf::new(port, readonly, reference, window, cx));
     cx.global_mut::<LeafCache>()
         .leaves
         .insert(key, leaf.clone());
@@ -90,8 +104,13 @@ fn placeholder(message: &str) -> AnyElement {
 
 struct Leaf {
     port: Arc<dyn WorkbookPort>,
+    readonly: bool,
     reference: String,
     state: LeafState,
+    /// The version the next commit expects; `None` until the workbook opens.
+    version: Option<WorkbookVersion>,
+    dirty: bool,
+    commit: Option<Task<()>>,
     _open: Option<Task<()>>,
     _ui: Vec<Subscription>,
 }
@@ -106,14 +125,19 @@ enum LeafState {
 impl Leaf {
     fn new(
         port: Arc<dyn WorkbookPort>,
+        readonly: bool,
         reference: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut leaf = Self {
             port,
+            readonly,
             reference: String::new(),
             state: LeafState::Idle,
+            version: None,
+            dirty: false,
+            commit: None,
             _open: None,
             _ui: Vec::new(),
         };
@@ -126,6 +150,9 @@ impl Leaf {
             return;
         }
         self.reference = reference;
+        self.version = None;
+        self.dirty = false;
+        self.commit = None;
         self._open = None;
         self._ui.clear();
         if self.reference.is_empty() {
@@ -149,6 +176,7 @@ impl Leaf {
                 }
                 match opened {
                     Ok(read) => {
+                        leaf.version = Some(read.version.clone());
                         let label = reference
                             .rsplit('/')
                             .next()
@@ -181,6 +209,7 @@ impl Leaf {
                         }));
                     }
                     Err(error) => {
+                        eprintln!("omasheets-block: {reference} did not open: {error}");
                         leaf.state = LeafState::Failed(error.to_string());
                         cx.notify();
                     }
@@ -199,8 +228,71 @@ impl Leaf {
             }
             _ => cx.new(|cx| SpreadsheetView::new(session, window, cx)),
         };
+        let readonly = self.readonly;
+        view.update(cx, |view, cx| view.set_readonly(readonly, cx));
+        self._ui = vec![cx.subscribe(&view, |leaf, _view, event, cx| {
+            if matches!(event, SpreadsheetUiEvent::EditCommitted { .. }) && !leaf.dirty {
+                leaf.dirty = true;
+                leaf.schedule_commit(cx);
+            }
+        })];
+        self.dirty = false;
         self.state = LeafState::Open(view);
         cx.notify();
+    }
+
+    fn schedule_commit(&mut self, cx: &mut Context<Self>) {
+        self.commit = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |leaf, cx| leaf.flush_commit(cx));
+        }));
+    }
+
+    /// Save the workbook File the block hosts, as the File page control does.
+    fn flush_commit(&mut self, cx: &mut Context<Self>) {
+        if !self.dirty || self.readonly {
+            return;
+        }
+        let reference = self.reference.clone();
+        let (Some(expected), LeafState::Open(view)) = (self.version.clone(), &self.state) else {
+            return;
+        };
+        let bytes = match view.update(cx, |view, _cx| view.session_mut().durable_bytes()) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                eprintln!("omasheets-block: {reference} has no native bytes to save");
+                return;
+            }
+            Err(error) => {
+                eprintln!("omasheets-block: {reference} did not encode: {error}");
+                return;
+            }
+        };
+        let port = self.port.clone();
+        let draft = WorkbookDraft {
+            expected_version: expected,
+            bytes,
+        };
+        self.commit = Some(cx.spawn(async move |this, cx| {
+            let outcome = port.commit(&reference, draft).await;
+            let _ = this.update(cx, |leaf, _cx| match outcome {
+                Ok(version) => {
+                    leaf.version = Some(version);
+                    leaf.dirty = false;
+                }
+                Err(PortError::Conflict { current }) => {
+                    eprintln!("omasheets-block: {reference} changed elsewhere; not saved");
+                    leaf.version = Some(current);
+                }
+                Err(error) => {
+                    // The next edit tries again.
+                    eprintln!("omasheets-block: {reference} did not save: {error}");
+                    leaf.dirty = false;
+                }
+            });
+        }));
     }
 }
 
