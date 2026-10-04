@@ -2,7 +2,7 @@
 
 use crate::appearance::{AppearanceError, AppearanceTile};
 use crate::session::{SpreadsheetSession, VISIBLE_COLUMNS, VISIBLE_ROWS, VisibleCell};
-use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
+use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
@@ -472,6 +472,9 @@ impl SpreadsheetView {
                     .on_action(cx.listener(|this, _: &Escape, window, cx| {
                         this.cancel_edit(window, cx);
                     }))
+                    // The single-line input commits on Enter and lets it
+                    // propagate; the edit is done, so it stops here.
+                    .on_action(|_: &Enter, _, cx| cx.stop_propagation())
                     .child(Input::new(&self.formula)),
             )
     }

@@ -632,3 +632,27 @@ fn autofocus_off_leaves_focus_where_it_was(cx: &mut TestAppContext) {
     assert!(focused(true, cx), "a File page focuses its grid");
     assert!(!focused(false, cx), "an embed does not take focus on open");
 }
+
+#[gpui_kit::test]
+fn typing_in_a_cell_and_pressing_enter_moves_one_row_down(cx: &mut TestAppContext) {
+    // A spreadsheet user types down a column: each Enter must land on the
+    // next row, or every other row is skipped.
+    let opened = open_spreadsheet(cx);
+    interact(&opened, cx, |window, cx| window.click("cell-0-0", cx));
+    interact(&opened, cx, |window, cx| window.press("7", cx));
+    interact(&opened, cx, |window, cx| window.press("enter", cx));
+    interact(&opened, cx, |window, cx| {
+        assert_eq!(
+            opened
+                .spreadsheet
+                .read(cx)
+                .session()
+                .selection_a1()
+                .as_deref(),
+            Some("A2"),
+            "one Enter commits A1 and selects the cell directly below"
+        );
+        let displayed = window.find("cell-0-0");
+        assert_eq!(displayed.value().or(displayed.label()), Some("7"));
+    });
+}
