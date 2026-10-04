@@ -2,7 +2,7 @@
 
 use crate::appearance::{AppearanceError, AppearanceTile};
 use crate::session::{SpreadsheetSession, VISIBLE_COLUMNS, VISIBLE_ROWS, VisibleCell};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
@@ -77,7 +77,11 @@ impl SpreadsheetView {
                 InputEvent::PressEnter { .. } => {
                     let text = input.read(cx).value().to_string();
                     this.session.set_formula_draft(text);
-                    this.commit_formula(window, cx);
+                    if this.commit_formula(window, cx) {
+                        // As in any spreadsheet: the edit lands and the cell below is next.
+                        this.navigate(1, 0, window, cx);
+                        this.grid_focus.focus(window, cx);
+                    }
                 }
                 InputEvent::Focus | InputEvent::Blur => {}
             },
@@ -180,10 +184,11 @@ impl SpreadsheetView {
         cx.notify();
     }
 
-    fn commit_formula(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Commits the draft into the selected cell; false when it was refused.
+    fn commit_formula(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.readonly {
             self.fail_message("workbook is read-only", cx);
-            return;
+            return false;
         }
         match self.session.commit_edit() {
             Ok((address, source)) => {
@@ -200,9 +205,39 @@ impl SpreadsheetView {
                 self.sync_formula(window, cx);
                 cx.emit(SpreadsheetUiEvent::EditCommitted { sheet, a1, source });
                 cx.notify();
+                true
             }
-            Err(error) => self.fail(error, cx),
+            Err(error) => {
+                self.fail(error, cx);
+                false
+            }
         }
+    }
+
+    /// Starts editing the selected cell in the formula field: with `typed`
+    /// replacing its contents, or with its current contents. The caret ends
+    /// the text so typing continues it.
+    fn begin_edit(&mut self, typed: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = typed {
+            self.session.set_formula_draft(text);
+        }
+        self.sync_formula(window, cx);
+        self.formula.update(cx, |input, cx| {
+            input.focus(window, cx);
+            let end = input.value().len();
+            input.set_selected_range(end..end, cx);
+        });
+        cx.notify();
+    }
+
+    /// Escape in the formula field: drop the draft and give the grid the keyboard.
+    fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(address) = self.session.selection() {
+            let _ = self.session.select(address.row, address.column);
+        }
+        self.sync_formula(window, cx);
+        self.grid_focus.focus(window, cx);
+        cx.notify();
     }
 
     fn drag_resize(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -301,6 +336,22 @@ impl SpreadsheetView {
             return false;
         }
         let jump = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+        if !self.readonly && !jump && self.session.selection().is_some() {
+            let key = event.keystroke.key.as_str();
+            if (key == "enter" || key == "f2") && !event.keystroke.modifiers.shift {
+                self.begin_edit(None, window, cx);
+                return true;
+            }
+            let typed = event
+                .keystroke
+                .key_char
+                .as_ref()
+                .filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
+            if let Some(text) = typed {
+                self.begin_edit(Some(text.clone()), window, cx);
+                return true;
+            }
+        }
         let far_back = i32::MIN;
         let far_forward = i32::MAX;
         let (rows, columns) = match event.keystroke.key.as_str() {
@@ -397,7 +448,7 @@ impl SpreadsheetView {
         cx.notify();
     }
 
-    fn formula_bar(&self) -> impl IntoElement {
+    fn formula_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self
             .session
             .selection_a1()
@@ -414,7 +465,15 @@ impl SpreadsheetView {
             .border_b_1()
             .border_color(rgb(0xd0d0d0))
             .child(div().w(px(72.)).child(label))
-            .child(div().flex_1().child(Input::new(&self.formula)))
+            .child(
+                div()
+                    .flex_1()
+                    // Escape discards the edit here rather than leaving a host's embed.
+                    .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                        this.cancel_edit(window, cx);
+                    }))
+                    .child(Input::new(&self.formula)),
+            )
     }
 
     fn sheet_labels(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -460,12 +519,13 @@ impl Render for SpreadsheetView {
         let grid = SheetGrid::from_session(&self.session, cx.entity(), self.grid_focus.clone());
         div()
             .id("omasheets-spreadsheet")
+            .debug_selector(|| "omasheets-embed".into())
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(0xffffff))
             .text_color(rgb(0x111111))
-            .child(self.formula_bar())
+            .child(self.formula_bar(cx))
             .child(self.sheet_labels(cx))
             .child(grid)
     }
@@ -659,6 +719,7 @@ impl RenderOnce for SheetGrid {
         let focus = self.focus.clone();
         div()
             .id("omasheets-grid")
+            .debug_selector(|| "omasheets-grid".into())
             .flex_1()
             .overflow_hidden()
             .track_focus(&self.focus)
