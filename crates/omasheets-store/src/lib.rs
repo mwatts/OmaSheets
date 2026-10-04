@@ -19,7 +19,7 @@ use omasheets_core::{
     Actor, ActorKind, ApplyError, BranchId, CellRef, CellValue, CheckResult, Command, Document,
     Event, EventId, Lineage, Operation, Severity, Snapshot, Touch, WatchId,
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1197,10 +1197,12 @@ mod tests {
             value: Literal::Number(42.0),
         };
         setup.store.connection.execute_batch("CREATE TRIGGER refuse_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
-        assert!(setup
-            .store
-            .append_batch(main, human(), 2_000, vec![command.clone()])
-            .is_err());
+        assert!(
+            setup
+                .store
+                .append_batch(main, human(), 2_000, vec![command.clone()])
+                .is_err()
+        );
         assert_eq!(setup.store.document(main).unwrap().digest(), before);
         setup.store.connection.execute_batch("DROP TRIGGER refuse_event; CREATE TRIGGER refuse_snapshot BEFORE INSERT ON snapshots BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
         setup.store.set_snapshot_interval(1);

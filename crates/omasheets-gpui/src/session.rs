@@ -2,10 +2,10 @@
 
 use crate::appearance::{AppearanceTile, SheetChrome, VisibleWindow};
 use crate::browse::{self, BrowseBook};
-use crate::media::{is_native_media_type, sniff_spreadsheet_media_type, XLSX_MEDIA_TYPE};
+use crate::media::{XLSX_MEDIA_TYPE, is_native_media_type, sniff_spreadsheet_media_type};
 use omasheets_core::{
-    column_letters, Actor, ActorKind, ApplyError, BranchId, CellInput, CellRef, CellValue, Command,
-    Document, DocumentId, Literal, ObjectId, SheetId,
+    Actor, ActorKind, ApplyError, BranchId, CellInput, CellRef, CellValue, Command, Document,
+    DocumentId, Literal, ObjectId, SheetId, column_letters,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
