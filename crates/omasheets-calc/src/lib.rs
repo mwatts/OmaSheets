@@ -831,6 +831,11 @@ impl Workbook {
             .or_insert_with(|| definition.into());
     }
 
+    /// Importers must retain source caches when linked inputs cannot be resolved.
+    pub fn require_external_inputs(&mut self) {
+        self.external.require_inputs = true;
+    }
+
     /// Records one external cell. `link_index` is the 1-based order of
     /// `externalReferences`. `book_file` is that link's target file name, so
     /// `[Book.xlsx]Sheet!A1` finds the same cell as `[1]Sheet!A1`. A scalar
@@ -4673,6 +4678,8 @@ struct ExternalRangeKey {
 struct ExternalCache {
     // Native event documents cannot persist external cache inputs yet.
     reject_references: bool,
+    require_inputs: bool,
+    sheets: HashSet<(ExternalBook, String)>,
     by_index: HashMap<(u32, String, u32, u32), Value>,
     by_file: HashMap<(String, String, u32, u32), Value>,
     /// Distinct external rectangles, each stored once for every formula and
@@ -4692,11 +4699,15 @@ impl ExternalCache {
         value: Value,
     ) {
         let sheet = sheet.trim().to_lowercase();
+        self.sheets
+            .insert((ExternalBook::Index(link_index), sheet.clone()));
         self.by_index
             .insert((link_index, sheet.clone(), row, column), value.clone());
         if let Some(file) = book_file {
             let file = external_file_key(file);
             if !file.is_empty() {
+                self.sheets
+                    .insert((ExternalBook::File(file.clone()), sheet.clone()));
                 self.by_file.insert((file, sheet, row, column), value);
             }
         }
@@ -4824,10 +4835,16 @@ fn external_rectangle(
     })
 }
 
-fn lower_external_scalar(cache: &ExternalCache, address: &ExternalAddress) -> Expr {
+fn lower_external_scalar(
+    cache: &ExternalCache,
+    address: &ExternalAddress,
+) -> Result<Expr, FormulaError> {
     match cache.get(&address.book, &address.sheet, address.row, address.column) {
-        Some(value) => value_to_expr(value.clone()),
-        None => Expr::Error(CalcError::InvalidReference),
+        Some(value) => Ok(value_to_expr(value.clone())),
+        None if cache.require_inputs => Err(FormulaError::ExternalReference(
+            "linked cell input is unavailable".into(),
+        )),
+        None => Ok(Expr::Error(CalcError::InvalidReference)),
     }
 }
 
@@ -4837,6 +4854,15 @@ fn lower_external_range(
     rows: usize,
     columns: usize,
 ) -> Result<Expr, FormulaError> {
+    if cache.require_inputs
+        && !cache
+            .sheets
+            .contains(&(anchor.book.clone(), anchor.sheet.trim().to_lowercase()))
+    {
+        return Err(FormulaError::ExternalReference(
+            "linked sheet inputs are unavailable".into(),
+        ));
+    }
     let count = rows
         .checked_mul(columns)
         .ok_or(FormulaError::RangeTooLarge)?;
@@ -4895,7 +4921,7 @@ fn lower_external_expressions(
         ));
     }
     Ok(match expression {
-        Expr::External(address) => lower_external_scalar(cache, &address),
+        Expr::External(address) => lower_external_scalar(cache, &address)?,
         Expr::ExternalRange {
             anchor,
             rows,

@@ -1441,6 +1441,7 @@ fn import_ranges_with_names(
         })
         .collect();
     let mut workbook = Workbook::default();
+    workbook.require_external_inputs();
     // One recalculation for the whole import instead of one per cell.
     workbook.begin_bulk();
     for sheet in &sheets {
@@ -2526,22 +2527,20 @@ mod tests {
             imported.workbook.value(CellId::new(0, 2, 2)),
             Value::Error(CalcError::InvalidReference)
         );
-        // No link target and no cache: the reference and the defined name
-        // compile, and the missing cell is `#REF!`.
-        assert_eq!(
-            imported.workbook.value(CellId::new(0, 4, 2)),
-            Value::Error(CalcError::InvalidReference)
-        );
-        assert_eq!(
-            imported.workbook.value(CellId::new(0, 5, 2)),
-            Value::Error(CalcError::InvalidReference)
-        );
+        // No linked input: refuse compilation and retain the source cache
+        // (blank here), rather than inventing an error for dependent formulas.
+        assert_eq!(imported.workbook.value(CellId::new(0, 4, 2)), Value::Blank);
+        assert_eq!(imported.workbook.value(CellId::new(0, 5, 2)), Value::Blank);
         let parity = imported.parity();
-        assert_eq!(parity.formula_cells_loaded, 5);
+        assert_eq!(parity.formula_cells_loaded, 3);
         assert_eq!(parity.stored_values_matched, 3);
         assert_eq!(
             imported.report().unsupported_reasons,
-            BTreeMap::from([("unknown_name".to_string(), 1)])
+            BTreeMap::from([
+                ("unknown_name".to_string(), 1),
+                ("external_reference".to_string(), 1),
+                ("unsupported_name".to_string(), 1)
+            ])
         );
     }
 
@@ -2683,6 +2682,36 @@ mod tests {
             link_target,
             &format!(r#"<row r="1"><cell r="A1"><v>{cache_value}</v></cell></row>"#),
         );
+    }
+
+    #[test]
+    fn unavailable_link_inputs_preserve_source_caches_and_dependents() {
+        let root = std::env::temp_dir().join(format!(
+            "omasheets-link-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = TempCleanup(root.clone());
+        let source = root.join("Source.xlsx");
+        write_linked_workbook(
+            &source,
+            "Report",
+            r#"<c r="A1"><f>[1]Inputs!B1+2</f><v>12</v></c><c r="B1"><f>SUM([2]Missing!A1:A3)</f><v>15</v></c><c r="C1"><f>A1+B1</f><v>27</v></c><c r="D1"><f>SUM([1]Inputs!A1:A3)</f><v>10</v></c>"#,
+            "",
+            "Missing.xlsx",
+            "10",
+        );
+        let imported = import_xlsx(&source, ImportLimits::default()).unwrap();
+        assert_eq!(imported.unsupported.len(), 2);
+        for (column, expected) in [12.0, 15.0, 27.0, 10.0].into_iter().enumerate() {
+            assert_eq!(
+                imported.workbook.value(CellId::new(0, 0, column as u32)),
+                Value::Number(expected)
+            );
+        }
     }
 
     #[test]
