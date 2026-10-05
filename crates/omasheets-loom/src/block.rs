@@ -48,6 +48,25 @@ pub(crate) fn touch(cx: &App) -> bool {
     cx.try_global::<BlockTouch>().is_some_and(|touch| touch.0)
 }
 
+/// The workbooks whose `reference` `matches` changed outside this app
+/// (sync, another window). Each matching embed with no unsaved edits rereads
+/// its workbook on its next paint; one with unsaved edits keeps them, and its
+/// next save meets the version conflict.
+pub fn changed_elsewhere(cx: &mut App, matches: impl Fn(&str) -> bool) {
+    let Some(cache) = cx.try_global::<LeafCache>() else {
+        return;
+    };
+    let leaves: Vec<_> = cache.leaves.values().cloned().collect();
+    for leaf in leaves {
+        leaf.update(cx, |leaf, cx| {
+            if !leaf.reference.is_empty() && matches(&leaf.reference) {
+                leaf.stale = true;
+                cx.notify();
+            }
+        });
+    }
+}
+
 /// Register the spreadsheet custom-block composer for this app.
 ///
 /// Safe to call more than once; later calls replace the port and composer.
@@ -132,6 +151,8 @@ struct Leaf {
     saving: bool,
     /// A save conflicted; nothing more saves while this leaf lives (until the app restarts).
     stopped: bool,
+    /// The workbook changed elsewhere ([`changed_elsewhere`]); reread it once clean.
+    stale: bool,
     timer: Option<Task<()>>,
     commit: Option<Task<()>>,
     _open: Option<Task<()>>,
@@ -163,6 +184,7 @@ impl Leaf {
             saved: 0,
             saving: false,
             stopped: false,
+            stale: false,
             timer: None,
             commit: None,
             _open: None,
@@ -192,7 +214,10 @@ impl Leaf {
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let reference = self.reference.clone();
         let port = self.port.clone();
-        self.state = LeafState::Opening;
+        // A reread keeps the open workbook painted until the new one is ready.
+        if !matches!(self.state, LeafState::Open(_)) {
+            self.state = LeafState::Opening;
+        }
         cx.notify();
         self._open = Some(cx.spawn_in(window, async move |this, cx| {
             let opened = port.open(&reference).await;
@@ -200,7 +225,11 @@ impl Leaf {
                 if leaf.reference != reference {
                     return;
                 }
+                let rereading = matches!(leaf.state, LeafState::Open(_));
                 match opened {
+                    Ok(read) if rereading && leaf.version.as_ref() == Some(&read.version) => {}
+                    // Typed into while the reread was in flight: keep the edit.
+                    Ok(_) if rereading && leaf.dirty() => leaf.stale = true,
                     Ok(read) => {
                         leaf.version = Some(read.version.clone());
                         let label = reference
@@ -210,7 +239,9 @@ impl Leaf {
                             .to_string();
                         let content_type = read.content_type.clone();
                         let bytes = read.bytes;
-                        leaf.state = LeafState::Opening;
+                        if !rereading {
+                            leaf.state = LeafState::Opening;
+                        }
                         leaf._open = Some(cx.spawn_in(window, async move |this, cx| {
                             let session = cx
                                 .background_spawn(async move {
@@ -222,6 +253,7 @@ impl Leaf {
                                     return;
                                 }
                                 match session {
+                                    Ok(_) if rereading && leaf.dirty() => leaf.stale = true,
                                     Ok(session) => leaf.show(session, window, cx),
                                     Err(error) => {
                                         eprintln!(
@@ -233,6 +265,9 @@ impl Leaf {
                                 }
                             });
                         }));
+                    }
+                    Err(error) if rereading => {
+                        eprintln!("omasheets-block: {reference} did not reread: {error}");
                     }
                     Err(error) => {
                         eprintln!("omasheets-block: {reference} did not open: {error}");
@@ -278,6 +313,11 @@ impl Leaf {
         self.reset_saves();
         self.state = LeafState::Open(view);
         cx.notify();
+    }
+
+    /// Edits not saved yet, or a save waiting or in flight.
+    fn dirty(&self) -> bool {
+        self.edits != self.saved || self.saving
     }
 
     fn reset_saves(&mut self) {
@@ -360,9 +400,13 @@ impl Leaf {
 impl gpui_shell::gpui::Render for Leaf {
     fn render(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl gpui_shell::gpui::IntoElement {
+        if self.stale && !self.dirty() && !matches!(self.state, LeafState::Opening) {
+            self.stale = false;
+            cx.defer_in(window, |leaf, window, cx| leaf.open(window, cx));
+        }
         match &self.state {
             LeafState::Idle | LeafState::Opening => div()
                 .w_full()

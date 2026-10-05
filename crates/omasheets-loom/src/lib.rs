@@ -16,8 +16,8 @@ mod control;
 mod port;
 
 pub use block::{
-    SPREADSHEET_BLOCK, install as install_block, install_read_only as install_block_read_only,
-    set_touch as set_block_touch,
+    SPREADSHEET_BLOCK, changed_elsewhere as block_changed_elsewhere, install as install_block,
+    install_read_only as install_block_read_only, set_touch as set_block_touch,
 };
 pub use control::{
     Options, SPREADSHEET, SpreadsheetControl, declaration, init, register, register_with,
