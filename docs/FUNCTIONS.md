@@ -1,7 +1,7 @@
 # Supported formula functions
 
 The owned M0 engine (`crates/omasheets-calc`) accepts exactly the
-128 function names listed below, grouped for reading.
+129 function names listed below, grouped for reading.
 A test in the calc crate fails when this file and the registry disagree, so
 the count here is never edited by hand: add the function to the registry and
 regenerate this list.
@@ -60,8 +60,9 @@ cached cell stays at no tick, so those formulas are not installed. `OFFSET`
 with constant arguments is an ordinary range; a dynamic shift keeps that
 shift's rectangle as its dependency envelope. `INDIRECT` accepts one A1
 reference or range, optionally sheet-qualified. A root `TRANSPOSE`, `MMULT`,
-or array constant spills into a bounded rectangle. Deliberately unsupported:
-3D references, add-in (`_xll.`) calls, and the 1904 date system. VBA and other
+or array constant spills into a bounded rectangle. A sheet span such as
+`Sheet1:Sheet3!A1` includes every sheet from the first name through the second.
+Deliberately unsupported: add-in (`_xll.`) calls and the 1904 date system. VBA and other
 workbook-defined procedures are not Excel functions and are not implemented.
 `TEXT` accepts only the locale-free codes listed
 with the text functions below.
@@ -197,6 +198,7 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `TRIM`
 - `UPPER`
 - `LOWER`
+- `PROPER`
 - `CONCAT`
 - `CONCATENATE`
 - `TEXTJOIN`
