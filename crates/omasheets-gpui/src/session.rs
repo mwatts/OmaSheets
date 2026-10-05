@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 pub const VISIBLE_ROWS: u32 = 32;
 pub const VISIBLE_COLUMNS: u32 = 12;
+const EMBED_MIN_ROWS: usize = 5;
+const EMBED_MAX_ROWS: usize = 15;
 const BACKING_ROWS: usize = 64;
 const BACKING_COLUMNS: usize = 16;
 
@@ -606,6 +608,38 @@ impl SpreadsheetSession {
             }
         }
         cells
+    }
+
+    /// Rows from the first to the last one holding a value or formula on the
+    /// active sheet; 0 for an empty sheet.
+    pub fn used_rows(&self) -> usize {
+        if let Some(book) = &self.browse {
+            let Some(sheet) = book.sheets.get(self.active) else {
+                return 0;
+            };
+            return book
+                .cells
+                .keys()
+                .filter(|(index, _, _)| *index == sheet.index)
+                .map(|(_, row, _)| *row as usize + 1)
+                .max()
+                .unwrap_or(0);
+        }
+        let (rows, columns) = self.sheet_bounds();
+        (0..rows)
+            .rev()
+            .find(|row| {
+                (0..columns).any(|column| {
+                    self.cell_ref(*row, column)
+                        .is_ok_and(|cell| self.document.cell(cell).is_some())
+                })
+            })
+            .map_or(0, |row| row + 1)
+    }
+
+    /// Rows an embed shows: the used rows plus one empty row, 5 to 15.
+    pub fn embed_rows(&self) -> usize {
+        (self.used_rows() + 1).clamp(EMBED_MIN_ROWS, EMBED_MAX_ROWS)
     }
 
     pub fn column_width_px(&self, column: usize) -> f32 {

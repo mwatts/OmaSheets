@@ -249,6 +249,8 @@ impl Leaf {
             if matches!(event, SpreadsheetUiEvent::EditCommitted { .. }) {
                 leaf.edits += 1;
                 leaf.schedule_commit(cx);
+                // A new row can grow the embed's height.
+                cx.notify();
             }
         })];
         self.reset_saves();
@@ -337,7 +339,7 @@ impl gpui_shell::gpui::Render for Leaf {
     fn render(
         &mut self,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl gpui_shell::gpui::IntoElement {
         match &self.state {
             LeafState::Idle | LeafState::Opening => div()
@@ -350,7 +352,12 @@ impl gpui_shell::gpui::Render for Leaf {
                 .min_h(px(120.))
                 .p_3()
                 .child(SharedString::from(message.clone())),
-            LeafState::Open(view) => div().w_full().min_h(px(240.)).child(view.clone()),
+            // The embed fits its used rows; a longer sheet scrolls inside the grid.
+            LeafState::Open(view) => div()
+                .w_full()
+                .overflow_hidden()
+                .h(px(view.read(cx).embed_height_px()))
+                .child(view.clone()),
         }
     }
 }
