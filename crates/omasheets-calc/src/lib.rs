@@ -454,7 +454,10 @@ impl ParsedFormula {
         // a name reference fails with `UnknownName`, as it would in a
         // workbook without definitions.
         let defined_names = DefinedNames::default();
-        let external = ExternalCache::default();
+        let external = ExternalCache {
+            reject_references: true,
+            ..ExternalCache::default()
+        };
         Parser::new(source, sheet, &lowered, &defined_names, &external)
             .parse()
             .map(|expression| Self {
@@ -477,7 +480,10 @@ impl ParsedFormula {
             .map(|(name, index)| (name.to_lowercase(), *index))
             .collect();
         let defined_names = DefinedNames::default();
-        let external = ExternalCache::default();
+        let external = ExternalCache {
+            reject_references: true,
+            ..ExternalCache::default()
+        };
         Parser::new_structured(source, sheet, &lowered, &defined_names, &external, context)
             .parse_with_metadata()
             .map(|(expression, structured_tables)| Self {
@@ -4665,6 +4671,8 @@ struct ExternalRangeKey {
 /// part only when the file is absent. This crate does not open the file.
 #[derive(Clone, Debug, Default)]
 struct ExternalCache {
+    // Native event documents cannot persist external cache inputs yet.
+    reject_references: bool,
     by_index: HashMap<(u32, String, u32, u32), Value>,
     by_file: HashMap<(String, String, u32, u32), Value>,
     /// Distinct external rectangles, each stored once for every formula and
@@ -4879,6 +4887,13 @@ fn lower_external_expressions(
     expression: Expr,
     cache: &ExternalCache,
 ) -> Result<Expr, FormulaError> {
+    if cache.reject_references
+        && matches!(&expression, Expr::External(_) | Expr::ExternalRange { .. })
+    {
+        return Err(FormulaError::ExternalReference(
+            "external inputs are unavailable in native documents".into(),
+        ));
+    }
     Ok(match expression {
         Expr::External(address) => lower_external_scalar(cache, &address),
         Expr::ExternalRange {
@@ -7425,6 +7440,36 @@ mod tests {
     }
 
     #[test]
+    fn native_parsing_refuses_external_inputs_instead_of_inventing_values() {
+        for formula in [
+            "=[1]Inputs!A1",
+            "=SUM([1]Inputs!A1:A3)",
+            "=IFERROR('[Book.xlsx]Sheet 1'!A1,0)",
+        ] {
+            assert!(
+                matches!(
+                    ParsedFormula::parse(formula, 0, &HashMap::new()),
+                    Err(FormulaError::ExternalReference(_))
+                ),
+                "{formula}"
+            );
+            assert!(
+                matches!(
+                    ParsedFormula::parse_with_structured_references(
+                        formula,
+                        0,
+                        &HashMap::new(),
+                        StructuredContext::default()
+                    ),
+                    Err(FormulaError::ExternalReference(_))
+                ),
+                "{formula}"
+            );
+        }
+        assert!(ParsedFormula::parse("=LEN(\"[1]Inputs!A1\")", 0, &HashMap::new()).is_ok());
+    }
+
+    #[test]
     fn cached_external_cells_sum_and_defined_names() {
         let mut workbook = Workbook::default();
         workbook.define_sheet(0, "Data");
@@ -8682,10 +8727,10 @@ mod tests {
             ParsedFormula::parse_with_structured_references("=[@Price]", 0, &names, context),
             Err(FormulaError::InvalidStructuredReference(_))
         ));
-        assert!(
-            ParsedFormula::parse_with_structured_references("=[1]Data!A1", 0, &names, context)
-                .is_ok()
-        );
+        assert!(matches!(
+            ParsedFormula::parse_with_structured_references("=[1]Data!A1", 0, &names, context),
+            Err(FormulaError::ExternalReference(_))
+        ));
         assert!(matches!(
             ParsedFormula::parse_with_structured_references("=[1]Data!", 0, &names, context),
             Err(FormulaError::ExternalReference(_))

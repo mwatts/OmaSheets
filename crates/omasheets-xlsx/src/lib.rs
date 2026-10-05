@@ -1083,8 +1083,12 @@ fn file_url_path(url: &str) -> Option<String> {
 }
 
 fn strip_ascii_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    (text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix))
-        .then_some(&text[prefix.len()..])
+    let head = text.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        text.get(prefix.len()..)
+    } else {
+        None
+    }
 }
 
 fn external_book_label(raw_target: &str) -> Option<String> {
@@ -2925,6 +2929,19 @@ mod tests {
             std::env::temp_dir().join(format!("omasheets-{label}-{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         (root.clone(), TempCleanup(root))
+    }
+
+    #[test]
+    fn external_file_urls_handle_short_and_unicode_targets_without_panicking() {
+        for target in ["file://a", "file://é.xlsx", "file://東京.xlsx", "file://"] {
+            let _ = local_relative_target(target);
+        }
+        assert_eq!(strip_ascii_prefix("é", "localhost"), None);
+        assert_eq!(strip_ascii_prefix("12345678é", "localhost"), None);
+        assert_eq!(
+            strip_ascii_prefix("LOCALHOST/a.xlsx", "localhost"),
+            Some("/a.xlsx")
+        );
     }
 
     #[test]

@@ -245,3 +245,5 @@ and does not fetch the target. `RANK` is a competition rank over numbers in
 the reference (ties share a rank and the next rank is skipped); a zero or
 omitted order ranks the largest first. An absent target returns `#N/A`.
 `RRI` is `(fv/pv)^(1/nper)-1`; a zero future value returns -1 (total loss).
+
+Native `.omasheets` documents do not yet persist external workbook inputs. Native import therefore retains the source cached value and reports the formula as cached-only; it does not install an external formula that would evaluate to `#REF!` or an empty-range zero. The owned XLSX scorer can resolve linked inputs separately.
