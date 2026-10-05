@@ -230,17 +230,21 @@ impl Host {
     fn show(&mut self, session: SpreadsheetSession, window: &mut Window, cx: &mut Context<Self>) {
         let view = match &self.state {
             BookState::Open(existing) => {
+                let touch = crate::block::touch(cx);
                 existing.update(cx, |view, cx| {
                     view.set_readonly(self.readonly, cx);
+                    view.set_touch(touch, cx);
                     view.show_session(session, window, cx);
                 });
                 existing.clone()
             }
             _ => {
                 let readonly = self.readonly;
+                let touch = crate::block::touch(cx);
                 let view = cx.new(|cx| {
                     let mut view = SpreadsheetView::new(session, window, cx);
                     view.set_readonly(readonly, cx);
+                    view.set_touch(touch, cx);
                     view
                 });
                 view

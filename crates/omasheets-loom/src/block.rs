@@ -32,15 +32,20 @@ struct LeafCache {
 
 impl Global for LeafCache {}
 
-/// Whether embeds use touch gestures ([`set_touch`]).
+/// Whether embeds and the File page use touch gestures ([`set_touch`]).
 struct BlockTouch(bool);
 
 impl Global for BlockTouch {}
 
-/// Open later embeds with touch gestures: a tap selects a cell and a
+/// Open later embeds and `omasheets.Spreadsheet` controls with touch gestures: a tap selects a cell and a
 /// double-tap edits it (a phone host). Independent of [`install`] order.
 pub fn set_touch(cx: &mut App, touch: bool) {
     cx.set_global(BlockTouch(touch));
+}
+
+/// Whether this app asked for touch gestures.
+pub(crate) fn touch(cx: &App) -> bool {
+    cx.try_global::<BlockTouch>().is_some_and(|touch| touch.0)
 }
 
 /// Register the spreadsheet custom-block composer for this app.
@@ -255,7 +260,7 @@ impl Leaf {
             }),
         };
         let readonly = self.readonly;
-        let touch = cx.try_global::<BlockTouch>().is_some_and(|touch| touch.0);
+        let touch = touch(cx);
         view.update(cx, |view, cx| {
             view.set_readonly(readonly, cx);
             view.set_touch(touch, cx);
