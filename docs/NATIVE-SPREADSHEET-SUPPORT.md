@@ -67,8 +67,8 @@ HYPERLINK, RANK, PV, IRR, RRI, covariance and standard-normal distribution
 functions. Bounded array constants work in aggregates and lookups, and a root
 array spills into a bounded rectangle. The registry and [function list](FUNCTIONS.md)
 are checked together. TODAY, NOW, RAND, and RANDBETWEEN consume persisted UTC
-tick events; they never read a hidden clock or change on reopen. A workbook
-with no such tick does not install those formulas. OFFSET and INDIRECT support
+tick events; they never read a hidden clock or change on reopen. With no tick
+they are `#N/A`. OFFSET and INDIRECT support
 bounded references, including a dynamic shift and A1 text.
 See FUNCTIONS.md for exact limits.
 

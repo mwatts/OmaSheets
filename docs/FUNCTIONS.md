@@ -53,18 +53,19 @@ workbook knows, with no stored value, is blank and shows 0. An unknown sheet
 or link is `#REF!`. A missing cell inside an external range on a resolved
 sheet is blank.
 `TODAY`, `NOW`, `RAND`, and `RANDBETWEEN` read the stored tick and never the
-system clock. Import sets that tick from the cached numeric value of a `TODAY()`
-or `NOW()` cell, as a 1900 serial read in UTC, before formulas are installed.
-`NOW()` keeps the time fraction when the cache has one. A workbook with no such
-cached cell stays at no tick, so those formulas are not installed. `OFFSET`
-with constant arguments is an ordinary range; a dynamic shift keeps that
-shift's rectangle as its dependency envelope. `INDIRECT` accepts one A1
-reference or range, optionally sheet-qualified. A root `TRANSPOSE`, `MMULT`,
-or array constant spills into a bounded rectangle. A sheet span such as
-`Sheet1:Sheet3!A1` includes every sheet from the first name through the second.
-Deliberately unsupported: add-in (`_xll.`) calls and the 1904 date system. VBA and other
-workbook-defined procedures are not Excel functions and are not implemented.
-`TEXT` accepts only the locale-free codes listed
+system clock. With no tick they are `#N/A`. Import sets that tick from the
+cached numeric value of a `TODAY()` or `NOW()` cell, as a serial in that
+file's date system read in UTC, before formulas are installed. `NOW()` keeps
+the time fraction when the cache has one. A workbook with no such cached cell
+stays at no tick. `OFFSET` with constant arguments is an ordinary range; a
+dynamic shift keeps that shift's rectangle as its dependency envelope.
+`INDIRECT` accepts one A1 reference or range, optionally sheet-qualified. A
+root `TRANSPOSE`, `MMULT`, or array constant spills into a bounded rectangle.
+A sheet span such as `Sheet1:Sheet3!A1` includes every sheet from the first
+name through the second. Deliberately unsupported: add-in (`_xll.`) calls.
+A workbook may use the 1900 or the 1904 date system; serials stay in the
+file's own epoch. VBA and other workbook-defined procedures are not Excel
+functions and are not implemented. `TEXT` accepts only the locale-free codes listed
 with the text functions below.
 
 Approximate lookups (`VLOOKUP`/`HLOOKUP` without `FALSE`, `MATCH` types 1 and
@@ -75,8 +76,8 @@ unsorted keys are undefined in Excel and are not promised here.
 
 ### Explicit tick and bounded references
 
-`TODAY`, `NOW`, `RAND`, and `RANDBETWEEN` require a persisted `Tick` event before a formula
-can be installed. Use Commands → Data → Refresh date and random formulas
+`TODAY`, `NOW`, `RAND`, and `RANDBETWEEN` read a persisted `Tick` event. With no
+tick they are `#N/A`. Use Commands → Data → Refresh date and random formulas
 to create or update that tick. Tick timestamps are UTC Unix milliseconds. Recalculation and
 reopen reuse that tick; a new explicit tick updates the values and dependents.
 RAND uses a fixed deterministic mixing algorithm with the tick, stable native
@@ -256,17 +257,23 @@ Formula criteria with nonmatching/blank headings are not implemented and return
 - `RRI`
 
 
-`TODAY` is the 1900 serial of the tick instant's UTC date. `NOW` adds the
-time-of-day fraction. Import replays a cached `TODAY()` or `NOW()` serial
-as that instant and does not read a clock. A workbook whose stored
-`YEARFRAC(TODAY(), …)` results all agree on one serial uses that Excel
-calculation date instead. `RAND` still will not match Excel's generator.
-`RAND` and `RANDBETWEEN` are deterministic in the tick number and the calling
-cell: the same tick replays the same value, and a new tick changes it.
-`OFFSET` refuses a result outside the grid with `#REF!` and a height or width
-over 1,000,000 cells with `#NUM!`. `INDIRECT` of A1 text, including text a
-formula produces and a whole column or row, is that reference. R1C1, 3D
-references and an external workbook are `#REF!`.
+`TODAY` is the serial of the tick instant's UTC date in the workbook's date
+system. `NOW` adds the time-of-day fraction. Import replays a cached `TODAY()`
+or `NOW()` serial as that instant and does not read a clock. A workbook whose
+stored `YEARFRAC(TODAY(), …)` results all agree on one serial uses that Excel
+calculation date instead. `RAND` returns a number greater than or equal to 0
+and less than 1. `RANDBETWEEN(bottom, top)` truncates both arguments toward
+zero and returns an integer from that bottom through that top; `bottom > top`
+is `#NUM!` and a non-numeric argument is `#VALUE!`. Import replays a cached
+bare `RAND()` when the cache is in that half-open interval, and a cached bare
+`RANDBETWEEN` when the cache is an integer. Formulas that read those cells
+then see Excel's saved draw. The next tick discards the saved draws. A new
+draw is deterministic in the tick number and the calling cell. Excel does not
+publish the seed of a saved workbook, so a fresh draw is not Excel's next
+number. `OFFSET` refuses a result outside the grid with `#REF!` and a height
+or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of A1 text, including
+text a formula produces and a whole column or row, is that reference. R1C1,
+3D references and an external workbook are `#REF!`.
 
 `GETPIVOTDATA(data_field, pivot_cell, [field, item], ...)` returns the sum
 of that data field over the pivot cache. The pivot cell must lie inside a
