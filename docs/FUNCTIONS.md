@@ -284,7 +284,9 @@ is `#NUM!` and a non-numeric argument is `#VALUE!`. Import replays a cached
 bare `RAND()` when the cache is in that half-open interval, and a cached bare
 `RANDBETWEEN` when the cache is an integer. Formulas that read those cells
 then see Excel's saved draw. The next tick discards the saved draws. A new
-draw is deterministic in the tick number and the calling cell. Excel does not
+draw is deterministic in the stored tick, stable native cell identity and call
+order. Use Commands → Data → Refresh date and random formulas to record a
+new tick. The random generator is not cryptographic. Excel does not
 publish the seed of a saved workbook, so a fresh draw is not Excel's next
 number. `OFFSET` refuses a result outside the grid with `#REF!` and a height
 or width over 1,000,000 cells with `#NUM!`. `INDIRECT` of A1 text, including

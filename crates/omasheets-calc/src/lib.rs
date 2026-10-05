@@ -9225,7 +9225,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_reference_functions_track_dependencies_and_refuse_dynamic_inputs() {
+    fn literal_reference_functions_track_dependencies_and_dynamic_errors() {
         let mut w = Workbook::default();
         w.set_number(cell(1, 0), 7.0);
         w.set_number(cell(2, 0), 9.0);

@@ -829,12 +829,7 @@ fn civil_from_days(days: i64) -> CivilDate {
 /// Convert an explicitly supplied UTC timestamp to an Excel 1900 serial.
 /// The caller owns tick persistence and timezone policy.
 pub fn from_unix_milliseconds(unix_ms: i64) -> Result<f64, CalcError> {
-    let mut serial = UNIX_EPOCH_SERIAL as f64 + unix_ms as f64 / 86_400_000.0;
-    if serial < 61.0 {
-        serial -= 1.0;
-    }
-    serial_from_number(serial)?;
-    Ok(serial)
+    serial_from_unix_millis(unix_ms)
 }
 
 #[cfg(test)]
