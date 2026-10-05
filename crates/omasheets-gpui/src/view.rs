@@ -12,6 +12,11 @@ use gpui_kit::{
 use omasheets_core::{ApplyError, Command};
 use std::path::Path;
 
+const FORMULA_BAR_PX: f32 = 32.0;
+const SHEET_TABS_PX: f32 = 28.0;
+const HEADER_PX: f32 = 22.0;
+const ROW_HEADER_PX: f32 = 48.0;
+
 /// Events a host receives through `cx.subscribe`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpreadsheetUiEvent {
@@ -55,6 +60,10 @@ pub struct SpreadsheetView {
     readonly: bool,
     /// Focus the grid when a document is shown (off for a leaf embedded in a note).
     autofocus: bool,
+    /// Phone gestures: a tap selects, a double-tap or a tap on the formula field edits.
+    touch: bool,
+    /// The formula field holds the keyboard for the selected cell.
+    editing: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -80,10 +89,34 @@ impl SpreadsheetView {
                     if this.commit_formula(window, cx) {
                         // As in any spreadsheet: the edit lands and the cell below is next.
                         this.navigate(1, 0, window, cx);
-                        this.grid_focus.focus(window, cx);
+                        if this.touch {
+                            // The keyboard stays up so a column is entered in one go.
+                            this.begin_edit(None, window, cx);
+                        } else {
+                            this.grid_focus.focus(window, cx);
+                        }
                     }
                 }
-                InputEvent::Focus | InputEvent::Blur => {}
+                InputEvent::Focus => {
+                    if this.readonly {
+                        this.grid_focus.focus(window, cx);
+                    } else {
+                        this.editing = true;
+                        cx.notify();
+                    }
+                }
+                InputEvent::Blur => {
+                    // On touch, Done or a tap outside the field commits the edit.
+                    if this.touch && this.editing {
+                        this.session
+                            .set_formula_draft(input.read(cx).value().to_string());
+                        this.commit_formula(window, cx);
+                    }
+                    if this.editing {
+                        this.editing = false;
+                        cx.notify();
+                    }
+                }
             },
         )];
         let view = Self {
@@ -96,6 +129,8 @@ impl SpreadsheetView {
             resize: None,
             readonly: false,
             autofocus: true,
+            touch: false,
+            editing: false,
             _subscriptions: subscriptions,
         };
         cx.defer_in(window, |this, window, cx| {
@@ -124,6 +159,33 @@ impl SpreadsheetView {
 
     pub fn readonly(&self) -> bool {
         self.readonly
+    }
+
+    /// Phone gestures (off by default). A tap on a cell selects it without
+    /// raising the keyboard; a double-tap, or a tap on the formula field,
+    /// edits it; while editing the formula field shows commit and discard.
+    pub fn set_touch(&mut self, touch: bool, cx: &mut Context<Self>) {
+        if self.touch != touch {
+            self.touch = touch;
+            cx.notify();
+        }
+    }
+
+    pub fn touch(&self) -> bool {
+        self.touch
+    }
+
+    /// Whether the formula field is editing the selected cell.
+    pub fn editing(&self) -> bool {
+        self.editing
+    }
+
+    /// Height for an embed: the used rows plus one empty row, 5 to 15 rows,
+    /// below the formula bar, sheet tabs, and column header.
+    pub fn embed_height_px(&self) -> f32 {
+        let rows = self.session.embed_rows();
+        let body: f32 = (0..rows).map(|row| self.session.row_height_px(row)).sum();
+        FORMULA_BAR_PX + SHEET_TABS_PX + HEADER_PX + body
     }
 
     /// Whether showing a document takes keyboard focus. A host that embeds the
@@ -218,6 +280,10 @@ impl SpreadsheetView {
     /// replacing its contents, or with its current contents. The caret ends
     /// the text so typing continues it.
     fn begin_edit(&mut self, typed: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.readonly {
+            return;
+        }
+        self.editing = true;
         if let Some(text) = typed {
             self.session.set_formula_draft(text);
         }
@@ -232,12 +298,53 @@ impl SpreadsheetView {
 
     /// Escape in the formula field: drop the draft and give the grid the keyboard.
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing = false;
         if let Some(address) = self.session.selection() {
             let _ = self.session.select(address.row, address.column);
         }
         self.sync_formula(window, cx);
         self.grid_focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// The ✓ beside the formula field: commit and leave the cell selected.
+    fn commit_and_end_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.formula.read(cx).value().to_string();
+        self.session.set_formula_draft(text);
+        self.editing = false;
+        self.commit_formula(window, cx);
+        self.grid_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// A press on a cell. On touch a single tap only selects; a double-tap edits.
+    fn press_cell(
+        &mut self,
+        row: usize,
+        column: usize,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize = None;
+        if !self.touch {
+            self.grid_focus.focus(window, cx);
+            self.select_cell(row, column, window, cx);
+            return;
+        }
+        let same = self.session.selection() == Some(crate::session::CellAddress { row, column });
+        if self.editing && !(same && click_count >= 2) {
+            // Leaving the field by tapping a cell commits, as a blur does.
+            self.commit_and_end_edit(window, cx);
+        }
+        if !same {
+            self.select_cell(row, column, window, cx);
+        }
+        if click_count >= 2 && !self.readonly {
+            self.begin_edit(None, window, cx);
+        } else if !self.editing {
+            self.grid_focus.focus(window, cx);
+        }
     }
 
     fn drag_resize(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -453,8 +560,51 @@ impl SpreadsheetView {
             .session
             .selection_a1()
             .unwrap_or_else(|| "—".to_string());
+        let view = cx.entity();
+        let edit_buttons = (self.touch && self.editing && !self.readonly).then(|| {
+            let commit = view.clone();
+            let discard = view.clone();
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .child(
+                    div()
+                        .id("omasheets-formula-commit")
+                        .aria_label("Commit")
+                        .test_support()
+                        .w(px(28.))
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child("✓")
+                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                            cx.stop_propagation();
+                            commit.update(cx, |this, cx| this.commit_and_end_edit(window, cx));
+                        }),
+                )
+                .child(
+                    div()
+                        .id("omasheets-formula-discard")
+                        .aria_label("Discard")
+                        .test_support()
+                        .w(px(28.))
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child("✕")
+                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                            cx.stop_propagation();
+                            discard.update(cx, |this, cx| this.cancel_edit(window, cx));
+                        }),
+                )
+        });
         div()
-            .h(px(32.))
+            .h(px(FORMULA_BAR_PX))
+            .flex_none()
             .w_full()
             .flex()
             .flex_row()
@@ -464,10 +614,11 @@ impl SpreadsheetView {
             .bg(rgb(0xf7f7f7))
             .border_b_1()
             .border_color(rgb(0xd0d0d0))
-            .child(div().w(px(72.)).child(label))
+            .child(div().flex_none().w(px(72.)).child(label))
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     // Escape discards the edit here rather than leaving a host's embed.
                     .on_action(cx.listener(|this, _: &Escape, window, cx| {
                         this.cancel_edit(window, cx);
@@ -475,8 +626,10 @@ impl SpreadsheetView {
                     // The single-line input commits on Enter and lets it
                     // propagate; the edit is done, so it stops here.
                     .on_action(|_: &Enter, _, cx| cx.stop_propagation())
-                    .child(Input::new(&self.formula)),
+                    // A read-only embed shows the cell but never takes the keyboard.
+                    .child(Input::new(&self.formula).disabled(self.readonly)),
             )
+            .children(edit_buttons)
     }
 
     fn sheet_labels(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -485,7 +638,8 @@ impl SpreadsheetView {
         let names = self.session.sheet_names();
         div()
             .id("omasheets-sheet-tabs")
-            .h(px(28.))
+            .h(px(SHEET_TABS_PX))
+            .flex_none()
             .w_full()
             .flex()
             .flex_row()
@@ -585,8 +739,11 @@ impl RenderOnce for SheetGrid {
         let header = div().flex().flex_row().children({
             let mut headers = vec![
                 div()
-                    .w(px(48.))
-                    .h(px(22.))
+                    .id("omasheets-corner")
+                    .test_support()
+                    .flex_none()
+                    .w(px(ROW_HEADER_PX))
+                    .h(px(HEADER_PX))
                     .bg(rgb(0xf3f3f3))
                     .border_1()
                     .border_color(rgb(0xd0d0d0)),
@@ -599,8 +756,11 @@ impl RenderOnce for SheetGrid {
                     .map(|cell| cell.column)
                     .unwrap_or(index);
                 div()
+                    .id(SharedString::from(format!("column-header-{column}")))
+                    .test_support()
+                    .flex_none()
                     .w(px(width))
-                    .h(px(22.))
+                    .h(px(HEADER_PX))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -637,7 +797,8 @@ impl RenderOnce for SheetGrid {
                 .unwrap_or(row_offset);
             let mut row = div().flex().flex_row().child(
                 div()
-                    .w(px(48.))
+                    .flex_none()
+                    .w(px(ROW_HEADER_PX))
                     .h(px(height))
                     .flex()
                     .flex_col()
@@ -695,6 +856,7 @@ impl RenderOnce for SheetGrid {
                         .id(id)
                         .aria_label(cell.text.clone())
                         .test_support()
+                        .flex_none()
                         .w(px(width))
                         .h(px(height))
                         .px_1()
@@ -705,12 +867,26 @@ impl RenderOnce for SheetGrid {
                         .text_color(rgb(font))
                         .border_1()
                         .border_color(rgb(border))
-                        .child(cell.text.clone())
-                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "cell-text-{row_index}-{column_index}"
+                                )))
+                                .test_support()
+                                .child(cell.text.clone()),
+                        )
+                        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                            // The cell decides focus; the grid's own press would
+                            // take it back from an edit a double-tap just began.
+                            cx.stop_propagation();
                             view.update(cx, |this, cx| {
-                                this.resize = None;
-                                this.grid_focus.focus(window, cx);
-                                this.select_cell(row_index, column_index, window, cx);
+                                this.press_cell(
+                                    row_index,
+                                    column_index,
+                                    event.click_count,
+                                    window,
+                                    cx,
+                                );
                             });
                         }),
                 );

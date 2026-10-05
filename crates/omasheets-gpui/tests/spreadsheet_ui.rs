@@ -656,3 +656,314 @@ fn typing_in_a_cell_and_pressing_enter_moves_one_row_down(cx: &mut TestAppContex
         assert_eq!(displayed.value().or(displayed.label()), Some("7"));
     });
 }
+
+/// An embed in a note on the phone: `width` points wide, with `setup`
+/// applied to the view before the first frame.
+fn open_embed(
+    cx: &mut TestAppContext,
+    width: f32,
+    setup: impl FnOnce(&mut SpreadsheetView, &mut Context<SpreadsheetView>) + 'static,
+) -> Opened {
+    cx.update(gpui_kit::init);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let sink = events.clone();
+    let slot: Rc<RefCell<Option<Entity<SpreadsheetView>>>> = Rc::new(RefCell::new(None));
+    let slot_for_open = slot.clone();
+    let window = cx.open_window(size(px(width), px(700.)), move |window, cx| {
+        let spreadsheet = cx.new(|cx| {
+            let mut view = SpreadsheetView::new(
+                SpreadsheetSession::open("book").expect("session opens"),
+                window,
+                cx,
+            );
+            setup(&mut view, cx);
+            view
+        });
+        slot_for_open.borrow_mut().replace(spreadsheet.clone());
+        let host = cx.new(|cx| Host::new(spreadsheet, sink, cx));
+        Root::new(host, window, cx)
+    });
+    // GPUI delivers focus and blur callbacks only to an active window.
+    cx.update_window(window.into(), |_, window, _| window.activate_window())
+        .expect("window open");
+    cx.run_until_parked();
+    Opened {
+        window,
+        spreadsheet: slot.borrow().clone().expect("spreadsheet mounted"),
+        events,
+    }
+}
+
+/// Writes `source` into a cell through the session, as a host restore would.
+fn put(view: &mut SpreadsheetView, row: usize, column: usize, source: &str) {
+    let session = view.session_mut();
+    session.select(row, column).expect("cell in view");
+    session.set_formula_draft(source.to_string());
+    session.commit_edit().expect("edit commits");
+}
+
+fn cell_text(opened: &Opened, cx: &mut TestAppContext, id: &str) -> String {
+    let mut text = String::new();
+    interact(opened, cx, |window, _cx| {
+        let cell = window.find(id.to_string());
+        text = cell
+            .value()
+            .or(cell.label())
+            .unwrap_or_default()
+            .to_string();
+    });
+    text
+}
+
+fn formula_focused(opened: &Opened, cx: &mut TestAppContext) -> bool {
+    let mut focused = false;
+    interact(opened, cx, |window, _cx| {
+        let id = formula_bar_id(window);
+        focused = window.find(id).focused() == Some(true);
+    });
+    focused
+}
+
+/// On a 390 pt phone the grid is wider than the note. The owner saw columns
+/// drift from their headers and "343" painted as "43": cells shrank to fit.
+/// Every column keeps its width, so headers line up and numbers paint whole.
+#[gpui_kit::test]
+fn a_narrow_embed_keeps_columns_aligned_and_numbers_whole(cx: &mut TestAppContext) {
+    let opened = open_embed(cx, 390.0, |view, _cx| {
+        put(view, 0, 0, "343");
+        put(view, 0, 2, "343");
+    });
+    interact(&opened, cx, |window, cx| {
+        let session = opened.spreadsheet.read(cx).session();
+        let mut checked = 0;
+        for column in 0..12 {
+            let header = window.find(format!("column-header-{column}")).bounds();
+            if header.origin.x >= px(390.) {
+                break;
+            }
+            checked += 1;
+            let width = session.column_width_px(column);
+            assert!(
+                (header.size.width.as_f32() - width).abs() < 0.5,
+                "column {column} header keeps its {width} px width, got {:?}",
+                header.size.width
+            );
+            for row in [0, 1, 5] {
+                let cell = window.find(format!("cell-{row}-{column}")).bounds();
+                assert_eq!(
+                    cell.origin.x, header.origin.x,
+                    "cell {row},{column} sits under its column header"
+                );
+                assert_eq!(cell.size.width, header.size.width);
+            }
+        }
+        assert!(
+            checked >= 4,
+            "at least four columns are in view, got {checked}"
+        );
+        for column in [0, 2] {
+            let cell = window.find(format!("cell-0-{column}")).bounds();
+            let text = window.find(format!("cell-text-0-{column}")).bounds();
+            assert!(
+                text.origin.x >= cell.origin.x && text.right() <= cell.right(),
+                "343 in column {column} paints inside its cell: text {text:?}, cell {cell:?}"
+            );
+        }
+    });
+}
+
+/// A note shows a small table at its size and a long one in a window that
+/// scrolls, never a fixed block clipped at row 8.
+#[gpui_kit::test]
+fn embed_height_fits_used_rows_between_five_and_fifteen(_cx: &mut TestAppContext) {
+    let mut session = SpreadsheetSession::open("book").expect("session opens");
+    assert_eq!(session.embed_rows(), 5, "an empty sheet still shows 5 rows");
+    for row in 0..3 {
+        session.select(row, 0).expect("cell");
+        session.set_formula_draft(format!("{row}"));
+        session.commit_edit().expect("commit");
+    }
+    assert_eq!(session.used_rows(), 3);
+    assert_eq!(
+        session.embed_rows(),
+        5,
+        "3 used rows plus one empty, at least 5"
+    );
+    for row in 0..40 {
+        session.select(row, 1).expect("cell");
+        session.set_formula_draft(format!("{row}"));
+        session.commit_edit().expect("commit");
+    }
+    assert_eq!(session.used_rows(), 40);
+    assert_eq!(
+        session.embed_rows(),
+        15,
+        "a long sheet stops at 15 rows and scrolls"
+    );
+}
+
+#[gpui_kit::test]
+fn embed_height_counts_chrome_and_row_heights(cx: &mut TestAppContext) {
+    let opened = open_embed(cx, 390.0, |view, _cx| {
+        for row in 0..3 {
+            put(view, row, 0, "1");
+        }
+    });
+    let height = cx.update(|cx| opened.spreadsheet.read(cx).embed_height_px());
+    // Formula bar 32, sheet tabs 28, column header 22, five 22 px rows.
+    assert_eq!(height, 32.0 + 28.0 + 22.0 + 5.0 * 22.0);
+}
+
+/// Phone gestures from Numbers and Google Sheets: tapping around a sheet
+/// must not raise the keyboard; a double-tap edits; Return walks down a column.
+#[gpui_kit::test]
+fn touch_tap_selects_and_double_tap_edits(cx: &mut TestAppContext) {
+    let opened = open_embed(cx, 390.0, |view, cx| {
+        view.set_autofocus(false);
+        view.set_touch(true, cx);
+        put(view, 0, 0, "12");
+        put(view, 1, 1, "5");
+    });
+    interact(&opened, cx, |window, cx| window.click("cell-1-1", cx));
+    let state = cx.update(|cx| {
+        let view = opened.spreadsheet.read(cx);
+        (view.session().selection_a1(), view.editing())
+    });
+    assert_eq!(state, (Some("B2".to_string()), false), "a tap only selects");
+    assert!(
+        !formula_focused(&opened, cx),
+        "a tap leaves the keyboard down"
+    );
+
+    interact(&opened, cx, |window, cx| {
+        window.double_click("cell-0-0", cx)
+    });
+    assert!(formula_focused(&opened, cx), "a double-tap edits the cell");
+    let draft = cx.update(|cx| {
+        opened
+            .spreadsheet
+            .read(cx)
+            .session()
+            .formula_draft()
+            .to_string()
+    });
+    assert_eq!(draft, "12", "the edit starts from the cell's contents");
+
+    interact(&opened, cx, |window, cx| window.input("3", cx));
+    interact(&opened, cx, |window, cx| window.press("enter", cx));
+    assert_eq!(cell_text(&opened, cx, "cell-0-0"), "123", "Return commits");
+    let state = cx.update(|cx| {
+        let view = opened.spreadsheet.read(cx);
+        (view.session().selection_a1(), view.editing())
+    });
+    assert_eq!(
+        state,
+        (Some("A2".to_string()), true),
+        "and edits the cell below"
+    );
+    assert!(formula_focused(&opened, cx), "the keyboard stays up");
+
+    interact(&opened, cx, |window, cx| window.input("7", cx));
+    interact(&opened, cx, |window, cx| {
+        window.click("omasheets-formula-commit", cx)
+    });
+    assert_eq!(cell_text(&opened, cx, "cell-1-0"), "7", "✓ commits");
+    let state = cx.update(|cx| {
+        let view = opened.spreadsheet.read(cx);
+        (view.session().selection_a1(), view.editing())
+    });
+    assert_eq!(
+        state,
+        (Some("A2".to_string()), false),
+        "✓ ends the edit on the same cell"
+    );
+    assert!(!formula_focused(&opened, cx));
+    let shown = cx.update_window(opened.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find("omasheets-formula-commit").is_some()
+    });
+    assert_eq!(shown.ok(), Some(false), "✓ and ✕ show only while editing");
+
+    interact(&opened, cx, |window, cx| {
+        window.double_click("cell-2-0", cx)
+    });
+    interact(&opened, cx, |window, cx| window.input("9", cx));
+    interact(&opened, cx, |window, cx| {
+        window.click("omasheets-formula-discard", cx)
+    });
+    assert_eq!(cell_text(&opened, cx, "cell-2-0"), "", "✕ discards");
+    let state = cx.update(|cx| {
+        let view = opened.spreadsheet.read(cx);
+        (view.session().selection_a1(), view.editing())
+    });
+    assert_eq!(
+        state,
+        (Some("A3".to_string()), false),
+        "✕ ends the edit on the same cell"
+    );
+
+    // A tap on the formula field edits the selected cell too.
+    interact(&opened, cx, |window, cx| {
+        window.click(formula_bar_id(window), cx)
+    });
+    assert!(
+        formula_focused(&opened, cx),
+        "a tap on the formula field edits"
+    );
+    let editing = cx.update(|cx| opened.spreadsheet.read(cx).editing());
+    assert!(editing, "the field shows ✓ and ✕ while editing");
+    interact(&opened, cx, |window, cx| {
+        window.click("omasheets-formula-discard", cx)
+    });
+
+    // Done on the keyboard, or a tap outside the field, blurs it: that commits.
+    interact(&opened, cx, |window, cx| {
+        window.double_click("cell-2-0", cx)
+    });
+    interact(&opened, cx, |window, cx| window.input("4", cx));
+    interact(&opened, cx, |window, cx| window.blur(cx));
+    assert_eq!(cell_text(&opened, cx, "cell-2-0"), "4", "blur commits");
+    let editing = cx.update(|cx| opened.spreadsheet.read(cx).editing());
+    assert!(!editing, "blur ends the edit");
+}
+
+/// A read-only embed (Ashlar's phone before editing is allowed) used to take
+/// typing and then refuse Enter silently. Its formula field only shows.
+#[gpui_kit::test]
+fn read_only_formula_field_takes_no_focus_or_typing(cx: &mut TestAppContext) {
+    for touch in [false, true] {
+        let opened = open_embed(cx, 390.0, move |view, cx| {
+            view.set_autofocus(false);
+            view.set_touch(touch, cx);
+            put(view, 0, 0, "12");
+            view.set_readonly(true, cx);
+        });
+        interact(&opened, cx, |window, cx| window.click("cell-0-0", cx));
+        interact(&opened, cx, |window, cx| {
+            window.click(formula_bar_id(window), cx)
+        });
+        assert!(
+            !formula_focused(&opened, cx),
+            "touch={touch}: a click does not focus it"
+        );
+        interact(&opened, cx, |window, cx| window.input("9", cx));
+        interact(&opened, cx, |window, cx| {
+            window.double_click("cell-0-0", cx)
+        });
+        interact(&opened, cx, |window, cx| window.input("8", cx));
+        assert!(
+            !formula_focused(&opened, cx),
+            "touch={touch}: a double-tap does not edit"
+        );
+        let (draft, editing) = cx.update(|cx| {
+            let view = opened.spreadsheet.read(cx);
+            (view.session().formula_draft().to_string(), view.editing())
+        });
+        assert_eq!(
+            draft, "12",
+            "touch={touch}: the field shows the cell and typing changes nothing"
+        );
+        assert!(!editing);
+        assert_eq!(cell_text(&opened, cx, "cell-0-0"), "12");
+    }
+}
