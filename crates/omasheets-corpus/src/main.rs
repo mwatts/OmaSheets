@@ -457,6 +457,16 @@ fn sanitize_error(error: impl ToString, path: &Path) -> String {
     redacted.chars().take(512).collect()
 }
 
+/// `true` when the kernel has no `RLIMIT_AS` ceiling. macOS defines the
+/// constant and `setrlimit` returns `EINVAL`. Other kernels may return
+/// `ENOTSUP`. A permission failure is not this case.
+fn address_space_limit_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EINVAL || code == libc::ENOTSUP
+    )
+}
+
 #[cfg(unix)]
 fn apply_probe_resource_limits() -> Result<(), String> {
     let limit = libc::rlimit {
@@ -465,13 +475,16 @@ fn apply_probe_resource_limits() -> Result<(), String> {
     };
     let result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
     if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "failed to apply the probe address-space limit: {}",
-            io::Error::last_os_error()
-        ))
+        return Ok(());
     }
+    let error = io::Error::last_os_error();
+    if address_space_limit_unsupported(&error) {
+        // The per-file timeout and output caps still bound the probe.
+        return Ok(());
+    }
+    Err(format!(
+        "failed to apply the probe address-space limit: {error}"
+    ))
 }
 
 #[cfg(not(unix))]
@@ -1025,6 +1038,17 @@ mod tests {
         assert_eq!(parse_score_options(&options).unwrap(), (12, true));
         assert!(parse_score_options(&["--timeout-seconds".into(), "0".into()]).is_err());
         assert!(parse_score_options(&["--unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn macos_rejects_the_address_space_ceiling_without_failing_the_probe() {
+        let unsupported = io::Error::from_raw_os_error(libc::EINVAL);
+        let also_unsupported = io::Error::from_raw_os_error(libc::ENOTSUP);
+        let refused = io::Error::from_raw_os_error(libc::EPERM);
+        assert!(address_space_limit_unsupported(&unsupported));
+        assert!(address_space_limit_unsupported(&also_unsupported));
+        assert!(!address_space_limit_unsupported(&refused));
+        apply_probe_resource_limits().expect("a missing ceiling must not fail the probe");
     }
 
     #[test]
