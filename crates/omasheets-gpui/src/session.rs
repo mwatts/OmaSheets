@@ -60,6 +60,9 @@ pub struct SpreadsheetSession {
     row_px: HashMap<(usize, usize), f32>,
     /// When set, formula-bar commands append into this native store.
     native: Option<NativeDurable>,
+    /// Whole rows and columns the host paints, at most the visible window.
+    fit_rows: u32,
+    fit_columns: u32,
 }
 
 impl SpreadsheetSession {
@@ -127,6 +130,8 @@ impl SpreadsheetSession {
             column_px: HashMap::new(),
             row_px: HashMap::new(),
             native: None,
+            fit_rows: VISIBLE_ROWS,
+            fit_columns: VISIBLE_COLUMNS,
         })
     }
 
@@ -275,6 +280,8 @@ impl SpreadsheetSession {
             column_px: HashMap::new(),
             row_px: HashMap::new(),
             native: None,
+            fit_rows: VISIBLE_ROWS,
+            fit_columns: VISIBLE_COLUMNS,
         }
     }
 
@@ -406,6 +413,8 @@ impl SpreadsheetSession {
             column_px: HashMap::new(),
             row_px: HashMap::new(),
             native: None,
+            fit_rows: VISIBLE_ROWS,
+            fit_columns: VISIBLE_COLUMNS,
         })
     }
 
@@ -637,6 +646,13 @@ impl SpreadsheetSession {
             .map_or(0, |row| row + 1)
     }
 
+    /// How many whole rows and columns the view paints. Moving the selection
+    /// scrolls so the selected cell stays inside them.
+    pub fn set_fit(&mut self, rows: u32, columns: u32) {
+        self.fit_rows = rows.clamp(1, VISIBLE_ROWS);
+        self.fit_columns = columns.clamp(1, VISIBLE_COLUMNS);
+    }
+
     /// Rows an embed shows: the used rows plus one empty row, 5 to 15.
     pub fn embed_rows(&self) -> usize {
         (self.used_rows() + 1).clamp(EMBED_MIN_ROWS, EMBED_MAX_ROWS)
@@ -853,22 +869,22 @@ impl SpreadsheetSession {
         let column = u32::try_from(column).unwrap_or(u32::MAX);
         if row < self.origin_row {
             self.origin_row = row;
-        } else if row >= self.origin_row.saturating_add(VISIBLE_ROWS) {
-            self.origin_row = row + 1 - VISIBLE_ROWS;
+        } else if row >= self.origin_row.saturating_add(self.fit_rows) {
+            self.origin_row = row + 1 - self.fit_rows;
         }
         if column < self.origin_column {
             self.origin_column = column;
-        } else if column >= self.origin_column.saturating_add(VISIBLE_COLUMNS) {
-            self.origin_column = column + 1 - VISIBLE_COLUMNS;
+        } else if column >= self.origin_column.saturating_add(self.fit_columns) {
+            self.origin_column = column + 1 - self.fit_columns;
         }
         self.clamp_origin();
     }
 
     fn clamp_origin(&mut self) {
         let (rows, columns) = self.sheet_bounds();
-        let max_row = u32::try_from(rows.saturating_sub(VISIBLE_ROWS as usize)).unwrap_or(u32::MAX);
+        let max_row = u32::try_from(rows.saturating_sub(self.fit_rows as usize)).unwrap_or(u32::MAX);
         let max_column =
-            u32::try_from(columns.saturating_sub(VISIBLE_COLUMNS as usize)).unwrap_or(u32::MAX);
+            u32::try_from(columns.saturating_sub(self.fit_columns as usize)).unwrap_or(u32::MAX);
         self.origin_row = self.origin_row.min(max_row);
         self.origin_column = self.origin_column.min(max_column);
     }
