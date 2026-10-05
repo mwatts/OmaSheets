@@ -229,9 +229,11 @@ impl Leaf {
                 match opened {
                     Ok(read) if rereading && leaf.version.as_ref() == Some(&read.version) => {}
                     // Typed into while the reread was in flight: keep the edit.
-                    Ok(_) if rereading && leaf.dirty() => leaf.stale = true,
+                    Ok(_) if rereading && leaf.dirty(cx) => leaf.stale = true,
                     Ok(read) => {
-                        leaf.version = Some(read.version.clone());
+                        // The version moves only with the session it names, so a
+                        // save never claims a version whose cells it lacks.
+                        let version = read.version.clone();
                         let label = reference
                             .rsplit('/')
                             .next()
@@ -253,8 +255,11 @@ impl Leaf {
                                     return;
                                 }
                                 match session {
-                                    Ok(_) if rereading && leaf.dirty() => leaf.stale = true,
-                                    Ok(session) => leaf.show(session, window, cx),
+                                    Ok(_) if rereading && leaf.dirty(cx) => leaf.stale = true,
+                                    Ok(session) => {
+                                        leaf.version = Some(version);
+                                        leaf.show(session, window, cx);
+                                    }
                                     Err(error) => {
                                         eprintln!(
                                             "omasheets-block: {reference} did not open as a workbook: {error}"
@@ -315,9 +320,10 @@ impl Leaf {
         cx.notify();
     }
 
-    /// Edits not saved yet, or a save waiting or in flight.
-    fn dirty(&self) -> bool {
-        self.edits != self.saved || self.saving
+    /// A cell being edited, edits not saved yet, or a save waiting or in flight.
+    fn dirty(&self, cx: &App) -> bool {
+        let editing = matches!(&self.state, LeafState::Open(view) if view.read(cx).editing());
+        editing || self.edits != self.saved || self.saving
     }
 
     fn reset_saves(&mut self) {
@@ -377,6 +383,8 @@ impl Leaf {
                     return;
                 }
                 leaf.saving = false;
+                // A reread that waited on this save can run now.
+                cx.notify();
                 match outcome {
                     Ok(version) => {
                         leaf.version = Some(version);
@@ -403,7 +411,7 @@ impl gpui_shell::gpui::Render for Leaf {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl gpui_shell::gpui::IntoElement {
-        if self.stale && !self.dirty() && !matches!(self.state, LeafState::Opening) {
+        if self.stale && !self.dirty(cx) && !matches!(self.state, LeafState::Opening) {
             self.stale = false;
             cx.defer_in(window, |leaf, window, cx| leaf.open(window, cx));
         }
