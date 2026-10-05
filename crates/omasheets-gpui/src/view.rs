@@ -308,13 +308,17 @@ impl SpreadsheetView {
     }
 
     /// The ✓ beside the formula field: commit and leave the cell selected.
-    fn commit_and_end_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// A refused commit keeps the edit and its draft, as Enter does; false then.
+    fn commit_and_end_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let text = self.formula.read(cx).value().to_string();
         self.session.set_formula_draft(text);
+        if !self.commit_formula(window, cx) {
+            return false;
+        }
         self.editing = false;
-        self.commit_formula(window, cx);
         self.grid_focus.focus(window, cx);
         cx.notify();
+        true
     }
 
     /// A press on a cell. On touch a single tap only selects; a double-tap edits.
@@ -333,9 +337,12 @@ impl SpreadsheetView {
             return;
         }
         let same = self.session.selection() == Some(crate::session::CellAddress { row, column });
-        if self.editing && !(same && click_count >= 2) {
+        if self.editing
+            && !(same && click_count >= 2)
             // Leaving the field by tapping a cell commits, as a blur does.
-            self.commit_and_end_edit(window, cx);
+            && !self.commit_and_end_edit(window, cx)
+        {
+            return;
         }
         if !same {
             self.select_cell(row, column, window, cx);
@@ -345,6 +352,36 @@ impl SpreadsheetView {
         } else if !self.editing {
             self.grid_focus.focus(window, cx);
         }
+    }
+
+    /// Counts the whole rows and columns that fit `size` from the current origin.
+    fn fit_to(&mut self, size: gpui_kit::Size<gpui_kit::Pixels>) {
+        let origin = self.session.visible_window();
+        let fit = |space: f32, extent: &dyn Fn(usize) -> f32, start: usize, max: u32| {
+            let mut used = 0.0;
+            let mut count = 0;
+            while count < max {
+                used += extent(start + count as usize);
+                if used > space + 0.5 {
+                    break;
+                }
+                count += 1;
+            }
+            count.max(1)
+        };
+        let rows = fit(
+            size.height.as_f32() - HEADER_PX,
+            &|row| self.session.row_height_px(row),
+            origin.origin_row as usize,
+            VISIBLE_ROWS,
+        );
+        let columns = fit(
+            size.width.as_f32() - ROW_HEADER_PX,
+            &|column| self.session.column_width_px(column),
+            origin.origin_column as usize,
+            VISIBLE_COLUMNS,
+        );
+        self.session.set_fit(rows, columns);
     }
 
     fn drag_resize(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -395,6 +432,18 @@ impl SpreadsheetView {
     }
 
     fn activate_sheet(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // A pending edit belongs to the sheet it started on: on touch it
+        // commits there (a refusal stays put); on the desktop it ends, as
+        // clicking away from the field always has.
+        if self.editing {
+            if self.touch {
+                if !self.commit_and_end_edit(window, cx) {
+                    return;
+                }
+            } else {
+                self.editing = false;
+            }
+        }
         if self.session.activate_sheet(index) {
             self.scroll_rows = 0.0;
             self.scroll_cols = 0.0;
@@ -582,7 +631,9 @@ impl SpreadsheetView {
                         .child("✓")
                         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                             cx.stop_propagation();
-                            commit.update(cx, |this, cx| this.commit_and_end_edit(window, cx));
+                            commit.update(cx, |this, cx| {
+                                this.commit_and_end_edit(window, cx);
+                            });
                         }),
                 )
                 .child(
@@ -655,6 +706,7 @@ impl SpreadsheetView {
                 let id = SharedString::from(format!("sheet-tab-{index}"));
                 div()
                     .id(id)
+                    .test_support()
                     .flex_shrink_0()
                     .h_full()
                     .px_2()
@@ -875,10 +927,11 @@ impl RenderOnce for SheetGrid {
                                 .test_support()
                                 .child(cell.text.clone()),
                         )
+                        // The press keeps bubbling so a host (the block editor)
+                        // can mark the embed. The cell chose focus, so the
+                        // grid and any focusable ancestor leave it alone.
                         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                            // The cell decides focus; the grid's own press would
-                            // take it back from an edit a double-tap just began.
-                            cx.stop_propagation();
+                            window.prevent_default();
                             view.update(cx, |this, cx| {
                                 this.press_cell(
                                     row_index,
@@ -899,6 +952,7 @@ impl RenderOnce for SheetGrid {
         div()
             .id("omasheets-grid")
             .debug_selector(|| "omasheets-grid".into())
+            .relative()
             .flex_1()
             .overflow_hidden()
             .track_focus(&self.focus)
@@ -916,7 +970,11 @@ impl RenderOnce for SheetGrid {
                 }
             })
             .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                focus.focus(window, cx);
+                // A cell already chose focus, such as the formula field for
+                // a double-tap edit.
+                if !window.default_prevented() {
+                    focus.focus(window, cx);
+                }
             })
             .on_mouse_move({
                 let view = self.view.clone();
@@ -936,6 +994,23 @@ impl RenderOnce for SheetGrid {
             })
             .child(header)
             .children(rows)
+            .child(
+                // Records how many rows and columns the grid paints, so moving
+                // the selection scrolls within what is actually in view.
+                gpui_kit::canvas(
+                    {
+                        let view = self.view.clone();
+                        move |bounds, _window, cx| {
+                            view.update(cx, |this, _| this.fit_to(bounds.size));
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
     }
 }
 

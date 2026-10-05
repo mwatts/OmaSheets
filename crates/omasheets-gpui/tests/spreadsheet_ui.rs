@@ -8,8 +8,8 @@ use std::rc::Rc;
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
-    TestAppContext, Window, WindowHandle, div, px, size,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+    Subscription, TestAppContext, Window, WindowHandle, div, px, size,
 };
 use omasheets_core::Command;
 use omasheets_gpui::{
@@ -53,6 +53,35 @@ struct Opened {
     window: WindowHandle<Root>,
     spreadsheet: Entity<SpreadsheetView>,
     events: Rc<RefCell<Vec<SpreadsheetUiEvent>>>,
+    /// Left presses that bubbled out of the spreadsheet to its host.
+    host_presses: Rc<std::cell::Cell<usize>>,
+}
+
+/// A note's embed: as wide as the window and as tall as the view asks,
+/// with a host press handler like the block editor's.
+struct EmbedHost {
+    spreadsheet: Entity<SpreadsheetView>,
+    presses: Rc<std::cell::Cell<usize>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Render for EmbedHost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let presses = self.presses.clone();
+        let height = self.spreadsheet.read(cx).embed_height_px();
+        div()
+            .size_full()
+            .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, _| {
+                presses.set(presses.get() + 1);
+            })
+            .child(
+                div()
+                    .w_full()
+                    .h(px(height))
+                    .overflow_hidden()
+                    .child(self.spreadsheet.clone()),
+            )
+    }
 }
 
 fn open_spreadsheet(cx: &mut TestAppContext) -> Opened {
@@ -77,6 +106,7 @@ fn open_spreadsheet(cx: &mut TestAppContext) -> Opened {
         window,
         spreadsheet: slot.borrow().clone().expect("spreadsheet mounted"),
         events,
+        host_presses: Rc::default(),
     }
 }
 
@@ -669,6 +699,8 @@ fn open_embed(
     let sink = events.clone();
     let slot: Rc<RefCell<Option<Entity<SpreadsheetView>>>> = Rc::new(RefCell::new(None));
     let slot_for_open = slot.clone();
+    let host_presses: Rc<std::cell::Cell<usize>> = Rc::default();
+    let presses_for_host = host_presses.clone();
     let window = cx.open_window(size(px(width), px(700.)), move |window, cx| {
         let spreadsheet = cx.new(|cx| {
             let mut view = SpreadsheetView::new(
@@ -680,7 +712,18 @@ fn open_embed(
             view
         });
         slot_for_open.borrow_mut().replace(spreadsheet.clone());
-        let host = cx.new(|cx| Host::new(spreadsheet, sink, cx));
+        let host = cx.new(|cx| {
+            let sink = sink.clone();
+            let events = cx.subscribe(&spreadsheet, move |_host, _view, event, _cx| {
+                sink.borrow_mut().push(event.clone());
+            });
+            let notified = cx.observe(&spreadsheet, |_host, _view, cx| cx.notify());
+            EmbedHost {
+                spreadsheet,
+                presses: presses_for_host,
+                _subscriptions: vec![events, notified],
+            }
+        });
         Root::new(host, window, cx)
     });
     // GPUI delivers focus and blur callbacks only to an active window.
@@ -691,6 +734,7 @@ fn open_embed(
         window,
         spreadsheet: slot.borrow().clone().expect("spreadsheet mounted"),
         events,
+        host_presses,
     }
 }
 
@@ -967,3 +1011,169 @@ fn read_only_formula_field_takes_no_focus_or_typing(cx: &mut TestAppContext) {
         assert_eq!(cell_text(&opened, cx, "cell-0-0"), "12");
     }
 }
+
+fn selection(opened: &Opened, cx: &mut TestAppContext) -> (Option<String>, bool) {
+    cx.update(|cx| {
+        let view = opened.spreadsheet.read(cx);
+        (view.session().selection_a1(), view.editing())
+    })
+}
+
+/// The block editor marks an embed's block from its own press handler, so
+/// Escape returns the caret to the embed that was clicked. A cell press that
+/// stopped there left the caret in the previous block.
+#[gpui_kit::test]
+fn a_cell_press_still_reaches_the_host(cx: &mut TestAppContext) {
+    for touch in [false, true] {
+        let opened = open_embed(cx, 390.0, move |view, cx| {
+            view.set_autofocus(false);
+            view.set_touch(touch, cx);
+        });
+        interact(&opened, cx, |window, cx| window.click("cell-1-1", cx));
+        assert_eq!(
+            opened.host_presses.get(),
+            1,
+            "touch={touch}: the host sees the press"
+        );
+        assert_eq!(selection(&opened, cx).0.as_deref(), Some("B2"));
+        if touch {
+            interact(&opened, cx, |window, cx| {
+                window.double_click("cell-1-1", cx)
+            });
+            assert!(
+                formula_focused(&opened, cx),
+                "the grid's press must not take focus back from a double-tap edit"
+            );
+        } else {
+            interact(&opened, cx, |window, cx| window.press("7", cx));
+            interact(&opened, cx, |window, cx| window.press("enter", cx));
+            assert_eq!(
+                cell_text(&opened, cx, "cell-1-1"),
+                "7",
+                "the grid has the keyboard"
+            );
+        }
+    }
+}
+
+/// Switching sheets mid-edit used to load the new sheet's A1 into the field,
+/// and the late blur then wrote it into that sheet, losing the edit.
+#[gpui_kit::test]
+fn switching_sheets_mid_edit_commits_to_the_edited_sheet(cx: &mut TestAppContext) {
+    let opened = open_embed(cx, 390.0, |view, cx| {
+        view.set_autofocus(false);
+        view.set_touch(true, cx);
+        view.session_mut()
+            .apply_command(Command::AddSheet { name: "Two".into() })
+            .expect("second sheet");
+    });
+    interact(&opened, cx, |window, cx| {
+        window.double_click("cell-2-1", cx)
+    });
+    interact(&opened, cx, |window, cx| window.input("42", cx));
+    interact(&opened, cx, |window, cx| window.click("sheet-tab-1", cx));
+    let (on_two, editing) = cx.update(|cx| {
+        let view = opened.spreadsheet.read(cx);
+        (
+            view.session().active_sheet_name().map(str::to_string),
+            view.editing(),
+        )
+    });
+    assert_eq!(on_two.as_deref(), Some("Two"));
+    assert!(!editing, "the switch ends the edit");
+    assert_eq!(
+        cell_text(&opened, cx, "cell-0-0"),
+        "",
+        "nothing lands in Two!A1"
+    );
+    assert_eq!(cell_text(&opened, cx, "cell-2-1"), "", "nor in Two!B3");
+    interact(&opened, cx, |window, cx| window.click("sheet-tab-0", cx));
+    assert_eq!(
+        cell_text(&opened, cx, "cell-2-1"),
+        "42",
+        "the edit landed in the first sheet"
+    );
+}
+
+/// Return walks down a column; the cell being edited must stay in the
+/// 5-15 rows an embed shows, and keys walking right stay in the columns
+/// that fit a 390 pt phone.
+#[gpui_kit::test]
+fn the_edited_cell_stays_in_the_painted_embed(cx: &mut TestAppContext) {
+    let opened = open_embed(cx, 390.0, |view, cx| {
+        view.set_autofocus(false);
+        view.set_touch(true, cx);
+    });
+    interact(&opened, cx, |window, cx| {
+        window.double_click("cell-0-0", cx)
+    });
+    for _ in 0..20 {
+        interact(&opened, cx, |window, cx| window.input("1", cx));
+        interact(&opened, cx, |window, cx| window.press("enter", cx));
+    }
+    assert_eq!(selection(&opened, cx), (Some("A21".to_string()), true));
+    let height = cx.update(|cx| opened.spreadsheet.read(cx).embed_height_px());
+    interact(&opened, cx, |window, _cx| {
+        let cell = window.find("cell-20-0").bounds();
+        assert!(
+            cell.origin.y >= px(0.) && cell.bottom() <= px(height),
+            "A21 {cell:?} is inside the {height} px embed"
+        );
+    });
+    interact(&opened, cx, |window, cx| {
+        window.click("omasheets-formula-commit", cx)
+    });
+    for _ in 0..6 {
+        interact(&opened, cx, |window, cx| window.press("right", cx));
+    }
+    assert_eq!(selection(&opened, cx).0.as_deref(), Some("G21"));
+    interact(&opened, cx, |window, _cx| {
+        let cell = window.find("cell-20-6").bounds();
+        assert!(
+            cell.origin.x >= px(48.) && cell.right() <= px(390.),
+            "G21 {cell:?} is inside the 390 px embed"
+        );
+    });
+}
+
+/// ✓ on a formula the engine refuses keeps the edit, as Enter does on the
+/// desktop, so the user can correct it instead of losing it.
+#[gpui_kit::test]
+fn a_refused_commit_keeps_the_edit(cx: &mut TestAppContext) {
+    let opened = open_embed(cx, 390.0, |view, cx| {
+        view.set_autofocus(false);
+        view.set_touch(true, cx);
+    });
+    interact(&opened, cx, |window, cx| {
+        window.double_click("cell-0-0", cx)
+    });
+    interact(&opened, cx, |window, cx| window.input(REFUSED, cx));
+    clear_events(&opened);
+    interact(&opened, cx, |window, cx| {
+        window.click("omasheets-formula-commit", cx)
+    });
+    assert!(
+        events(&opened)
+            .iter()
+            .any(|event| matches!(event, SpreadsheetUiEvent::CommandFailed { .. })),
+        "the formula is refused: {:?}",
+        events(&opened)
+    );
+    assert_eq!(
+        selection(&opened, cx),
+        (Some("A1".to_string()), true),
+        "still editing"
+    );
+    assert!(formula_focused(&opened, cx), "the keyboard stays up");
+    let draft = cx.update(|cx| {
+        opened
+            .spreadsheet
+            .read(cx)
+            .session()
+            .formula_draft()
+            .to_string()
+    });
+    assert_eq!(draft, REFUSED, "the draft is kept");
+}
+
+const REFUSED: &str = "=1+";

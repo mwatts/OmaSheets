@@ -264,10 +264,12 @@ impl Leaf {
             if matches!(event, SpreadsheetUiEvent::EditCommitted { .. }) {
                 leaf.edits += 1;
                 leaf.schedule_commit(cx);
-                // A new row can grow the embed's height.
-                cx.notify();
             }
         })];
+        // The embed's height follows the view: edits, commands, sheet
+        // switches, and row resizes all notify it.
+        self._ui
+            .push(cx.observe(&view, |_leaf, _view, cx| cx.notify()));
         self.reset_saves();
         self.state = LeafState::Open(view);
         cx.notify();
