@@ -882,7 +882,8 @@ impl SpreadsheetSession {
 
     fn clamp_origin(&mut self) {
         let (rows, columns) = self.sheet_bounds();
-        let max_row = u32::try_from(rows.saturating_sub(self.fit_rows as usize)).unwrap_or(u32::MAX);
+        let max_row =
+            u32::try_from(rows.saturating_sub(self.fit_rows as usize)).unwrap_or(u32::MAX);
         let max_column =
             u32::try_from(columns.saturating_sub(self.fit_columns as usize)).unwrap_or(u32::MAX);
         self.origin_row = self.origin_row.min(max_row);
