@@ -388,7 +388,7 @@ impl Store {
                 let (seq, canonical) = row?;
                 events.push(StoredEvent {
                     seq,
-                    event: serde_json::from_str(&canonical)?,
+                    event: read_json(&canonical)?,
                 });
             }
         }
@@ -410,7 +410,7 @@ impl Store {
             // Include the checkpoint event itself to verify membership in this
             // branch's ancestry, without parsing the history preceding it.
             let tail = self.chain_after(branch, seq.saturating_sub(1))?;
-            let restored = serde_json::from_str::<Snapshot>(&payload)
+            let restored = read_json::<Snapshot>(&payload)
                 .ok()
                 .and_then(|snapshot| Document::from_snapshot(&snapshot).ok())
                 .filter(|document| document.digest() == digest)
@@ -954,6 +954,20 @@ fn conflicts_between(source: &[Event], target: &[Event]) -> Vec<Touch> {
         .intersection(&touched(target))
         .copied()
         .collect()
+}
+
+/// Reads a stored event or snapshot from its JSON, whatever `serde_json`
+/// features the linking binary turned on.
+///
+/// `Operation` and `CellInput` are internally tagged, so serde buffers their
+/// fields through `deserialize_any`. With `serde_json`'s `arbitrary_precision`
+/// on (any crate in the binary can turn it on), the string parser answers
+/// `deserialize_any` for a float with a private map token rather than an
+/// `f64`, and the buffered map cannot become `Literal::Number`. A
+/// `serde_json::Value` answers with the `f64` whenever the text is the
+/// float's own, which every number this store wrote is.
+fn read_json<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, serde_json::Error> {
+    T::deserialize(serde_json::from_str::<serde_json::Value>(json)?)
 }
 
 pub fn operation_label(operation: &Operation) -> String {

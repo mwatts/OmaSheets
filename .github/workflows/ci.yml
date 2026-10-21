@@ -83,6 +83,9 @@ jobs:
       - name: Build and test the isolated corpus scorer
         run: |
           cargo test --workspace --locked --release
+          # A host binary may turn on serde_json's arbitrary_precision; the
+          # store must read its files either way.
+          cargo test -p omasheets-store --locked --release --features serde_json/arbitrary_precision
           python -m pip install --disable-pip-version-check openpyxl==3.1.5
           cargo test -p omasheets-service --locked --release --test native_controls independent_reader -- --ignored
           cargo build --locked --release -p omasheets-corpus
